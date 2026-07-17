@@ -39,7 +39,9 @@
     menuBtn: document.getElementById("menuBtn"),
     sidebar: document.getElementById("sidebar"),
     scrim: document.getElementById("scrim"),
-    themeBtn: document.getElementById("themeBtn")
+    themeBtn: document.getElementById("themeBtn"),
+    themeIcon: document.getElementById("themeIcon"),
+    themeLabel: document.getElementById("themeLabel")
   };
 
   /* ---------- helpers ------------------------------------------------------ */
@@ -243,22 +245,45 @@
   }
 
   /* ---------- theme toggle ------------------------------------------------- */
-  function initTheme() {
-    var saved = null;
-    try { saved = localStorage.getItem("be-theme"); } catch (e) {}
-    if (saved === "light" || saved === "dark") {
-      document.documentElement.setAttribute("data-theme", saved);
+  function currentTheme() {
+    var attr = document.documentElement.getAttribute("data-theme");
+    if (attr === "light" || attr === "dark") return attr;
+    var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  }
+
+  // Deep-dives are same-origin, so stamp the chosen theme onto the iframe's
+  // document too — otherwise the content would ignore the toggle and follow
+  // only the OS preference.
+  function applyThemeToFrame(theme) {
+    try {
+      var doc = el.frame && el.frame.contentDocument;
+      if (doc && doc.documentElement) doc.documentElement.setAttribute("data-theme", theme);
+    } catch (e) { /* cross-origin or not yet loaded — ignore */ }
+  }
+
+  function applyTheme(theme, persist) {
+    document.documentElement.setAttribute("data-theme", theme);
+    if (persist) { try { localStorage.setItem("be-theme", theme); } catch (e) {} }
+    var isDark = theme === "dark";
+    if (el.themeIcon) el.themeIcon.textContent = isDark ? "☾" : "☀";
+    if (el.themeLabel) el.themeLabel.textContent = isDark ? "Dark" : "Light";
+    if (el.themeBtn) {
+      el.themeBtn.setAttribute("aria-pressed", isDark ? "true" : "false");
+      el.themeBtn.title = "Switch to " + (isDark ? "light" : "dark") + " theme";
     }
+    applyThemeToFrame(theme);
+  }
+
+  function initTheme() {
+    // The inline <head> script already applied any saved theme (flash-free);
+    // sync the button and iframe to whatever is currently in effect.
+    applyTheme(currentTheme(), false);
     el.themeBtn.addEventListener("click", function () {
-      var cur = document.documentElement.getAttribute("data-theme");
-      if (!cur) {
-        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-        cur = prefersDark ? "dark" : "light";
-      }
-      var next = cur === "dark" ? "light" : "dark";
-      document.documentElement.setAttribute("data-theme", next);
-      try { localStorage.setItem("be-theme", next); } catch (e) {}
+      applyTheme(currentTheme() === "dark" ? "light" : "dark", true);
     });
+    // Re-apply to each deep-dive as it loads into the iframe.
+    el.frame.addEventListener("load", function () { applyThemeToFrame(currentTheme()); });
   }
 
   /* ---------- mobile nav --------------------------------------------------- */

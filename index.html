@@ -7,6 +7,15 @@
   <meta name="description" content="A personalized, interactive learning journey from strong programmer to production-ready backend engineer." />
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="assets/theme.css" />
+  <script>
+    /* Apply any saved theme before first paint to avoid a flash of the wrong theme. */
+    (function () {
+      try {
+        var t = localStorage.getItem("be-theme");
+        if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    })();
+  </script>
   <style>
     /* App-shell layout chrome only. Visual identity lives in theme.css. */
     html, body { height: 100%; }
@@ -47,6 +56,22 @@
       color: var(--text); cursor: pointer; font-size: 1.1rem;
     }
     .icon-btn:hover { border-color: var(--accent); }
+
+    /* Labeled light/dark toggle */
+    .theme-toggle {
+      display: inline-flex; align-items: center; gap: var(--sp-2);
+      height: 38px; padding: 0 var(--sp-3);
+      border-radius: var(--radius);
+      background: var(--surface-2); border: 1px solid var(--border);
+      color: var(--text); cursor: pointer; font: inherit;
+    }
+    .theme-toggle:hover { border-color: var(--accent); }
+    .theme-toggle .ic { font-size: 1.05rem; line-height: 1; }
+    .theme-toggle .lbl {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600;
+    }
+    @media (max-width: 560px) { .theme-toggle .lbl { display: none; } }
 
     .menu-btn { display: none; }
 
@@ -195,7 +220,11 @@
       <div class="bar"><span id="progressFill"></span></div>
       <span class="count" id="progressCount">0 / 0</span>
     </div>
-    <button class="icon-btn" id="themeBtn" aria-label="Toggle light/dark theme">◐</button>
+    <button class="theme-toggle" id="themeBtn" title="Switch between light and dark theme"
+            aria-label="Switch between light and dark theme" aria-pressed="false">
+      <span class="ic" id="themeIcon" aria-hidden="true">☾</span>
+      <span class="lbl" id="themeLabel">Dark</span>
+    </button>
   </header>
 
   <div class="app-layout">
