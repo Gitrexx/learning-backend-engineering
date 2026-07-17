@@ -1,0 +1,266 @@
+{
+  "topic": "Backend Engineering",
+  "mode": "hybrid",
+  "tagline": "From strong programmer to production-ready backend engineer.",
+  "sections": [
+    { "id": "foundations", "title": "Foundations", "order": 1, "blurb": "The mental models everything else pins onto. Do these first, in order." },
+    { "id": "apis", "title": "APIs & Interfaces", "order": 2, "blurb": "How services expose themselves and talk to each other." },
+    { "id": "data", "title": "Data & Databases", "order": 3, "blurb": "The heart of most backends: modeling, SQL, indexes, transactions, stores, caching." },
+    { "id": "distributed", "title": "Distributed Systems & Scaling", "order": 4, "blurb": "What changes when one machine isn't enough. The part interviews probe hardest." },
+    { "id": "reliability", "title": "Reliability & Operating in Production", "order": 5, "blurb": "What 'production-ready' actually means: resilience, observability, performance, delivery." },
+    { "id": "security", "title": "Security & Quality", "order": 6, "blurb": "Auth, the OWASP-class threats, and testing strategy." },
+    { "id": "capstone", "title": "Capstone & Bridge", "order": 7, "blurb": "Assemble it into a design method — then reframe ML systems as backend systems." }
+  ],
+  "items": [
+    {
+      "id": "anatomy-of-a-backend",
+      "title": "Anatomy of a Backend Service",
+      "sectionId": "foundations",
+      "order": 1,
+      "summary": "The request lifecycle end to end, the layers of a real service, and what 'production-ready' means.",
+      "prerequisites": [],
+      "file": "anatomy-of-a-backend.html",
+      "status": "planned"
+    },
+    {
+      "id": "networking-for-backend",
+      "title": "Networking & Protocols for Backend Engineers",
+      "sectionId": "foundations",
+      "order": 2,
+      "summary": "TCP/TLS/DNS, HTTP/1.1 vs 2 vs 3, connection pooling, and the timeout/retry budget.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "networking-for-backend.html",
+      "status": "planned"
+    },
+    {
+      "id": "concurrency-and-io",
+      "title": "Concurrency, Threads & Async I/O",
+      "sectionId": "foundations",
+      "order": 3,
+      "summary": "Blocking vs non-blocking I/O, threads vs event loops, pools, backpressure, and pool exhaustion.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "concurrency-and-io.html",
+      "status": "planned"
+    },
+    {
+      "id": "rest-api-design",
+      "title": "Designing Clean REST APIs",
+      "sectionId": "apis",
+      "order": 1,
+      "summary": "Resources, verbs, status codes, idempotency, pagination, error contracts, and versioning.",
+      "prerequisites": ["networking-for-backend"],
+      "file": "rest-api-design.html",
+      "status": "planned"
+    },
+    {
+      "id": "rpc-graphql-streaming",
+      "title": "Beyond REST: gRPC, GraphQL & Streaming",
+      "sectionId": "apis",
+      "order": 2,
+      "summary": "When REST isn't the tool: gRPC/protobuf, GraphQL and the N+1 trap, WebSockets/SSE — and how to choose.",
+      "prerequisites": ["rest-api-design"],
+      "file": "rpc-graphql-streaming.html",
+      "status": "planned"
+    },
+    {
+      "id": "relational-data-modeling",
+      "title": "Relational Data Modeling",
+      "sectionId": "data",
+      "order": 1,
+      "summary": "Entities, keys, relationships, normalization and deliberate denormalization, constraints.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "relational-data-modeling.html",
+      "status": "planned"
+    },
+    {
+      "id": "sql-and-query-performance",
+      "title": "SQL Deep-Dive & Query Performance",
+      "sectionId": "data",
+      "order": 2,
+      "summary": "How joins execute, the query planner, reading EXPLAIN, and the anti-patterns that kill latency.",
+      "prerequisites": ["relational-data-modeling"],
+      "file": "sql-and-query-performance.html",
+      "status": "planned"
+    },
+    {
+      "id": "indexing-and-storage-engines",
+      "title": "Indexes & Storage Engines",
+      "sectionId": "data",
+      "order": 3,
+      "summary": "B-trees vs LSM-trees, clustered vs secondary indexes, composite order, and the write/read trade-off.",
+      "prerequisites": ["sql-and-query-performance"],
+      "file": "indexing-and-storage-engines.html",
+      "status": "planned"
+    },
+    {
+      "id": "transactions-and-isolation",
+      "title": "Transactions, ACID & Isolation Levels",
+      "sectionId": "data",
+      "order": 4,
+      "summary": "ACID precisely, the isolation levels, the anomalies they permit, MVCC vs locking, and deadlocks.",
+      "prerequisites": ["relational-data-modeling"],
+      "file": "transactions-and-isolation.html",
+      "status": "planned"
+    },
+    {
+      "id": "nosql-and-data-stores",
+      "title": "NoSQL & Choosing a Data Store",
+      "sectionId": "data",
+      "order": 5,
+      "summary": "Key-value, document, wide-column, graph — their models, and choosing from access patterns not hype.",
+      "prerequisites": ["relational-data-modeling"],
+      "file": "nosql-and-data-stores.html",
+      "status": "planned"
+    },
+    {
+      "id": "caching-strategies",
+      "title": "Caching Strategies",
+      "sectionId": "data",
+      "order": 6,
+      "summary": "Cache-aside vs write-through, invalidation, TTLs, the stampede problem, and consistency hazards.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "caching-strategies.html",
+      "status": "planned"
+    },
+    {
+      "id": "scaling-and-load-balancing",
+      "title": "Scaling & Load Balancing",
+      "sectionId": "distributed",
+      "order": 1,
+      "summary": "Vertical vs horizontal, why statelessness enables scale-out, LB algorithms, and health checks.",
+      "prerequisites": ["concurrency-and-io"],
+      "file": "scaling-and-load-balancing.html",
+      "status": "planned"
+    },
+    {
+      "id": "replication-and-partitioning",
+      "title": "Replication & Partitioning",
+      "sectionId": "distributed",
+      "order": 2,
+      "summary": "Leader/follower vs leaderless, replication lag, sharding, consistent hashing, and hot partitions.",
+      "prerequisites": ["scaling-and-load-balancing", "transactions-and-isolation"],
+      "file": "replication-and-partitioning.html",
+      "status": "planned"
+    },
+    {
+      "id": "consistency-and-consensus",
+      "title": "Consistency Models, CAP & Consensus",
+      "sectionId": "distributed",
+      "order": 3,
+      "summary": "The consistency spectrum, what CAP/PACELC really say, quorums, and Raft-style consensus.",
+      "prerequisites": ["replication-and-partitioning"],
+      "file": "consistency-and-consensus.html",
+      "status": "planned"
+    },
+    {
+      "id": "messaging-and-event-driven",
+      "title": "Messaging, Queues & Event-Driven Architecture",
+      "sectionId": "distributed",
+      "order": 4,
+      "summary": "Queues vs logs, delivery semantics, ordering, idempotent consumers, DLQs, and the outbox pattern.",
+      "prerequisites": ["scaling-and-load-balancing"],
+      "file": "messaging-and-event-driven.html",
+      "status": "planned"
+    },
+    {
+      "id": "distributed-transactions-sagas",
+      "title": "Distributed Transactions, Sagas & Idempotency",
+      "sectionId": "distributed",
+      "order": 5,
+      "summary": "Why cross-service ACID is costly, 2PC vs sagas, compensating actions, and effective exactly-once.",
+      "prerequisites": ["consistency-and-consensus", "messaging-and-event-driven"],
+      "file": "distributed-transactions-sagas.html",
+      "status": "planned"
+    },
+    {
+      "id": "resilience-patterns",
+      "title": "Resilience Patterns",
+      "sectionId": "reliability",
+      "order": 1,
+      "summary": "Timeouts, retries with backoff+jitter, circuit breakers, bulkheads, load shedding, graceful degradation.",
+      "prerequisites": ["scaling-and-load-balancing"],
+      "file": "resilience-patterns.html",
+      "status": "planned"
+    },
+    {
+      "id": "observability",
+      "title": "Observability: Logs, Metrics & Traces",
+      "sectionId": "reliability",
+      "order": 2,
+      "summary": "The three pillars, RED/USE, cardinality pitfalls, SLIs/SLOs/error budgets, and alerting on symptoms.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "observability.html",
+      "status": "planned"
+    },
+    {
+      "id": "performance-and-capacity",
+      "title": "Performance, Profiling & Capacity Planning",
+      "sectionId": "reliability",
+      "order": 3,
+      "summary": "Latency vs throughput, percentiles and tail latency, Little's Law, back-of-envelope estimation.",
+      "prerequisites": ["concurrency-and-io"],
+      "file": "performance-and-capacity.html",
+      "status": "planned"
+    },
+    {
+      "id": "deployment-and-cicd",
+      "title": "Deployment, CI/CD & Release Strategies",
+      "sectionId": "reliability",
+      "order": 4,
+      "summary": "12-factor, containers, IaC, CI/CD gates, and blue-green vs canary vs rolling with fast rollback.",
+      "prerequisites": ["anatomy-of-a-backend"],
+      "file": "deployment-and-cicd.html",
+      "status": "planned"
+    },
+    {
+      "id": "auth-and-access",
+      "title": "Authentication & Authorization Done Right",
+      "sectionId": "security",
+      "order": 1,
+      "summary": "AuthN vs AuthZ, password hashing, sessions vs JWT, OAuth2/OIDC, and RBAC vs ABAC.",
+      "prerequisites": ["rest-api-design"],
+      "file": "auth-and-access.html",
+      "status": "planned"
+    },
+    {
+      "id": "backend-security",
+      "title": "Backend Security & the OWASP Top 10",
+      "sectionId": "security",
+      "order": 2,
+      "summary": "Injection and parameterized queries, broken access control, secrets, rate limiting, least privilege.",
+      "prerequisites": ["rest-api-design"],
+      "file": "backend-security.html",
+      "status": "planned"
+    },
+    {
+      "id": "testing-backend",
+      "title": "Testing Backend Systems",
+      "sectionId": "security",
+      "order": 3,
+      "summary": "The testing pyramid, unit vs integration vs contract vs e2e, test doubles, and CI gates.",
+      "prerequisites": ["rest-api-design"],
+      "file": "testing-backend.html",
+      "status": "planned"
+    },
+    {
+      "id": "system-design-method",
+      "title": "The System Design Method",
+      "sectionId": "capstone",
+      "order": 1,
+      "summary": "A repeatable method — clarify, estimate, sketch, drill in, state trade-offs — worked on a real prompt.",
+      "prerequisites": ["scaling-and-load-balancing", "caching-strategies", "replication-and-partitioning", "messaging-and-event-driven"],
+      "file": "system-design-method.html",
+      "status": "planned"
+    },
+    {
+      "id": "ml-systems-as-backends",
+      "title": "ML Systems as Backend Systems",
+      "sectionId": "capstone",
+      "order": 2,
+      "summary": "Serving as a low-latency service, feature stores as a caching problem, skew as a consistency bug.",
+      "prerequisites": ["scaling-and-load-balancing", "caching-strategies", "messaging-and-event-driven"],
+      "file": "ml-systems-as-backends.html",
+      "status": "planned"
+    }
+  ]
+}

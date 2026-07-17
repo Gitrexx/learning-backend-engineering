@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backend Engineering — Learning</title>
+  <meta name="description" content="A personalized, interactive learning journey from strong programmer to production-ready backend engineer." />
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="assets/theme.css" />
+  <style>
+    /* App-shell layout chrome only. Visual identity lives in theme.css. */
+    html, body { height: 100%; }
+    body { background-attachment: fixed; }
+
+    .app-header {
+      position: sticky; top: 0; z-index: 20;
+      display: flex; align-items: center; gap: var(--sp-4);
+      padding: var(--sp-3) var(--sp-5);
+      background: color-mix(in srgb, var(--surface) 88%, transparent);
+      backdrop-filter: saturate(140%) blur(10px);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .brand .eyebrow { color: var(--text-faint); }
+    .brand strong { font-size: var(--fs-md); letter-spacing: -0.01em; }
+    .brand .node-dot {
+      color: var(--accent); font-family: var(--font-mono);
+    }
+    .header-spacer { flex: 1 1 auto; }
+
+    .header-progress { display: flex; align-items: center; gap: var(--sp-3); }
+    .header-progress .bar {
+      width: 140px; height: 8px; border-radius: 999px;
+      background: var(--surface-2); border: 1px solid var(--border); overflow: hidden;
+    }
+    .header-progress .bar > span {
+      display: block; height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--blueprint));
+      width: 0; transition: width .5s ease;
+    }
+    .header-progress .count { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted); white-space: nowrap; }
+
+    .icon-btn {
+      display: inline-grid; place-items: center;
+      width: 38px; height: 38px; border-radius: var(--radius);
+      background: var(--surface-2); border: 1px solid var(--border);
+      color: var(--text); cursor: pointer; font-size: 1.1rem;
+    }
+    .icon-btn:hover { border-color: var(--accent); }
+
+    .menu-btn { display: none; }
+
+    .app-layout {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      min-height: calc(100vh - 63px);
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--border);
+      background: color-mix(in srgb, var(--surface) 55%, transparent);
+      padding: var(--sp-5) var(--sp-4) var(--sp-8);
+      overflow-y: auto;
+      max-height: calc(100vh - 63px);
+      position: sticky; top: 63px;
+    }
+    .sidebar .home-link {
+      display: flex; align-items: center; gap: var(--sp-2);
+      width: 100%; text-align: left;
+      font: inherit; font-weight: 600; color: var(--text);
+      background: none; border: 1px solid transparent; border-radius: var(--radius);
+      padding: var(--sp-2) var(--sp-3); cursor: pointer; margin-bottom: var(--sp-4);
+    }
+    .sidebar .home-link:hover { background: var(--surface-2); }
+    .sidebar .home-link.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+
+    .nav-section { margin-bottom: var(--sp-5); }
+    .nav-section > .sec-head {
+      display: flex; align-items: baseline; gap: var(--sp-2);
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--text-faint); margin: 0 0 var(--sp-2); padding: 0 var(--sp-3);
+    }
+    .nav-section > .sec-head .sec-num { color: var(--accent); }
+    .nav-items { list-style: none; margin: 0; padding: 0; }
+    .nav-item { margin: 0; }
+    .nav-item button {
+      display: grid; grid-template-columns: 18px 1fr auto; align-items: center; gap: var(--sp-2);
+      width: 100%; text-align: left; font: inherit;
+      color: var(--text); background: none; border: 1px solid transparent;
+      border-radius: var(--radius); padding: var(--sp-2) var(--sp-3); cursor: pointer;
+      line-height: 1.35;
+    }
+    .nav-item button .idx { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+    .nav-item button:hover:not([disabled]) { background: var(--surface-2); }
+    .nav-item button.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+    .nav-item button[disabled] { cursor: not-allowed; color: var(--text-faint); }
+    .nav-item button[disabled] .idx { opacity: 0.6; }
+    .nav-item .dot {
+      width: 9px; height: 9px; border-radius: 50%; justify-self: center;
+      border: 1.5px solid var(--border-strong); background: transparent;
+    }
+    .nav-item button.done .dot { background: var(--ok); border-color: var(--ok); }
+    .nav-item .lock { font-size: 0.75rem; color: var(--text-faint); }
+
+    .main { min-width: 0; display: flex; flex-direction: column; }
+
+    /* Deep-dive iframe view */
+    .viewer { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+    .viewer.active { display: flex; }
+    .viewer-bar {
+      display: flex; align-items: center; gap: var(--sp-3);
+      padding: var(--sp-3) var(--sp-5); border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .viewer-bar .crumb { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted); }
+    .viewer-bar .crumb b { color: var(--text); }
+    .viewer iframe { flex: 1 1 auto; width: 100%; border: 0; background: var(--bg); min-height: 60vh; }
+
+    /* Overview view */
+    .overview { display: none; padding: var(--sp-7) var(--sp-6) var(--sp-8); max-width: var(--page-max); margin: 0 auto; width: 100%; }
+    .overview.active { display: block; }
+    .hero .eyebrow { margin-bottom: var(--sp-3); }
+    .hero h1 { max-width: 20ch; }
+    .hero p.lead { font-size: var(--fs-md); color: var(--text-muted); max-width: 62ch; }
+
+    .progress-card {
+      display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-5);
+      margin: var(--sp-6) 0;
+    }
+    .progress-card .ring { --pct: 0; position: relative; width: 84px; height: 84px; flex: none; }
+    .progress-card .ring svg { transform: rotate(-90deg); }
+    .progress-card .ring .pct {
+      position: absolute; inset: 0; display: grid; place-items: center;
+      font-family: var(--font-mono); font-weight: 700; font-size: 0.95rem; color: var(--text);
+    }
+    .progress-card .meta { font-size: var(--fs-sm); color: var(--text-muted); }
+    .progress-card .meta strong { color: var(--text); }
+
+    .sec-grid { display: grid; gap: var(--sp-5); grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); margin-top: var(--sp-6); }
+    .sec-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--sp-5); box-shadow: var(--shadow-1); }
+    .sec-card > h3 { margin-top: 0; display: flex; align-items: baseline; gap: var(--sp-2); }
+    .sec-card > h3 .sec-num { font-family: var(--font-mono); font-size: 0.9rem; color: var(--accent); }
+    .sec-card .sec-blurb { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 0; }
+    .sec-card ol { list-style: none; margin: var(--sp-3) 0 0; padding: 0; }
+    .sec-card li { margin: 0; }
+    .sec-card li button {
+      display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: var(--sp-3);
+      width: 100%; text-align: left; font: inherit; color: var(--text);
+      background: none; border: none; border-top: 1px solid var(--border);
+      padding: var(--sp-3) var(--sp-1); cursor: pointer;
+    }
+    .sec-card li:first-child button { border-top: none; }
+    .sec-card li button:hover:not([disabled]) { color: var(--accent-strong); }
+    .sec-card li button[disabled] { cursor: default; }
+    .sec-card li .t-title { line-height: 1.35; }
+    .sec-card li .t-title small { display: block; color: var(--text-faint); font-size: 0.8rem; font-weight: 400; }
+    .sec-card li[data-status="planned"] .t-title { color: var(--text-muted); }
+    .sec-card li .num { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-faint); }
+
+    .empty-note {
+      margin-top: var(--sp-6);
+      display: grid; grid-template-columns: auto 1fr; gap: var(--sp-3) var(--sp-4);
+    }
+
+    .load-error { color: var(--danger); font-family: var(--font-mono); }
+
+    /* Responsive */
+    @media (max-width: 900px) {
+      .menu-btn { display: inline-grid; }
+      .app-layout { grid-template-columns: 1fr; }
+      .sidebar {
+        position: fixed; top: 63px; left: 0; bottom: 0; width: min(88vw, 340px);
+        z-index: 30; transform: translateX(-102%); transition: transform .22s ease;
+        background: var(--surface); max-height: none;
+        box-shadow: var(--shadow-2);
+      }
+      body.nav-open .sidebar { transform: translateX(0); }
+      .scrim { display: none; position: fixed; inset: 63px 0 0 0; background: rgba(0,0,0,.45); z-index: 25; }
+      body.nav-open .scrim { display: block; }
+      .header-progress .bar { width: 90px; }
+    }
+    @media (min-width: 901px) { .scrim { display: none; } }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <button class="icon-btn menu-btn" id="menuBtn" aria-label="Toggle navigation">☰</button>
+    <div class="brand">
+      <span class="eyebrow">learning <span class="node-dot">//</span> systematic</span>
+      <strong id="brandTitle">Backend Engineering</strong>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="header-progress" title="Deep-dives built so far">
+      <div class="bar"><span id="progressFill"></span></div>
+      <span class="count" id="progressCount">0 / 0</span>
+    </div>
+    <button class="icon-btn" id="themeBtn" aria-label="Toggle light/dark theme">◐</button>
+  </header>
+
+  <div class="app-layout">
+    <div class="scrim" id="scrim"></div>
+    <aside class="sidebar" id="sidebar">
+      <button class="home-link active" id="homeLink">
+        <span aria-hidden="true">▚</span> Journey overview
+      </button>
+      <nav id="nav" aria-label="Sub-topics"></nav>
+    </aside>
+
+    <main class="main">
+      <!-- Landing / overview -->
+      <section class="overview active" id="overview">
+        <div class="hero">
+          <span class="eyebrow" id="heroMode">landscape</span>
+          <h1 id="heroTitle">Backend Engineering</h1>
+          <p class="lead" id="heroTagline"></p>
+        </div>
+
+        <div class="progress-card">
+          <div class="ring" id="ring">
+            <svg width="84" height="84" viewBox="0 0 84 84" aria-hidden="true">
+              <circle cx="42" cy="42" r="36" fill="none" stroke="var(--surface-2)" stroke-width="8"></circle>
+              <circle id="ringArc" cx="42" cy="42" r="36" fill="none" stroke="var(--accent)"
+                      stroke-width="8" stroke-linecap="round"
+                      stroke-dasharray="226" stroke-dashoffset="226"></circle>
+            </svg>
+            <span class="pct" id="ringPct">0%</span>
+          </div>
+          <div class="meta" id="progressMeta"></div>
+        </div>
+
+        <div class="sec-grid" id="secGrid"></div>
+
+        <div class="callout note empty-note" id="emptyNote" hidden>
+          <span class="callout-icon">i</span>
+          <div class="callout-body">
+            <span class="callout-title">No deep-dives built yet</span>
+            <p style="margin:.4rem 0 0">Every sub-topic below is <b>planned</b>. Content is created one
+            sub-topic at a time — open this repo in Claude Code and say
+            <em>“continue the next deep-dive.”</em> The routine rules live in
+            <code>.claude/CLAUDE.md</code>; the full plan is in <code>ROADMAP.md</code>.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Deep-dive viewer -->
+      <section class="viewer" id="viewer">
+        <div class="viewer-bar">
+          <button class="icon-btn" id="backBtn" aria-label="Back to overview">←</button>
+          <span class="crumb"><span id="crumbSection"></span> / <b id="crumbTitle"></b></span>
+        </div>
+        <iframe id="frame" title="Deep-dive" loading="lazy"></iframe>
+      </section>
+    </main>
+  </div>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>
