@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Anatomy of a Backend Service — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the request-tracer widget only. */
+    .tracer-controls {
+      display: flex; flex-wrap: wrap; align-items: center;
+      gap: var(--sp-4); margin-bottom: var(--sp-5);
+    }
+    .tracer-controls label {
+      display: inline-flex; align-items: center; gap: 0.45em;
+      font-size: var(--fs-sm); color: var(--text-muted); cursor: pointer;
+    }
+    .tracer-controls input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+    .tracer-total {
+      margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-sm);
+      color: var(--text); background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 0.3em 0.7em; white-space: nowrap;
+    }
+    .tracer-total b { color: var(--accent-strong); }
+
+    .tracer-track {
+      display: flex; align-items: center; overflow-x: auto;
+      padding: var(--sp-2) var(--sp-1) var(--sp-4);
+      -webkit-overflow-scrolling: touch;
+    }
+    .hop {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 0.3rem;
+      min-width: 104px; font: inherit; color: var(--text); text-align: center;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-3) var(--sp-3); cursor: pointer;
+      transition: border-color .15s, background .15s, opacity .15s, transform .1s;
+    }
+    .hop .hop-name { font-weight: 600; font-size: var(--fs-sm); line-height: 1.25; }
+    .hop .hop-ms { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+    .hop:hover { border-color: var(--accent); }
+    .hop:active { transform: translateY(1px); }
+    .hop.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: var(--ring); }
+    .hop.done { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); background: var(--ok-soft); }
+    .hop.done .hop-ms { color: var(--ok); }
+    .hop.skipped { opacity: 0.4; }
+    .hop.skipped .hop-name { text-decoration: line-through; }
+    .hop-arrow {
+      flex: 0 0 auto; color: var(--text-faint); font-family: var(--font-mono);
+      padding: 0 var(--sp-2); font-size: 1rem; user-select: none;
+    }
+    .tracer-detail {
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4); font-size: var(--fs-sm); color: var(--text-muted); min-height: 3.4em;
+    }
+    .tracer-detail b { color: var(--text); }
+    .tracer-waterfall { margin-top: var(--sp-4); display: grid; gap: 0.4rem; }
+    .tracer-waterfall .wf-row {
+      display: grid; grid-template-columns: 128px 1fr auto; align-items: center; gap: var(--sp-3);
+      font-size: var(--fs-sm);
+    }
+    .tracer-waterfall .wf-label { font-family: var(--font-mono); color: var(--text-muted); text-align: right; }
+    .tracer-waterfall .wf-bar-track { background: var(--surface-2); border-radius: 999px; height: 10px; overflow: hidden; }
+    .tracer-waterfall .wf-bar {
+      height: 100%; border-radius: 999px; width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--blueprint));
+      transition: width .5s ease;
+    }
+    .tracer-waterfall .wf-ms { font-family: var(--font-mono); color: var(--text); min-width: 3.6em; }
+    @media (max-width: 560px) {
+      .tracer-total { margin-left: 0; }
+      .tracer-waterfall .wf-row { grid-template-columns: 84px 1fr auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Foundations // 01</p>
+    <h1>Anatomy of a Backend Service</h1>
+
+    <p>
+      If a backend interviewer says <em>"not enough evidence you can design and implement
+      production-ready backend services,"</em> it almost never means you can't write a handler
+      function. It means you don't yet have a stable mental map of everything a request touches
+      between a client hitting "send" and a response coming back — and everything that has to be
+      true of a service for that round trip to be dependable at 3&nbsp;AM, under load, with a
+      teammate on call instead of you. This page builds that map. Every later topic in this
+      course — networking, data, distributed systems, reliability, security — is a zoom-in on one
+      piece of it.
+    </p>
+
+    <p>
+      A useful working definition: a <span class="term">backend service</span> is a program that
+      receives requests over a network, does something with state (read it, change it, coordinate
+      it with other services), and returns a response — reliably, at some scale, for as long as
+      it's expected to run. Everything on this page follows from taking that last clause
+      seriously.
+    </p>
+
+    <h2>The request lifecycle</h2>
+    <p>
+      Take the most ordinary case: a client calls <code>GET /api/orders/42</code> against
+      <code>api.example.com</code>. Before your handler function ever executes, the request has
+      already crossed several layers you don't own and rarely think about — and after your
+      handler returns, it crosses them again in reverse. Here's the full hop-by-hop path:
+    </p>
+
+    <dl class="definition">
+      <dt>1. Client</dt>
+      <dd>A browser, mobile app, or another backend service constructs the request: method, path,
+        headers (auth token, content type, trace id), and maybe a body. It hands this to the OS
+        network stack.</dd>
+
+      <dt>2. DNS resolution</dt>
+      <dd><code>api.example.com</code> has to become an IP address. A resolver walks the DNS
+        hierarchy (root → TLD → authoritative nameserver) if nothing is cached — tens of
+        milliseconds. If it's cached (by the OS, the browser, or an intermediate resolver, within
+        the record's TTL), this is close to free. This is your first lesson in a recurring theme:
+        <b>caching turns an expensive step into a cheap one, and the cache's staleness window
+        becomes your problem later.</b></dd>
+
+      <dt>3. TCP + TLS handshake</dt>
+      <dd>A TCP three-way handshake opens a connection (one round trip), then TLS negotiates
+        encryption on top of it (one more round trip on TLS 1.3, two on TLS 1.2). Paid once per
+        connection — <em>not</em> once per request — which is exactly why connection reuse
+        (keep-alive, connection pooling) matters so much for latency at scale. You'll go deep on
+        this in <em>Networking &amp; Protocols</em>.</dd>
+
+      <dt>4. Load balancer</dt>
+      <dd>The connection lands on a load balancer (L4, working on IP/port, or L7, working on
+        HTTP semantics) that picks one of many healthy backend instances — by round-robin,
+        least-connections, or a hash — and forwards the request. It's also usually where TLS is
+        terminated, and where a health check silently stops sending traffic to an instance that's
+        unhealthy. None of your application code runs yet.</dd>
+
+      <dt>5. App server</dt>
+      <dd>The request reaches a process running your code. It flows through a middleware pipeline
+        — routing, authentication, logging, rate limiting — and finally into the handler: the
+        actual business logic for "get order 42." This is the only hop on this list that's
+        <em>your</em> code; everything before it is infrastructure whose entire job is getting the
+        request here correctly.</dd>
+
+      <dt>6. Cache lookup</dt>
+      <dd>Before touching the database, a well-built handler often checks a cache (Redis,
+        memcached, an in-process cache) for the data it needs. A <b>hit</b> returns in
+        sub-millisecond time and the database is never touched. A <b>miss</b> falls through to the
+        next hop — and, in the naive implementation, so does every other concurrent request for
+        the same key. (That failure mode has a name — cache stampede — and its own deep-dive.)</dd>
+
+      <dt>7. Database / data store</dt>
+      <dd>On a cache miss, the handler queries the authoritative store. A query planner decides
+        how to execute the query (index scan vs. sequential scan, join strategy), the storage
+        engine reads pages from disk or page cache, and — if this write contends with another
+        transaction — the handler may wait on a lock. This single hop is where most production
+        latency and most production incidents live, which is why <em>Data &amp; Databases</em> is
+        the largest area in this course.</dd>
+
+      <dt>8. Downstream services (optional)</dt>
+      <dd>Many handlers aren't done yet — they call one or more other internal services (a
+        payments service, a recommendations service, a fraud check). Each of those calls is its
+        own full request lifecycle, nested inside yours, with its own network hop, its own
+        latency, and its own chance of failing or being slow. This is the seed of fan-out latency
+        and cascading failure — the subject of <em>Resilience Patterns</em> later on.</dd>
+
+      <dt>9. Response</dt>
+      <dd>The handler serializes a response body (JSON, protobuf, …), sets a status code and
+        headers, and returns. The response flows back through the app server, the load balancer,
+        and the already-open TLS connection to the client. Total time from step 1 to now is what
+        the client — and your dashboards — call <b>latency</b>.</dd>
+    </dl>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Every one of those nine hops can fail or be slow independently, and none of them know
+        about the others. "Production-ready" starts with designing as if every hop <em>will</em>
+        eventually fail, because at scale and over time, it will.</p>
+      </div>
+    </div>
+
+    <p>
+      The widget below lets you trace this path yourself. Toggle whether the cache hits and
+      whether a downstream service gets called, then send a request and watch where the time
+      actually goes.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Request tracer</div>
+
+      <div class="tracer-controls">
+        <button class="btn" id="sendBtn">Send request →</button>
+        <label><input type="checkbox" id="cacheHit" /> Cache hit</label>
+        <label><input type="checkbox" id="callDownstream" /> Handler calls a downstream service</label>
+        <span class="tracer-total" id="tracerTotal">Total latency: <b>—</b></span>
+      </div>
+
+      <div class="tracer-track" id="tracerTrack"><!-- hops injected by JS --></div>
+
+      <div class="tracer-detail" id="tracerDetail">
+        Click any hop to inspect it, or hit <b>Send request</b> to trace a full call. Try checking
+        "Cache hit" and sending again — watch the database hop get skipped and the total drop.
+      </div>
+
+      <div class="tracer-waterfall" id="tracerWaterfall"></div>
+    </div>
+
+    <h2>The layers of a real service</h2>
+    <p>
+      Zoom into hop 5 — "app server" — and it isn't one thing. A service you'd actually deploy has
+      its own internal layering, and knowing which layer a piece of logic belongs in is most of
+      what "clean architecture" means in practice.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Layer</th><th>Responsibility</th><th>Example</th><th>If it's missing / wrong</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Edge / network</td>
+            <td>TLS termination, routing, DDoS protection, static-asset delivery</td>
+            <td>Load balancer, CDN, API gateway</td>
+            <td>Every instance re-terminates TLS; no protection from traffic spikes or abuse</td>
+          </tr>
+          <tr>
+            <td>API / presentation</td>
+            <td>Parse and validate the request, enforce the contract, shape the response</td>
+            <td>Route handlers, request/response DTOs, input validation</td>
+            <td>Malformed input reaches business logic; internal errors leak to clients</td>
+          </tr>
+          <tr>
+            <td>Business logic</td>
+            <td>The actual rules: what "place an order" means, what's allowed, what happens next</td>
+            <td>Domain/service classes, use-case functions</td>
+            <td>Rules get duplicated across handlers, or leak into SQL / the UI</td>
+          </tr>
+          <tr>
+            <td>Data access</td>
+            <td>Talk to stores and caches; translate between domain objects and rows/documents</td>
+            <td>Repositories, ORMs, query modules</td>
+            <td>SQL scattered through business logic; no single place to add a cache or an index hint</td>
+          </tr>
+          <tr>
+            <td>Cross-cutting / infra</td>
+            <td>Config, secrets, auth, logging, metrics, tracing — needed everywhere, owned by none of the above</td>
+            <td>Middleware, a config loader, an observability SDK</td>
+            <td>Every layer reinvents logging; secrets end up hardcoded; nothing is traceable</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The point of separating these isn't ceremony — it's that each layer fails and changes for
+      different reasons, on different timelines, owned by different people. A schema migration
+      shouldn't require touching the API layer; a new auth provider shouldn't require touching
+      business logic. When a bug report comes in, "which layer" is usually the first productive
+      question.
+    </p>
+
+    <h2>Stateless vs. stateful</h2>
+    <p>
+      This is the single most consequential design axis in the whole diagram, because it decides
+      whether you can survive success. A component is <span class="term">stateless</span> if any
+      instance of it can handle any request, because no request-specific data lives only in one
+      instance's memory. A component is <span class="term">stateful</span> if it's the opposite —
+      it holds data that would be lost, or would make answers inconsistent, if you routed the next
+      request to a different instance.
+    </p>
+
+    <div class="definition">
+      <dt>Typically stateless</dt>
+      <dd>App servers / API handlers, most business logic, load balancers themselves (modulo
+        sticky-session config) — as long as they don't keep per-user data in local memory or on
+        local disk between requests.</dd>
+      <dt>Typically stateful</dt>
+      <dd>Databases, caches, message queues, session stores, anything with a local filesystem
+        that matters (uploaded files not pushed to object storage, an in-memory rate-limit
+        counter).</dd>
+    </div>
+
+    <p>
+      Why it matters: a stateless app tier can be scaled horizontally by adding identical
+      instances behind a load balancer, with zero coordination — this is the entire trick behind
+      cloud elasticity and auto-scaling, and it's the precondition for <em>Scaling &amp; Load
+      Balancing</em> later in this course. A stateful component can't be scaled that way; it needs
+      replication, partitioning, or consensus to add capacity without losing or splitting data —
+      each of which is an entire area of this roadmap on its own.
+    </p>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p><b>Sticky sessions</b> — routing a user to "their" instance because that's where their
+        session lives in memory — is the classic way statefulness sneaks into an app tier that was
+        supposed to be stateless. It works until that instance is redeployed, crashes, or is
+        auto-scaled away, silently losing every session pinned to it. The fix is almost always to
+        push the state out: a shared session store (Redis), a signed token the client holds (JWT),
+        or a database row — so <em>any</em> instance can serve <em>any</em> request again.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A model-serving fleet is the same shape: the inference workers should be stateless —
+        any replica can score any request, so you scale by adding pods — while the model weights,
+        the feature store, and any request-level cache are the stateful pieces that actually need
+        careful engineering (versioning, replication, consistency). If you've ever debugged "why
+        does this pod give a different prediction than that one," it was almost certainly state
+        that leaked into a component that was supposed to be stateless — a locally cached model
+        version, a warm feature cache that diverged. Same failure mode, different noun.</p>
+      </div>
+    </div>
+
+    <h2>What "production-ready" actually means</h2>
+    <p>
+      "Production-ready" is vague enough to be useless unless you break it into checkable
+      properties. Here's the working definition this course uses — five pillars, each of which
+      gets its own deep-dive later:
+    </p>
+
+    <dl class="definition">
+      <dt>Reliable</dt>
+      <dd>The service does the right thing under failure, not just under the happy path: it
+        survives a dependency timing out, a spike in traffic, an instance dying mid-request.
+        <i>What breaks without it:</i> one slow downstream call exhausts your thread pool and
+        takes the whole service down with it — a cascading failure from a single weak link.</dd>
+
+      <dt>Observable</dt>
+      <dd>You can answer "what is it doing right now, and why" from logs, metrics, and traces —
+        without SSH-ing into a box. <i>What breaks without it:</i> a latency regression ships, a
+        customer complains three days later, and nobody can reconstruct what happened because
+        nothing was measured or ever will be.</dd>
+
+      <dt>Secure</dt>
+      <dd>It correctly authenticates and authorizes every request, never trusts client input, and
+        keeps secrets out of code and logs. <i>What breaks without it:</i> the breach — an
+        unauthenticated endpoint, a SQL injection, an API key committed to a public repo.</dd>
+
+      <dt>Operable</dt>
+      <dd>It can be deployed, rolled back, scaled, and configured without a single person's tribal
+        knowledge — runbooks exist, config isn't hardcoded, deploys are boring. <i>What breaks
+        without it:</i> the one engineer who knows how to restart it correctly is on vacation
+        during the incident.</dd>
+
+      <dt>Owned</dt>
+      <dd>Someone is accountable for it staying healthy — on-call rotation, a clear escalation
+        path, alerts that reach a real person. <i>What breaks without it:</i> the alert fires into
+        a channel nobody reads, for a service everyone assumes someone else is watching.</dd>
+    </dl>
+
+    <p>
+      Notice none of these five is "has tests" or "is fast" in isolation — those are inputs to
+      reliability and operability, not the goal itself. When an interviewer probes for
+      "production-ready" thinking, they're checking whether you reach for these five
+      properties unprompted, not whether you can recite a framework's routing syntax.
+    </p>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A client reuses an open keep-alive connection for a second request to
+          the same API. What happens to the TLS handshake cost on that second request?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Paid again — TLS is negotiated per request, not per connection.</button>
+          <button class="quiz-option" data-choice="b">Not paid again — the handshake happened once when the connection opened, and this request reuses it.</button>
+          <button class="quiz-option" data-choice="c">Paid again, but only half the cost, since the certificate is cached.</button>
+        </div>
+        <p class="quiz-explain" hidden>TLS establishes an encrypted channel over a TCP connection — once that's done, every subsequent request on the same connection rides on it for free. This is exactly why connection pooling and keep-alive are a first-order performance lever, not a minor optimization.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. Which of these makes an app-server instance "stateless"?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It never writes to a database.</button>
+          <button class="quiz-option" data-choice="b">No per-request or per-user data lives only in that instance's memory — any instance could have handled the same request.</button>
+          <button class="quiz-option" data-choice="c">It runs in a container.</button>
+        </div>
+        <p class="quiz-explain" hidden>Statelessness is about where request-specific data lives, not about whether the service touches durable storage (it usually does — that's what the database is for) or how it's packaged. A containerized app server that keeps a session in local memory is just as stateful as one running on bare metal.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. A service has had 100% uptime this quarter, but when latency creeps up, nobody can tell you the p99, which endpoint is slow, or when it started — without manually grepping logs on a box. Which production-readiness pillar is missing?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Reliable</button>
+          <button class="quiz-option" data-choice="b">Secure</button>
+          <button class="quiz-option" data-choice="c">Observable</button>
+        </div>
+        <p class="quiz-explain" hidden>Uptime alone doesn't tell you the service is observable. Reliability is about surviving failure; observability is about being able to *see* what's happening — metrics, logs, and traces that let you answer "what, when, where" without spelunking. A service can be up and completely opaque at the same time.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page was the map. The next two Foundations deep-dives zoom into the two hops that
+      dominate everything downstream: <em>Networking &amp; Protocols</em> covers what really
+      happens in hops 2–4 (DNS, TCP/TLS, and why HTTP/2 exists), and <em>Concurrency, Threads
+      &amp; Async I/O</em> covers what happens <em>inside</em> hop 5 when many requests arrive at
+      once — the mechanism behind that "one slow downstream call takes down the service" failure
+      mode mentioned above.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var STAGES = [
+        { id: "client", name: "Client", ms: 0,
+          detail: "The browser, mobile app, or another service builds the request — method, path, headers, body — and hands it to the OS network stack." },
+        { id: "dns", name: "DNS", ms: 8,
+          detail: "Resolve the hostname to an IP. A cold lookup walks the DNS hierarchy (root → TLD → authoritative) — tens of ms. A cached one is close to free, until the TTL expires." },
+        { id: "tls", name: "TCP + TLS", ms: 35,
+          detail: "TCP handshake (1 round trip) then TLS (1–2 round trips) establish an encrypted connection. Paid once per connection, not per request — connection reuse is what makes this cheap in aggregate." },
+        { id: "lb", name: "Load balancer", ms: 1,
+          detail: "Picks a healthy backend instance (round-robin, least-connections, hashing) and forwards the request. Often terminates TLS and evicts unhealthy instances via health checks." },
+        { id: "app", name: "App server", ms: 4,
+          detail: "The request enters your process: middleware (auth, logging, rate limiting) runs, then the handler — your business logic — executes." },
+        { id: "cache", name: "Cache", ms: 1,
+          detail: "A lookup in Redis/memcached/an in-process cache for the data the handler needs. A hit returns here; a miss falls through to the database." },
+        { id: "db", name: "Database", ms: 22,
+          detail: "On a cache miss, the authoritative store is queried: the planner picks a strategy (index scan, join), the storage engine reads data, and locks may be waited on." },
+        { id: "downstream", name: "Downstream service", ms: 45,
+          detail: "An optional call to another internal service (payments, recommendations, …) — its own full request lifecycle nested inside yours, with its own chance of being slow or failing." },
+        { id: "response", name: "Response", ms: 2,
+          detail: "The handler serializes the response and it flows back through the app server, load balancer, and the already-open TLS connection to the client." }
+      ];
+
+      var track = document.getElementById("tracerTrack");
+      var detailBox = document.getElementById("tracerDetail");
+      var totalBox = document.getElementById("tracerTotal");
+      var waterfall = document.getElementById("tracerWaterfall");
+      var sendBtn = document.getElementById("sendBtn");
+      var cacheHitBox = document.getElementById("cacheHit");
+      var downstreamBox = document.getElementById("callDownstream");
+
+      var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      var hopEls = {};
+      var running = false;
+
+      STAGES.forEach(function (stage, i) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "hop";
+        btn.dataset.stage = stage.id;
+        btn.innerHTML =
+          '<span class="hop-name">' + stage.name + '</span>' +
+          '<span class="hop-ms">' + (stage.ms > 0 ? "~" + stage.ms + "ms" : "origin") + '</span>';
+        btn.addEventListener("click", function () { showDetail(stage); });
+        track.appendChild(btn);
+        hopEls[stage.id] = btn;
+
+        if (i < STAGES.length - 1) {
+          var arrow = document.createElement("span");
+          arrow.className = "hop-arrow";
+          arrow.setAttribute("aria-hidden", "true");
+          arrow.textContent = "→";
+          track.appendChild(arrow);
+        }
+      });
+
+      function showDetail(stage) {
+        detailBox.innerHTML = "<b>" + stage.name + "</b> — " + stage.detail;
+      }
+
+      function resetHops() {
+        STAGES.forEach(function (s) {
+          hopEls[s.id].classList.remove("active", "done", "skipped");
+        });
+      }
+
+      function buildPath(cacheHit, downstream) {
+        var path = ["client", "dns", "tls", "lb", "app", "cache"];
+        if (!cacheHit) path.push("db");
+        if (downstream) path.push("downstream");
+        path.push("response");
+        return path;
+      }
+
+      function sleep(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, reduceMotion ? 0 : ms); });
+      }
+
+      async function runTrace() {
+        if (running) return;
+        running = true;
+        sendBtn.disabled = true;
+        resetHops();
+        waterfall.innerHTML = "";
+        totalBox.innerHTML = 'Total latency: <b>tracing…</b>';
+
+        var cacheHit = cacheHitBox.checked;
+        var downstream = downstreamBox.checked;
+        var path = buildPath(cacheHit, downstream);
+        var pathSet = {};
+        path.forEach(function (id) { pathSet[id] = true; });
+
+        STAGES.forEach(function (s) {
+          if (!pathSet[s.id]) hopEls[s.id].classList.add("skipped");
+        });
+
+        var total = 0;
+        var rows = [];
+
+        for (var i = 0; i < path.length; i++) {
+          var stage = STAGES.filter(function (s) { return s.id === path[i]; })[0];
+          hopEls[stage.id].classList.add("active");
+          showDetail(stage);
+          await sleep(320);
+          hopEls[stage.id].classList.remove("active");
+          hopEls[stage.id].classList.add("done");
+          total += stage.ms;
+          rows.push(stage);
+        }
+
+        totalBox.innerHTML = "Total latency: <b>~" + total + "ms</b>";
+        renderWaterfall(rows, total);
+        sendBtn.disabled = false;
+        running = false;
+
+        var note = cacheHit
+          ? "Cache hit — the database hop was skipped entirely."
+          : "Cache miss — the database was queried, adding real latency.";
+        detailBox.innerHTML = "<b>Trace complete.</b> " + note +
+          (downstream ? " A downstream service call was included." : "");
+      }
+
+      function renderWaterfall(rows, total) {
+        waterfall.innerHTML = "";
+        var max = Math.max.apply(null, rows.map(function (r) { return r.ms; }).concat([1]));
+        rows.forEach(function (r) {
+          var row = document.createElement("div");
+          row.className = "wf-row";
+          var pct = Math.max(4, Math.round((r.ms / max) * 100));
+          row.innerHTML =
+            '<span class="wf-label">' + r.name + '</span>' +
+            '<span class="wf-bar-track"><span class="wf-bar" style="width:' + pct + '%"></span></span>' +
+            '<span class="wf-ms">' + r.ms + 'ms</span>';
+          waterfall.appendChild(row);
+        });
+      }
+
+      sendBtn.addEventListener("click", runTrace);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

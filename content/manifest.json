@@ -20,7 +20,7 @@
       "summary": "The request lifecycle end to end, the layers of a real service, and what 'production-ready' means.",
       "prerequisites": [],
       "file": "anatomy-of-a-backend.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "networking-for-backend",
