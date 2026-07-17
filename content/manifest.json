@@ -30,7 +30,7 @@
       "summary": "TCP/TLS/DNS, HTTP/1.1 vs 2 vs 3, connection pooling, and the timeout/retry budget.",
       "prerequisites": ["anatomy-of-a-backend"],
       "file": "networking-for-backend.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "concurrency-and-io",

@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Networking &amp; Protocols for Backend Engineers — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the HTTP/1.1 vs HTTP/2 timeline widget only. */
+    .net-controls {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      margin-bottom: var(--sp-5);
+    }
+    .net-controls label {
+      display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em;
+    }
+    .net-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+
+    .net-compare { display: grid; gap: var(--sp-5); grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .net-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4);
+    }
+    .net-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+    .net-card-head h4 { margin: 0; font-size: var(--fs-md); color: var(--text); }
+    .net-total { font-family: var(--font-mono); font-size: var(--fs-md); color: var(--text); }
+    .net-total b { color: var(--accent-strong); }
+    .net-card.winner { border-color: var(--ok); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 40%, transparent); }
+    .net-card.winner .net-total b { color: var(--ok); }
+
+    .net-lanes { display: grid; gap: 4px; }
+    .net-lane {
+      position: relative; height: 20px; background: var(--surface-2);
+      border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+    }
+    .net-seg {
+      position: absolute; top: 0; bottom: 0;
+      background: linear-gradient(90deg, var(--accent), var(--blueprint));
+      opacity: 0.88;
+    }
+    .net-seg.handshake { background: var(--text-faint); opacity: 0.55; }
+    .net-seg.stall { background: repeating-linear-gradient(45deg, var(--danger), var(--danger) 4px, var(--danger-soft) 4px, var(--danger-soft) 8px); opacity: 0.85; }
+    .net-legend { display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-3); font-size: var(--fs-sm); color: var(--text-muted); }
+    .net-legend span { display: inline-flex; align-items: center; gap: 0.4em; }
+    .net-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .net-legend i.handshake { background: var(--text-faint); }
+    .net-legend i.transfer { background: linear-gradient(90deg, var(--accent), var(--blueprint)); }
+    .net-legend i.stall { background: var(--danger); }
+    .net-note { margin-top: var(--sp-4); font-size: var(--fs-sm); color: var(--text-muted); }
+
+    @media (max-width: 560px) { .net-controls { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Foundations // 02</p>
+    <h1>Networking &amp; Protocols for Backend Engineers</h1>
+
+    <p>
+      The <a href="anatomy-of-a-backend.html">request lifecycle</a> spent three of its nine hops —
+      DNS, TCP+TLS, and the load balancer — on infrastructure that exists purely to get bytes from
+      a client to your process and back. This page zooms into those hops, because they're where
+      the <span class="term">first fallacy of distributed computing</span> stops being a slogan and
+      starts being your on-call reality: <b>the network is not reliable.</b> Packets get dropped,
+      reordered, and delayed; connections die mid-request; DNS answers go stale. Every design
+      decision in this page — handshakes, protocol choice, pooling, timeouts — is a response to
+      that one uncomfortable fact.
+    </p>
+
+    <h2>TCP vs. UDP: the two contracts</h2>
+    <p>
+      Almost everything you build sits on top of one of two transport protocols, and they make
+      opposite promises.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>TCP</th><th>UDP</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Contract</td>
+            <td>Reliable, ordered, connection-oriented byte stream</td>
+            <td>Best-effort, unordered, connectionless datagrams</td>
+          </tr>
+          <tr>
+            <td>Delivery</td>
+            <td>Guaranteed (retransmits lost packets) or the connection errors out</td>
+            <td>Not guaranteed — a lost packet is just gone unless the application retries</td>
+          </tr>
+          <tr>
+            <td>Ordering</td>
+            <td>Guaranteed — the OS reorders/buffers for you</td>
+            <td>None — packets can arrive out of order, or not at all</td>
+          </tr>
+          <tr>
+            <td>Setup cost</td>
+            <td>A handshake before any data flows (see below)</td>
+            <td>None — first packet <em>is</em> the first data</td>
+          </tr>
+          <tr>
+            <td>Typical use</td>
+            <td>HTTP/1.1, HTTP/2, gRPC, databases, anything correctness-sensitive</td>
+            <td>DNS queries, video/voice, gaming, and — surprisingly — HTTP/3 (built on QUIC, over UDP)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The instinct "TCP is always safer" is wrong often enough to matter: TCP's reliability comes
+      from retransmission and strict ordering, and both cost latency. A single dropped packet in a
+      live video call is better replaced by the <em>next</em> frame than retransmitted three
+      round trips late — which is exactly why real-time media uses UDP-based protocols (RTP) and
+      tolerates loss instead of paying to fix it. Keep this trade-off in mind; it resurfaces below
+      when HTTP/3 makes the same call for web traffic.
+    </p>
+
+    <h2>The TCP handshake — and why it's not free</h2>
+    <p>
+      Before a single byte of your request travels, TCP negotiates a connection: <b>SYN</b> (client
+      → server), <b>SYN-ACK</b> (server → client), <b>ACK</b> (client → server). That's one full
+      round trip before the client can even send its first real byte. On a connection with 40ms
+      round-trip time (RTT) to the server, you've spent 40ms and transferred nothing.
+    </p>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>RTT, not one-way latency, is the unit that matters for handshake math — every
+        "negotiation" step is a round trip, and round trips are dominated by the speed of light and
+        the number of network hops, not your server's CPU. A cross-continent connection (~70–100ms
+        RTT) pays for every round trip your protocol demands; a same-datacenter one (~0.5ms) barely
+        notices.</p>
+      </div>
+    </div>
+
+    <p>
+      Then <b>TLS</b> layers encryption on top, and it's another negotiation: TLS 1.3 (current
+      standard) needs one more round trip (or even zero, with session resumption / 0-RTT for
+      returning clients); TLS 1.2 needs two. So a fresh HTTPS connection on TLS 1.3, cold, costs
+      roughly <b>2 RTT</b> before the first application byte moves — TCP's 1 RTT plus TLS's 1 RTT.
+      That's the "TCP + TLS" hop from the anatomy page, now with a number attached.
+    </p>
+
+    <p>
+      <b>TLS termination</b> is a placement decision, not just a crypto one: terminate at the load
+      balancer (common) and the LB→backend hop can run plaintext inside your trusted network
+      (simpler cert management, one place to rotate certs) or re-encrypt it (mutual TLS,
+      zero-trust internal networking — more common now that "trusted internal network" is a
+      weaker assumption than it used to be). Terminate at the origin instead, and the LB stays a
+      dumb, fast packet-forwarder but every backend instance needs the certificate.
+    </p>
+
+    <h2>DNS: the lookup that's supposed to be invisible</h2>
+    <p>
+      Turning <code>api.example.com</code> into an IP address is a hierarchical walk — your
+      resolver asks a root server, which delegates to a <code>.com</code> TLD server, which
+      delegates to your domain's authoritative nameserver — unless the answer is already cached
+      somewhere along that chain, which it usually is. Each DNS record carries a <b>TTL</b> (time
+      to live) that governs how long it's allowed to be cached before the walk has to happen again.
+    </p>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>A long TTL makes lookups nearly free but makes your infrastructure <em>slow to change</em>:
+        if you repoint a hostname during an incident (failover to a backup region), clients holding
+        a cached record from an hour-long TTL won't see the change until it expires. This is why
+        teams often drop TTLs to something short (60s) <em>before</em> a planned migration, and why
+        "just update DNS" is a much slower lever during an active incident than people expect.</p>
+      </div>
+    </div>
+
+    <h2>HTTP/1.1 → HTTP/2 → HTTP/3: solving head-of-line blocking</h2>
+    <p>
+      Once the connection exists, the application-layer protocol decides how requests actually
+      travel over it — and the whole story of HTTP's evolution is about one problem:
+      <span class="term">head-of-line (HOL) blocking</span> — one slow or stuck request delaying
+      everything queued behind it.
+    </p>
+
+    <dl class="definition">
+      <dt>HTTP/1.1</dt>
+      <dd>One request in flight per connection at a time (without pipelining, which browsers
+        never really shipped because a slow response still blocks everything behind it — HOL
+        blocking at the application layer). Browsers work around this by opening multiple parallel
+        connections to the same origin — typically 6 — each paying its own handshake cost, each
+        serially blocked within itself.</dd>
+
+      <dt>HTTP/2</dt>
+      <dd><b>Multiplexing:</b> many logical request/response "streams" interleaved over a
+        <em>single</em> TCP connection, each broken into frames tagged with a stream ID so they can
+        be reassembled independently. One connection, one handshake, and no more application-level
+        HOL blocking — a slow response no longer blocks an unrelated fast one queued after it.</dd>
+
+      <dt>HTTP/3</dt>
+      <dd>Built on <b>QUIC</b>, which runs over UDP instead of TCP. Why: HTTP/2's multiplexing
+        removed HOL blocking at the <em>application</em> layer, but it still runs over one TCP
+        connection — and TCP itself enforces strict in-order delivery for the whole connection. A
+        single lost packet still stalls <em>every</em> HTTP/2 stream until it's retransmitted,
+        because TCP won't hand any later bytes to the application until the gap is filled. QUIC
+        moves stream multiplexing into the transport itself, so loss on one stream no longer blocks
+        the others — it also folds the transport and TLS 1.3 handshakes into a single round trip.</dd>
+    </dl>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Each HTTP version fixes head-of-line blocking at a <em>lower</em> layer than the one
+        before it: HTTP/2 fixes it at the application layer (multiplexed streams instead of
+        strictly serial requests), and HTTP/3 fixes it at the transport layer (UDP-based QUIC
+        instead of TCP). This is a useful lens for reading almost any protocol upgrade: ask which
+        layer's ordering guarantee was creating the bottleneck.</p>
+      </div>
+    </div>
+
+    <p>
+      The widget below makes this concrete. It compares HTTP/1.1 (6 parallel connections) against
+      HTTP/2 (1 multiplexed connection) for fetching N resources, and adds a packet-loss slider to
+      show <em>why</em> HTTP/2's single-connection design has a weak spot that HTTP/3 exists to fix.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Connection timeline: HTTP/1.1 vs HTTP/2</div>
+
+      <div class="net-controls">
+        <div>
+          <label for="numRes">Resources to fetch: <span class="val" id="numResVal">12</span></label>
+          <input type="range" id="numRes" min="1" max="24" value="12" />
+        </div>
+        <div>
+          <label for="rtt">Network RTT: <span class="val" id="rttVal">80ms</span></label>
+          <input type="range" id="rtt" min="10" max="300" step="10" value="80" />
+        </div>
+        <div>
+          <label for="loss">Packet loss on the wire: <span class="val" id="lossVal">0%</span></label>
+          <input type="range" id="loss" min="0" max="20" step="1" value="0" />
+        </div>
+      </div>
+
+      <div class="net-compare">
+        <div class="net-card" id="card11">
+          <div class="net-card-head">
+            <h4>HTTP/1.1 <span class="badge">6 connections</span></h4>
+            <span class="net-total">Total: <b id="total11">—</b></span>
+          </div>
+          <div class="net-lanes" id="lanes11"></div>
+        </div>
+        <div class="net-card" id="card2">
+          <div class="net-card-head">
+            <h4>HTTP/2 <span class="badge">1 connection</span></h4>
+            <span class="net-total">Total: <b id="total2">—</b></span>
+          </div>
+          <div class="net-lanes" id="lanes2"></div>
+        </div>
+      </div>
+
+      <div class="net-legend">
+        <span><i class="handshake"></i> Handshake (TCP+TLS)</span>
+        <span><i class="transfer"></i> Request/response transfer</span>
+        <span><i class="stall"></i> Loss-triggered retransmit stall</span>
+      </div>
+
+      <p class="net-note" id="netNote"></p>
+    </div>
+
+    <p>
+      At zero packet loss, HTTP/2 wins comfortably: one handshake instead of six, and every
+      resource travels concurrently instead of queueing behind five other connections' worth of
+      requests. Push the loss slider up, though, and watch the gap close — because HTTP/2's single
+      TCP connection means one dropped packet stalls <em>all</em> multiplexed streams at once,
+      while HTTP/1.1's six independent connections only ever lose the one connection that actually
+      dropped a packet. That's precisely the TCP-level HOL blocking HTTP/3/QUIC was built to
+      eliminate, and precisely why "just use HTTP/2" isn't a universal answer on lossy networks
+      (mobile, satellite, congested Wi-Fi).
+    </p>
+
+    <h2>Connection pooling and keep-alive</h2>
+    <p>
+      Paying 1–2 RTT to open a connection is fine once. Paying it on <em>every request</em> is not
+      — and it's exactly what happens if a client opens a fresh connection per call instead of
+      reusing one. <b>Keep-alive</b> (the default in HTTP/1.1 with <code>Connection: keep-alive</code>,
+      implicit in HTTP/2) keeps a TCP connection open across multiple requests so the handshake
+      cost is amortized. A <b>connection pool</b> takes this further on the client/service side: a
+      fixed set of pre-warmed, reusable connections to a downstream (a database, another service)
+      that requests borrow and return instead of opening new ones.
+    </p>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>A connection pool is a <em>finite resource</em>, and sizing it wrong causes two opposite
+        failures. Too small, and requests queue waiting for a free connection under load — you'll
+        see this as latency that spikes with traffic even though the downstream itself is healthy.
+        Too large, and you can overwhelm a downstream that has its own connection limits (a common
+        way to accidentally take down a database: N app instances × a pool size of M, all opening
+        connections, can exceed what the DB was provisioned for). Pool sizing is a capacity-planning
+        problem, not a "set it high and forget it" one — the same theme returns in
+        <em>Concurrency, Threads &amp; Async I/O</em>.</p>
+      </div>
+    </div>
+
+    <h2>The timeout/retry budget</h2>
+    <p>
+      Every network call your service makes needs an answer to "how long do I wait before giving
+      up?" — a <b>timeout</b> — because the alternative is a thread or connection held hostage by a
+      downstream that may simply never respond. Get this wrong and a single wedged dependency can
+      exhaust your entire capacity, one blocked caller at a time — the cascading-failure seed
+      mentioned on the anatomy page.
+    </p>
+    <p>
+      Timeouts compose badly if you're not deliberate about it. If service A calls B calls C, and
+      each layer independently sets a generous 30-second timeout, a slow C can hold open A's
+      request for the full chain — 90 seconds — instead of failing fast. The fix is a
+      <span class="term">deadline budget</span>: the caller decides a total time budget for the
+      whole chain, propagates the remaining budget downward (often as a header), and each hop
+      respects <em>that</em> deadline rather than inventing its own. This is standard practice in
+      gRPC (deadline propagation is a first-class feature) and worth deliberately building even
+      when your RPC framework doesn't hand it to you for free.
+    </p>
+    <p>
+      Retries are the other half of the budget, and they're a preview of <em>Resilience
+      Patterns</em> later in this course: retrying a timed-out call can turn one slow request into
+      several, and retrying <em>blindly</em> during an outage is how a struggling service gets
+      finished off by its own callers (a retry storm). The short version for now — never retry
+      without a cap, backoff, and jitter, and only retry calls that are safe to repeat
+      (idempotent).
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Online model serving lives or dies by this same budget. A feature store lookup, a
+        downstream model call in an ensemble, or a call out to a third-party enrichment API all eat
+        into the same request's latency budget as everything else — and a p99 SLA on your serving
+        endpoint is really a deadline budget split across every hop your inference path touches.
+        gRPC is the default transport for a reason here too: internal model-serving traffic is
+        service-to-service, schema matters, and streaming responses (token-by-token generation) map
+        directly onto what you'll see in the next area, <em>Beyond REST: gRPC, GraphQL &amp;
+        Streaming</em>.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A cold HTTPS connection using TLS 1.3 needs roughly how many round
+          trips before the first application byte can be sent?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Zero — TLS negotiation happens inside the TCP handshake.</button>
+          <button class="quiz-option" data-choice="b">About two — one for the TCP handshake, one for the TLS 1.3 handshake.</button>
+          <button class="quiz-option" data-choice="c">About four — TCP and TLS each need two full round trips.</button>
+        </div>
+        <p class="quiz-explain" hidden>TCP's SYN/SYN-ACK/ACK is one round trip, and TLS 1.3 adds one more (TLS 1.2 needed two). That ~2 RTT cost is paid once per connection — which is the entire justification for keep-alive and connection pooling.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. HTTP/2 removes head-of-line blocking at the application layer by
+          multiplexing streams over one TCP connection. Why can a single dropped packet still
+          stall every one of those streams?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">TCP guarantees strictly in-order delivery for the whole connection, so it withholds all later bytes — across every multiplexed stream — until the gap from the lost packet is retransmitted and filled.</button>
+          <button class="quiz-option" data-choice="b">HTTP/2 streams aren't actually independent — they share a single request queue internally.</button>
+          <button class="quiz-option" data-choice="c">Browsers only allow one HTTP/2 connection per tab, so a drop anywhere blocks the whole tab.</button>
+        </div>
+        <p class="quiz-explain" hidden>HTTP/2 fixed HOL blocking at the application layer, but it still rides on TCP, whose ordering guarantee is per-connection, not per-stream. QUIC (HTTP/3) fixes this by moving multiplexing into the transport itself, over UDP, so loss on one stream doesn't block the others.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. Service A calls B calls C. Each service independently sets its own
+          30-second timeout for its outbound call, with no shared deadline. C becomes slow. What's
+          the main problem with this setup?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nothing — as long as each hop has *a* timeout, the system is safe by definition.</button>
+          <button class="quiz-option" data-choice="b">TCP will automatically propagate C's slowness back to A within one RTT.</button>
+          <button class="quiz-option" data-choice="c">The timeouts compose: A's caller can end up waiting up to 90 seconds total, instead of the chain failing fast — because no hop knows about, or respects, an overall deadline.</button>
+        </div>
+        <p class="quiz-explain" hidden>Independently-set timeouts stack up across a call chain instead of sharing a budget. The fix is deadline propagation: the top-level caller sets a total time budget and passes the *remaining* time down at each hop, so every layer respects the same overall deadline instead of each inventing its own.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page covered what happens <em>between</em> machines. The next Foundations deep-dive,
+      <em>Concurrency, Threads &amp; Async I/O</em>, covers what happens the moment a request lands
+      inside a single process and many others arrive alongside it — the mechanism behind pool
+      exhaustion, and the direct ancestor of the connection-pool sizing problem raised above.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var numResEl = document.getElementById("numRes");
+      var rttEl = document.getElementById("rtt");
+      var lossEl = document.getElementById("loss");
+      var numResVal = document.getElementById("numResVal");
+      var rttVal = document.getElementById("rttVal");
+      var lossVal = document.getElementById("lossVal");
+
+      var lanes11 = document.getElementById("lanes11");
+      var lanes2 = document.getElementById("lanes2");
+      var total11 = document.getElementById("total11");
+      var total2 = document.getElementById("total2");
+      var card11 = document.getElementById("card11");
+      var card2 = document.getElementById("card2");
+      var netNote = document.getElementById("netNote");
+
+      var HTTP1_CONNECTIONS = 6;
+
+      function fmt(ms) { return Math.round(ms) + "ms"; }
+
+      function render() {
+        var n = parseInt(numResEl.value, 10);
+        var rtt = parseInt(rttEl.value, 10);
+        var loss = parseInt(lossEl.value, 10) / 100;
+
+        numResVal.textContent = n;
+        rttVal.textContent = rtt + "ms";
+        lossVal.textContent = Math.round(loss * 100) + "%";
+
+        // --- HTTP/1.1: up to 6 parallel connections, each serial within itself ---
+        var conns = Math.min(HTTP1_CONNECTIONS, n);
+        var handshake11 = 2 * rtt; // TCP + TLS, paid once per connection, opened in parallel
+        var perConn = new Array(conns).fill(0).map(function () { return 0; });
+        for (var i = 0; i < n; i++) perConn[i % conns]++;
+        var maxQueue = Math.max.apply(null, perConn);
+        var transfer11 = maxQueue * rtt; // serial requests on the busiest connection
+        var stall11 = loss * rtt * maxQueue; // loss retransmit only affects that connection's own queue
+        var total11ms = handshake11 + transfer11 + stall11;
+
+        // --- HTTP/2: single multiplexed connection ---
+        var handshake2 = 2 * rtt;
+        var transfer2 = rtt; // all N requests interleaved concurrently over one connection
+        var stall2 = loss * rtt * n; // TCP-level HOL blocking: one loss stalls every stream
+        var total2ms = handshake2 + transfer2 + stall2;
+
+        total11.textContent = fmt(total11ms);
+        total2.textContent = fmt(total2ms);
+
+        card11.classList.toggle("winner", total11ms < total2ms);
+        card2.classList.toggle("winner", total2ms <= total11ms);
+
+        renderLanes11(lanes11, conns, perConn, handshake11, rtt, loss);
+        renderLanes2(lanes2, n, handshake2, transfer2, stall2);
+
+        if (loss === 0) {
+          netNote.innerHTML = "No packet loss: HTTP/2's single handshake and full concurrency win outright.";
+        } else if (Math.abs(total11ms - total2ms) < rtt * 0.15) {
+          netNote.innerHTML = "Roughly tied: HTTP/2's efficiency advantage is being eaten by TCP-level head-of-line blocking under loss — every multiplexed stream stalls together.";
+        } else if (total2ms > total11ms) {
+          netNote.innerHTML = "HTTP/2 is now <b>slower</b>: with this much loss, six independent connections lose less collectively than one shared connection stalling every stream at once.";
+        } else {
+          netNote.innerHTML = "HTTP/2 still wins, but the margin has shrunk as loss increases the shared connection's stall cost.";
+        }
+      }
+
+      function pxWidth(ms, scale) { return Math.max(2, ms * scale); }
+
+      function renderLanes11(container, conns, perConn, handshake, rtt, loss) {
+        container.innerHTML = "";
+        var totalMax = handshake + Math.max.apply(null, perConn) * rtt * (1 + loss) + 40;
+        var scale = 260 / totalMax;
+        for (var c = 0; c < conns; c++) {
+          var lane = document.createElement("div");
+          lane.className = "net-lane";
+          var x = 0;
+          var hs = document.createElement("div");
+          hs.className = "net-seg handshake";
+          hs.style.left = x + "px";
+          hs.style.width = pxWidth(handshake, scale) + "px";
+          lane.appendChild(hs);
+          x += pxWidth(handshake, scale);
+
+          for (var r = 0; r < perConn[c]; r++) {
+            var seg = document.createElement("div");
+            seg.className = "net-seg";
+            seg.style.left = x + "px";
+            seg.style.width = pxWidth(rtt, scale) + "px";
+            lane.appendChild(seg);
+            x += pxWidth(rtt, scale);
+          }
+
+          if (loss > 0) {
+            var stall = document.createElement("div");
+            stall.className = "net-seg stall";
+            stall.style.left = x + "px";
+            stall.style.width = pxWidth(loss * rtt * perConn[c], scale) + "px";
+            lane.appendChild(stall);
+          }
+          container.appendChild(lane);
+        }
+      }
+
+      function renderLanes2(container, n, handshake, transfer, stall) {
+        container.innerHTML = "";
+        var totalMax = handshake + transfer + stall + 40;
+        var scale = 260 / totalMax;
+
+        var lane = document.createElement("div");
+        lane.className = "net-lane";
+        lane.style.height = "44px";
+        var x = 0;
+        var hs = document.createElement("div");
+        hs.className = "net-seg handshake";
+        hs.style.left = x + "px";
+        hs.style.width = pxWidth(handshake, scale) + "px";
+        lane.appendChild(hs);
+        x += pxWidth(handshake, scale);
+
+        // draw N multiplexed streams as thin stacked bars sharing the same transfer window
+        var w = pxWidth(transfer, scale);
+        var stripes = Math.min(n, 24);
+        for (var i = 0; i < stripes; i++) {
+          var seg = document.createElement("div");
+          seg.className = "net-seg";
+          seg.style.left = x + "px";
+          seg.style.width = w + "px";
+          seg.style.top = (i % 4) * 25 + "%";
+          seg.style.bottom = "auto";
+          seg.style.height = "25%";
+          seg.style.opacity = 0.55;
+          lane.appendChild(seg);
+        }
+        x += w;
+
+        if (stall > 0) {
+          var stallEl = document.createElement("div");
+          stallEl.className = "net-seg stall";
+          stallEl.style.left = x + "px";
+          stallEl.style.width = pxWidth(stall, scale) + "px";
+          lane.appendChild(stallEl);
+        }
+        container.appendChild(lane);
+      }
+
+      [numResEl, rttEl, lossEl].forEach(function (el) {
+        el.addEventListener("input", render);
+      });
+      render();
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
