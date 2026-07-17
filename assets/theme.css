@@ -133,8 +133,23 @@
 }
 
 /* Explicit theme overrides win in BOTH directions (viewer toggle stamps
-   data-theme on :root). */
-:root[data-theme="light"] { color-scheme: light; }
+   data-theme on :root). Each block re-declares the FULL palette so that
+   forcing one theme overrides the prefers-color-scheme media query even when
+   the OS prefers the opposite theme (e.g. force light on a dark-mode OS). */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg:#eef2f7; --bg-grid:#d7dee9; --surface:#ffffff; --surface-2:#f4f7fb;
+  --surface-code:#0f1b2d; --text:#10233b; --text-muted:#4a5d74;
+  --text-faint:#7488a0; --text-on-code:#dfe8f4; --border:#d3dce8;
+  --border-strong:#b9c6d6; --accent:#0c8d7d; --accent-strong:#0a7466;
+  --accent-soft:#d7f0ec; --blueprint:#2a63d6; --blueprint-soft:#dde7fb;
+  --ok:#1f9d51; --ok-soft:#d8f2e1; --warn:#b26a00; --warn-soft:#fbecd2;
+  --danger:#c8353c; --danger-soft:#fadfe0; --insight:#6b3fd4;
+  --insight-soft:#e7ddfb;
+  --shadow-1:0 1px 2px rgba(16,35,59,.06),0 2px 8px rgba(16,35,59,.06);
+  --shadow-2:0 6px 24px rgba(16,35,59,.12);
+  --ring:0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg:#0a1220; --bg-grid:#142238; --surface:#101c30; --surface-2:#16253c;
