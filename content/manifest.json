@@ -40,7 +40,7 @@
       "summary": "Blocking vs non-blocking I/O, threads vs event loops, pools, backpressure, and pool exhaustion.",
       "prerequisites": ["anatomy-of-a-backend"],
       "file": "concurrency-and-io.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "rest-api-design",
