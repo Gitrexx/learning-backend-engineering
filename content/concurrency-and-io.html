@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Concurrency, Threads &amp; Async I/O — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the concurrency-sandbox widget only. */
+    .cio-controls {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin-bottom: var(--sp-5);
+      align-items: end;
+    }
+    .cio-controls label {
+      display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em;
+    }
+    .cio-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .cio-toggle {
+      display: flex; align-items: center; gap: 0.6em;
+      font-size: var(--fs-sm); color: var(--text-muted);
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: var(--sp-3) var(--sp-4);
+    }
+    .cio-toggle input { width: auto; accent-color: var(--accent); }
+
+    .cio-actions { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-5); }
+
+    .cio-compare { display: grid; gap: var(--sp-5); grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .cio-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4);
+    }
+    .cio-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); flex-wrap: wrap; }
+    .cio-card-head h4 { margin: 0; font-size: var(--fs-md); color: var(--text); }
+
+    .cio-badge {
+      display: inline-flex; align-items: center; gap: 0.4em;
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.06em; text-transform: uppercase;
+      padding: 0.22em 0.6em; border-radius: 999px; border: 1px solid var(--border-strong);
+    }
+    .cio-badge-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .cio-badge-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+    .cio-badge-danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+
+    .cio-stats {
+      display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2) var(--sp-4);
+      font-size: var(--fs-sm); margin-bottom: var(--sp-3);
+    }
+    .cio-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); border-bottom: 1px dashed var(--border); padding-bottom: 0.3em; }
+    .cio-stat-label { color: var(--text-muted); }
+    .cio-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+
+    .cio-chart {
+      display: block; width: 100%; height: 70px;
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    }
+    .cio-chart-caption { font-size: var(--fs-eyebrow); color: var(--text-faint); font-family: var(--font-mono); margin-top: 0.4em; letter-spacing: 0.04em; }
+    .cio-note { margin-top: var(--sp-4); font-size: var(--fs-sm); color: var(--text-muted); }
+
+    @media (max-width: 560px) { .cio-controls { grid-template-columns: 1fr; } .cio-stats { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Foundations // 03</p>
+    <h1>Concurrency, Threads &amp; Async I/O</h1>
+
+    <p>
+      The <a href="anatomy-of-a-backend.html">request lifecycle</a> page treated "the app server
+      handles the request" as one box. The <a href="networking-for-backend.html">networking</a>
+      page flagged that a connection pool is a finite resource. This page opens both of those
+      boxes: what actually happens <em>inside a single process</em> the moment more than one
+      request needs attention at the same time — which, in production, is always. Get this model
+      right and you can reason about throughput, tail latency, and the specific way a service
+      falls over under load. Get it wrong and "just add more threads" or "just use async"
+      becomes cargo-culting instead of engineering.
+    </p>
+
+    <h2>Blocking vs. non-blocking I/O</h2>
+    <p>
+      Almost every backend request spends most of its time <em>waiting</em>, not computing — on a
+      database round trip, a downstream HTTP call, a disk read. The question that defines your
+      concurrency model is: <b>what does the thread do while it waits?</b>
+    </p>
+
+    <dl class="definition">
+      <dt>Blocking I/O</dt>
+      <dd>The calling thread issues the I/O operation and is suspended by the OS until it
+        completes — it cannot do anything else in the meantime. Simple to reason about (code
+        reads top-to-bottom, one line at a time) but the thread is dead weight for the whole
+        wait.</dd>
+      <dt>Non-blocking I/O</dt>
+      <dd>The thread issues the operation and immediately moves on to other work; the OS
+        notifies it (via a mechanism like <code>epoll</code>, <code>kqueue</code>, or IOCP) when
+        the operation is ready, and a scheduler resumes the associated work. One thread can have
+        thousands of I/O operations in flight at once because it's never sitting idle waiting on
+        any single one.</dd>
+    </dl>
+
+    <p>
+      Neither is "better" in the abstract — they're a trade between programming simplicity and
+      the number of concurrent waits a thread can absorb. The three concurrency models below are
+      really just three different answers to "how many blocking waits do I let pile up, and on
+      what?"
+    </p>
+
+    <h2>Three ways to handle many requests at once</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Unit of concurrency</th><th>Per-unit cost</th><th>Handles I/O-bound work</th><th>Handles CPU-bound work</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Thread-per-request</b></td>
+            <td>1 OS thread per in-flight request</td>
+            <td>~1–8&nbsp;MB stack + kernel scheduling overhead per thread</td>
+            <td>Well, up to a point — see the C10k problem below</td>
+            <td>Well — the OS timeslices real CPU cores across threads</td>
+          </tr>
+          <tr>
+            <td><b>Thread pool + queue</b></td>
+            <td>N reusable OS threads, a bounded/unbounded queue in front</td>
+            <td>Fixed — N × stack cost, independent of request volume</td>
+            <td>Only as well as N allows — see below, this is the model the widget simulates</td>
+            <td>Well, bounded by real core count</td>
+          </tr>
+          <tr>
+            <td><b>Event loop (async/await)</b></td>
+            <td>1 (or a small, fixed few) threads running a callback/coroutine scheduler</td>
+            <td>Near-zero per pending I/O op — a callback + a bit of state, not a stack</td>
+            <td>Excellent — thousands of concurrent waits cost almost nothing</td>
+            <td><b>Poor</b> — one CPU-bound callback blocks the entire loop</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      A fourth model is worth knowing by name even though it's less common in typical backend
+      frameworks: <b>green threads / M:N scheduling</b> — Go's goroutines, Erlang's processes.
+      The language runtime multiplexes many cheap, growable-stack "logical" threads onto a small
+      number of real OS threads, and the runtime scheduler itself switches a goroutine off its OS
+      thread when it blocks on I/O — giving you thread-per-request's simple blocking-style code
+      with close to an event loop's per-unit cost. It's why Go services routinely handle tens of
+      thousands of concurrent connections with ordinary-looking blocking code and no callback
+      soup.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Every one of these models is solving the same constraint from a different angle: a
+        real CPU core can only execute one instruction stream at a time, but a request spends
+        most of its life waiting on something that <em>isn't</em> the CPU. The models differ in
+        how cheaply they can "park" a waiting request and resume something else. Thread-per-request
+        parks it on an OS thread (expensive to create, cheap to reason about). An event loop parks
+        it as a tiny callback record (cheap to create, harder to reason about — no linear
+        top-to-bottom control flow without <code>async</code>/<code>await</code> sugar). Green
+        threads try to get both.</p>
+      </div>
+    </div>
+
+    <h2>The C10k problem</h2>
+    <p>
+      In the late 1990s, "handle 10,000 concurrent connections on one server" was a research
+      problem, not a Tuesday. Thread-per-connection was the default model, and it fell over for
+      two compounding reasons: each thread reserved megabytes of stack (10,000 threads × a few MB
+      is real, provisioned memory, most of it never touched), and the OS scheduler's cost to
+      context-switch between threads grows with the number of runnable threads — at high counts,
+      the machine spends more cycles deciding what to run next than running it.
+    </p>
+    <p>
+      The fix that defined the next twenty years of server design was the non-blocking,
+      event-driven I/O model: <code>epoll</code> (Linux), <code>kqueue</code> (BSD/macOS), and
+      IOCP (Windows) let a single thread ask the kernel "wake me when <em>any</em> of these
+      thousands of sockets is ready," instead of dedicating a thread to block on each one
+      individually. nginx, Node.js, and every modern async runtime (Python's <code>asyncio</code>,
+      Java's Netty, Rust's <code>tokio</code>) are built on exactly this primitive. It's why a
+      single nginx process comfortably reverse-proxies tens of thousands of concurrent
+      connections that would need tens of thousands of threads — and tens of gigabytes of stack
+      — under the old model.
+    </p>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>"C10k" is dated — modern hardware and kernels have pushed the frontier to C10M
+        (ten million) in specialized cases — but the underlying lesson didn't expire: <em>the
+        cost of concurrency has to scale with the number of things waiting, not with a fixed
+        per-connection overhead.</em> That's the lens for evaluating any concurrency model you're
+        handed.</p>
+      </div>
+    </div>
+
+    <h2>CPU-bound vs. I/O-bound work — and why the distinction is everything</h2>
+    <p>
+      The table above has one row that should stand out: an event loop is excellent for I/O-bound
+      work and poor for CPU-bound work, on the <em>same thread</em>. This isn't a minor caveat —
+      it's the single most common way people misapply async frameworks in production.
+    </p>
+    <p>
+      An event loop's superpower is that when a callback hits a non-blocking I/O call, it
+      <em>yields control back to the loop</em>, which goes and runs some other pending callback
+      while the I/O completes in the background. But if a callback instead does something
+      CPU-bound — parsing a large JSON body, running a regex against megabytes of text, computing
+      a hash, running a small ML model inline — it never yields. It runs to completion on the one
+      thread the loop has, and <em>every other pending request</em>, no matter how simple, waits
+      behind it. A single slow CPU-bound handler doesn't just slow down its own request; it stalls
+      the entire process.
+    </p>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>This is why Node.js and Python's <code>asyncio</code> both push CPU-heavy work out of
+        the event loop entirely — into a worker thread pool (Node's <code>worker_threads</code>,
+        Python's <code>loop.run_in_executor</code>) or a separate process. "Just make it async"
+        does nothing for CPU-bound work; <code>await</code>ing a function that doesn't actually do
+        I/O just delays when the blocking happens, it doesn't remove the block.</p>
+      </div>
+    </div>
+
+    <p>
+      Python adds a wrinkle worth knowing precisely: the <span class="term">Global Interpreter
+      Lock (GIL)</span> means only one thread executes Python bytecode at a time, even on a
+      multi-core machine — so Python threads don't give you CPU parallelism for CPU-bound work no
+      matter how many you spawn. They still help for I/O-bound work, though, because the GIL is
+      released during blocking I/O calls (the C extension doing the socket read drops the lock
+      while it waits), letting another Python thread run. That's why a Python web server can use a
+      thread pool productively for I/O-bound handlers, but reaches for <code>multiprocessing</code>
+      (separate processes, separate interpreters, separate GILs) or a native extension for
+      CPU-bound parallelism.
+    </p>
+
+    <h2>Backpressure: what happens when arrivals outpace processing</h2>
+    <p>
+      Every queue in front of a fixed-capacity worker pool — a thread pool's task queue, an event
+      loop's pending-callback queue, a message broker's topic — eventually faces a moment where
+      requests arrive faster than they can be drained. What the system does next is called
+      <span class="term">backpressure</span>, and there are exactly three honest options:
+    </p>
+    <ul>
+      <li><b>Let the queue grow unbounded.</b> Latency climbs without limit as requests wait
+        longer and longer; eventually memory holding the queued requests exhausts and the process
+        dies — the worst outcome, because it took down requests that hadn't even started yet.</li>
+      <li><b>Bound the queue and reject when full.</b> New requests get an immediate, fast
+        failure (503, connection refused) once the queue hits a cap, instead of joining a line
+        that will never be served in time. This preserves latency for the requests already
+        in-flight at the cost of visibly failing some traffic.</li>
+      <li><b>Shed load deliberately, upstream.</b> Rate-limit or reject at the edge — before work
+        even enters the queue — often prioritizing by request type (fail health checks last, fail
+        best-effort background jobs first). This is the mature version of option 2, chosen
+        deliberately rather than discovered accidentally.</li>
+    </ul>
+    <p>
+      Option 1 is the default in far more systems than anyone intends, because an unbounded queue
+      is the path of least resistance to write and looks fine in every test that doesn't push past
+      capacity. It's also the shape of nearly every "service fell over at 3&nbsp;AM" incident that
+      traces back to one slow downstream: not a crash, a <em>queue that never stopped growing</em>.
+    </p>
+
+    <h2>Try it: thread pool vs. event loop under load</h2>
+    <p>
+      The simulator below runs both models side by side against the <em>same</em> stream of
+      incoming requests. Push the request rate and per-request work time up and watch queue depth,
+      throughput, and tail latency diverge — and watch what happens to each model when you flip
+      the workload from I/O-bound to CPU-bound.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Concurrency sandbox: thread pool vs. event loop</div>
+
+      <div class="cio-controls">
+        <div>
+          <label for="rate">Incoming request rate: <span class="val" id="rateVal">50</span> req/s</label>
+          <input type="range" id="rate" min="1" max="400" step="1" value="50" />
+        </div>
+        <div>
+          <label for="workMs">Work per request: <span class="val" id="workVal">100ms</span></label>
+          <input type="range" id="workMs" min="1" max="500" step="1" value="100" />
+        </div>
+        <div>
+          <label for="poolSize">Thread pool size: <span class="val" id="poolVal">8</span> threads</label>
+          <input type="range" id="poolSize" min="1" max="64" step="1" value="8" />
+        </div>
+        <label class="cio-toggle">
+          <input type="checkbox" id="cpuBound" />
+          Workload is CPU-bound (blocks the event loop too)
+        </label>
+      </div>
+
+      <div class="cio-actions">
+        <button class="btn" id="cioRun" type="button">Pause</button>
+        <button class="btn secondary" id="cioReset" type="button">Reset</button>
+      </div>
+
+      <div class="cio-compare">
+        <div class="cio-card">
+          <div class="cio-card-head">
+            <h4>Thread-per-request pool</h4>
+            <span class="cio-badge cio-badge-ok" id="tpSatBadge">HEALTHY</span>
+          </div>
+          <div class="cio-stats">
+            <div><span class="cio-stat-label">Active threads</span><span class="cio-stat-val" id="tpActive">0/8</span></div>
+            <div><span class="cio-stat-label">Queue depth</span><span class="cio-stat-val" id="tpQueue">0</span></div>
+            <div><span class="cio-stat-label">Throughput</span><span class="cio-stat-val" id="tpThroughput">0.0 req/s</span></div>
+            <div><span class="cio-stat-label">Load ρ</span><span class="cio-stat-val" id="tpRho">0.00</span></div>
+            <div><span class="cio-stat-label">p50 / p99 latency</span><span class="cio-stat-val" id="tpLatency">— / —</span></div>
+          </div>
+          <canvas class="cio-chart" id="tpChart" height="70"></canvas>
+          <p class="cio-chart-caption">queue depth over time</p>
+        </div>
+        <div class="cio-card">
+          <div class="cio-card-head">
+            <h4>Event loop</h4>
+            <span class="cio-badge cio-badge-ok" id="elSatBadge">HEALTHY</span>
+          </div>
+          <div class="cio-stats">
+            <div><span class="cio-stat-label">In-flight I/O</span><span class="cio-stat-val" id="elActive">0</span></div>
+            <div><span class="cio-stat-label">Queue depth</span><span class="cio-stat-val" id="elQueue">0</span></div>
+            <div><span class="cio-stat-label">Throughput</span><span class="cio-stat-val" id="elThroughput">0.0 req/s</span></div>
+            <div><span class="cio-stat-label">Load ρ</span><span class="cio-stat-val" id="elRho">0.00</span></div>
+            <div><span class="cio-stat-label">p50 / p99 latency</span><span class="cio-stat-val" id="elLatency">— / —</span></div>
+          </div>
+          <canvas class="cio-chart" id="elChart" height="70"></canvas>
+          <p class="cio-chart-caption">queue depth over time</p>
+        </div>
+      </div>
+
+      <p class="cio-note" id="cioNote"></p>
+    </div>
+
+    <p>
+      The <b>Load ρ</b> readout is a preview of a formula you'll use constantly once you reach
+      <em>Performance, Profiling &amp; Capacity Planning</em>: for N servers each taking S seconds
+      per request, serving arrivals at rate λ, the offered load is <code>ρ = λ·S / N</code>. Below
+      1, the system is stable — a queue may fluctuate but drains. At or above 1, arrivals outpace
+      service capacity and the queue grows without bound, no matter how the moment-to-moment
+      randomness shakes out. Notice that the event loop's ρ in I/O-bound mode uses a tiny S
+      (registering a callback is cheap) and effectively N=∞ workers-worth of waiting capacity —
+      which is exactly why it can shrug off request rates that would drown a modest thread pool.
+      Flip to CPU-bound mode and the event loop's effective N collapses to 1, and its ρ rockets
+      past the thread pool's.
+    </p>
+
+    <h2>Pool exhaustion: the anatomy of a 3&nbsp;AM incident</h2>
+    <p>
+      The <a href="networking-for-backend.html">networking page</a>'s connection-pool caution
+      said sizing a pool wrong causes two failures. Here's the full mechanism for one of them,
+      because it's the single most common cause of a cascading outage: a service calls a
+      downstream that gets slow (not down — <em>slow</em>, which is worse, because health checks
+      and circuit breakers built for "down" don't trip). Every thread that calls it blocks longer
+      than usual. The thread pool's queue starts absorbing new requests instead of draining them.
+      Once the queue is full, <em>every</em> request to the service — including ones that don't
+      even touch the slow downstream — waits behind it, because they're all sharing the same
+      finite pool. A dependency problem for one endpoint becomes an outage for the whole service.
+    </p>
+    <p>
+      This is precisely ρ crossing 1: the downstream getting slower increased S (service time per
+      request), and nothing else in the system compensated, so the pool that was comfortably under
+      capacity a minute ago is now unboundedly backed up. The fix previewed here — and covered
+      properly in <em>Resilience Patterns</em> — is to bound the wait: a tight timeout on the
+      downstream call stops S from growing without limit, and a bulkhead (a separate, smaller pool
+      dedicated to that one downstream) stops its queue from cannibalizing capacity that unrelated
+      requests need.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Model-serving frameworks live directly on top of this chapter. FastAPI + Uvicorn is an
+        event loop under the hood — great for the I/O-bound parts of serving (auth checks, feature
+        store lookups, calling other services), terrible if you run inference synchronously inside
+        an <code>async def</code> handler, because a GPU call or heavy CPU preprocessing blocks the
+        loop exactly like the pitfall above. That's why production servers (Triton, TorchServe,
+        most hand-rolled ones) push inference onto dedicated worker processes or threads and keep
+        the request-handling loop purely I/O-bound. <b>Dynamic batching</b> — buffering several
+        requests for a few milliseconds so the GPU processes them as one larger batch — is a
+        deliberate backpressure/throughput trade: it adds queueing latency per request (bad for
+        p99) in exchange for far higher throughput per GPU-second (good for capacity), the same
+        ρ = λ·S/N trade-off as the widget above, just with N cast as "GPU batch slots" instead of
+        threads.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A thread pool has N=10 threads, each request takes 200ms of blocking
+          work, and requests arrive at 40 req/s. What does queueing theory (ρ = λ·S/N) predict?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">ρ = 0.5 — comfortably stable, no queueing expected.</button>
+          <button class="quiz-option" data-choice="b">ρ = 2.0 — but since it's under 10 threads, the pool absorbs it fine long-term.</button>
+          <button class="quiz-option" data-choice="c">ρ = 0.8 — near capacity; the pool is stable on average but queueing and tail latency will be noticeably worse than at low load, and any burst risks tipping past 1.</button>
+        </div>
+        <p class="quiz-explain" hidden>ρ = (40 × 0.2) / 10 = 0.8. Below 1 means the queue drains on average, but 0.8 is close enough to capacity that variance in arrivals or service time will regularly push instantaneous load over 1, causing visible queueing and tail-latency spikes even though the long-run average looks fine.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. Why does a single-threaded event loop handle 10,000 concurrent
+          I/O-bound connections well, but a single CPU-bound request can stall all of them?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Non-blocking I/O lets the loop yield to other pending callbacks while waiting, so waits cost almost nothing — but a CPU-bound callback never yields, so it monopolizes the one thread the loop runs on until it finishes.</button>
+          <button class="quiz-option" data-choice="b">The event loop secretly spawns a new OS thread per connection, so CPU-bound work should scale the same way I/O-bound work does.</button>
+          <button class="quiz-option" data-choice="c">CPU-bound work is always faster than I/O-bound work, so it finishes before it can block anything.</button>
+        </div>
+        <p class="quiz-explain" hidden>The event loop's entire advantage comes from parking cheap, yielding waits instead of expensive OS threads. That advantage only applies to work that yields (non-blocking I/O). CPU-bound work runs to completion on the loop's one thread, blocking every other pending callback — the fix is to move it to a worker thread/process pool, not to wrap it in async/await.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">3. A service's thread pool starts backing up after a downstream API
+          becomes slow (not down). Requests to endpoints that never call that downstream also
+          start timing out. What's the most direct fix previewed in this chapter?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Switch the entire service to an event loop — that alone fixes pool exhaustion regardless of workload type.</button>
+          <button class="quiz-option" data-choice="b">Add a timeout on the downstream call to bound how long a thread can be held, and isolate that downstream's calls in their own smaller pool (a bulkhead) so its backup can't consume capacity that unrelated requests need.</button>
+          <button class="quiz-option" data-choice="c">Increase the thread pool size until the queue empties out.</button>
+        </div>
+        <p class="quiz-explain" hidden>A slow downstream increases S (service time) for the threads calling it; without a timeout, S is effectively unbounded and every thread can end up stuck waiting. Because all endpoints share one pool, that backup starves unrelated requests too — a bulkhead (a separate pool per downstream) contains the damage, and a timeout stops S from growing without limit. Growing the pool just delays the same failure at a higher threshold; it doesn't remove the shared-fate problem.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This closes out the Foundations spine — you now have the request lifecycle, the network
+      between machines, and the concurrency model inside one process. Everything from here is a
+      landscape: <em>Designing Clean REST APIs</em> picks up the API &amp; Interfaces area, while
+      <em>Scaling &amp; Load Balancing</em> and <em>Performance, Profiling &amp; Capacity
+      Planning</em> — both unlocked by this page — pick the thread-pool-and-ρ story back up at the
+      level of many machines instead of one process.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var TICK_MS = 150;
+      var DT = 0.4; // simulated seconds advanced per tick
+      var HISTORY_LEN = 150;
+      var MAX_THREADS = 64;
+      var QUEUE_CAP = 2000;
+
+      var rateEl = document.getElementById("rate");
+      var workEl = document.getElementById("workMs");
+      var poolEl = document.getElementById("poolSize");
+      var cpuBoundEl = document.getElementById("cpuBound");
+      var rateVal = document.getElementById("rateVal");
+      var workVal = document.getElementById("workVal");
+      var poolVal = document.getElementById("poolVal");
+      var runBtn = document.getElementById("cioRun");
+      var resetBtn = document.getElementById("cioReset");
+      var cioNote = document.getElementById("cioNote");
+
+      var tpActiveEl = document.getElementById("tpActive");
+      var tpQueueEl = document.getElementById("tpQueue");
+      var tpThroughputEl = document.getElementById("tpThroughput");
+      var tpLatencyEl = document.getElementById("tpLatency");
+      var tpRhoEl = document.getElementById("tpRho");
+      var tpBadge = document.getElementById("tpSatBadge");
+      var tpChart = document.getElementById("tpChart");
+
+      var elActiveEl = document.getElementById("elActive");
+      var elQueueEl = document.getElementById("elQueue");
+      var elThroughputEl = document.getElementById("elThroughput");
+      var elLatencyEl = document.getElementById("elLatency");
+      var elRhoEl = document.getElementById("elRho");
+      var elBadge = document.getElementById("elSatBadge");
+      var elChart = document.getElementById("elChart");
+
+      var simTime = 0;
+      var running = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      var tp = { slots: null, queue: [], completed: [], completedTimes: [], history: [] };
+      var el = { queue: [], inFlight: [], cpuAcc: 0, completed: [], completedTimes: [], history: [] };
+
+      function resetSim() {
+        simTime = 0;
+        tp.slots = new Array(MAX_THREADS).fill(null);
+        tp.queue = [];
+        tp.completed = [];
+        tp.completedTimes = [];
+        tp.history = [];
+        el.queue = [];
+        el.inFlight = [];
+        el.cpuAcc = 0;
+        el.completed = [];
+        el.completedTimes = [];
+        el.history = [];
+      }
+      resetSim();
+
+      function gaussian() {
+        var u = Math.random() || 1e-9;
+        var v = Math.random();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      }
+
+      function poissonSample(lambda) {
+        if (lambda <= 0) return 0;
+        if (lambda > 30) {
+          return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * gaussian()));
+        }
+        var L = Math.exp(-lambda), k = 0, p = 1;
+        do { k++; p *= Math.random(); } while (p > L);
+        return k - 1;
+      }
+
+      function percentile(arr, p) {
+        if (!arr.length) return null;
+        var sorted = arr.slice().sort(function (a, b) { return a - b; });
+        var idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+        return sorted[idx];
+      }
+
+      function throughputOf(times) {
+        var cutoff = simTime - 3;
+        var count = 0;
+        for (var i = times.length - 1; i >= 0; i--) {
+          if (times[i] >= cutoff) count++; else break;
+        }
+        return count / 3;
+      }
+
+      function fmtMs(v) { return v == null ? "—" : Math.round(v * 1000) + "ms"; }
+
+      function setBadge(badgeEl, rho) {
+        badgeEl.classList.remove("cio-badge-ok", "cio-badge-warn", "cio-badge-danger");
+        if (rho >= 1) {
+          badgeEl.textContent = "SATURATING";
+          badgeEl.classList.add("cio-badge-danger");
+        } else if (rho >= 0.7) {
+          badgeEl.textContent = "NEAR CAPACITY";
+          badgeEl.classList.add("cio-badge-warn");
+        } else {
+          badgeEl.textContent = "HEALTHY";
+          badgeEl.classList.add("cio-badge-ok");
+        }
+      }
+
+      function drawChart(canvas, history) {
+        var w = canvas.clientWidth || 400;
+        if (canvas.width !== w) canvas.width = w;
+        var h = canvas.height;
+        var ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, w, h);
+        if (!history.length) return;
+
+        var max = Math.max(10, Math.max.apply(null, history));
+        var stepX = w / (HISTORY_LEN - 1);
+        var offset = HISTORY_LEN - history.length;
+        var accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0c8d7d";
+
+        ctx.beginPath();
+        ctx.moveTo(offset * stepX, h);
+        for (var i = 0; i < history.length; i++) {
+          var x = (offset + i) * stepX;
+          var y = h - (history[i] / max) * h;
+          ctx.lineTo(x, y);
+        }
+        ctx.lineTo((offset + history.length - 1) * stepX, h);
+        ctx.closePath();
+        var grad = ctx.createLinearGradient(0, 0, 0, h);
+        grad.addColorStop(0, accent);
+        grad.addColorStop(1, "transparent");
+        ctx.fillStyle = grad;
+        ctx.globalAlpha = 0.45;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (var j = 0; j < history.length; j++) {
+          var x2 = (offset + j) * stepX;
+          var y2 = h - (history[j] / max) * h;
+          if (j === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+        }
+        ctx.stroke();
+      }
+
+      function updateNote(tpRho, elRho, cpuBound) {
+        if (cpuBound) {
+          cioNote.innerHTML = "CPU-bound mode: the event loop's single thread now has to run every request's work to completion serially, so it behaves like a thread pool with N=1 — its ρ climbs far faster than the thread pool's. This is why CPU-bound work belongs on a worker pool or separate processes, not directly on an event loop.";
+        } else if (tpRho >= 1 && elRho < 0.7) {
+          cioNote.innerHTML = "The thread pool is saturating (ρ ≥ 1) while the event loop stays healthy: identical I/O-bound workload, but the event loop's cost per waiting request is near zero, so it never runs out of \"threads\" to park waits on.";
+        } else if (tpRho >= 0.7 && tpRho < 1) {
+          cioNote.innerHTML = "The thread pool is near capacity — average throughput still keeps up, but watch the queue-depth chart for bursts pushing instantaneous load past what N threads can absorb.";
+        } else if (tpRho < 0.7 && elRho < 0.7) {
+          cioNote.innerHTML = "Both models are comfortably under capacity at this rate. Raise the request rate, shrink the pool, or flip the CPU-bound toggle to find where each one breaks.";
+        } else {
+          cioNote.innerHTML = "Watch the queue-depth charts: a healthy queue hovers near zero and drains; a saturating one trends upward without bound, even though arrivals are random moment to moment.";
+        }
+      }
+
+      function tick() {
+        if (running) {
+          simTime += DT;
+
+          var rate = parseInt(rateEl.value, 10);
+          var workMs = parseInt(workEl.value, 10);
+          var N = parseInt(poolEl.value, 10);
+          var cpuBound = cpuBoundEl.checked;
+
+          var arrivals = poissonSample(rate * DT);
+          for (var a = 0; a < arrivals; a++) {
+            if (tp.queue.length < QUEUE_CAP) tp.queue.push(simTime);
+            if (el.queue.length < QUEUE_CAP) el.queue.push(simTime);
+          }
+
+          // --- Thread pool: free finished slots, then assign queued work ---
+          for (var i = 0; i < MAX_THREADS; i++) {
+            var slot = tp.slots[i];
+            if (slot && slot.busyUntil <= simTime) {
+              tp.completed.push(simTime - slot.arrivalTime);
+              tp.completedTimes.push(simTime);
+              tp.slots[i] = null;
+            }
+          }
+          for (var j = 0; j < N && tp.queue.length; j++) {
+            if (!tp.slots[j]) {
+              var t0 = tp.queue.shift();
+              tp.slots[j] = { arrivalTime: t0, busyUntil: simTime + workMs / 1000 };
+            }
+          }
+          var tpActive = 0;
+          for (var s = 0; s < N; s++) if (tp.slots[s]) tpActive++;
+
+          // --- Event loop: CPU budget drains the queue; I/O waits happen off-loop ---
+          var cpuMs = cpuBound ? workMs : 0.3;
+          el.cpuAcc += DT * 1000;
+          var capAcc = cpuMs * 3;
+          if (el.cpuAcc > capAcc) el.cpuAcc = capAcc;
+          while (el.cpuAcc >= cpuMs && el.queue.length) {
+            el.cpuAcc -= cpuMs;
+            var t1 = el.queue.shift();
+            if (cpuBound) {
+              el.completed.push(simTime - t1);
+              el.completedTimes.push(simTime);
+            } else {
+              el.inFlight.push({ arrivalTime: t1, completeAt: simTime + workMs / 1000 });
+            }
+          }
+          if (!cpuBound && el.inFlight.length) {
+            var stillFlight = [];
+            for (var f = 0; f < el.inFlight.length; f++) {
+              var req = el.inFlight[f];
+              if (req.completeAt <= simTime) {
+                el.completed.push(simTime - req.arrivalTime);
+                el.completedTimes.push(simTime);
+              } else {
+                stillFlight.push(req);
+              }
+            }
+            el.inFlight = stillFlight;
+          }
+
+          if (tp.completed.length > 300) { tp.completed = tp.completed.slice(-150); tp.completedTimes = tp.completedTimes.slice(-150); }
+          if (el.completed.length > 300) { el.completed = el.completed.slice(-150); el.completedTimes = el.completedTimes.slice(-150); }
+
+          tp.history.push(tp.queue.length);
+          if (tp.history.length > HISTORY_LEN) tp.history.shift();
+          el.history.push(el.queue.length);
+          if (el.history.length > HISTORY_LEN) el.history.shift();
+
+          render(rate, workMs, N, cpuBound, tpActive);
+        }
+      }
+
+      function render(rate, workMs, N, cpuBound, tpActive) {
+        rateVal.textContent = rate;
+        workVal.textContent = workMs + "ms";
+        poolVal.textContent = N;
+
+        var tpThroughput = throughputOf(tp.completedTimes);
+        var elThroughput = throughputOf(el.completedTimes);
+        var tpP50 = percentile(tp.completed, 0.5);
+        var tpP99 = percentile(tp.completed, 0.99);
+        var elP50 = percentile(el.completed, 0.5);
+        var elP99 = percentile(el.completed, 0.99);
+
+        var tpRho = (rate * (workMs / 1000)) / N;
+        var elCpuMs = cpuBound ? workMs : 0.3;
+        var elRho = rate * (elCpuMs / 1000);
+
+        tpActiveEl.textContent = tpActive + "/" + N;
+        tpQueueEl.textContent = tp.queue.length >= QUEUE_CAP ? QUEUE_CAP + "+" : tp.queue.length;
+        tpThroughputEl.textContent = tpThroughput.toFixed(1) + " req/s";
+        tpLatencyEl.textContent = fmtMs(tpP50) + " / " + fmtMs(tpP99);
+        tpRhoEl.textContent = tpRho.toFixed(2);
+        setBadge(tpBadge, tpRho);
+
+        elActiveEl.textContent = cpuBound ? "0 (loop is blocked while computing)" : String(el.inFlight.length);
+        elQueueEl.textContent = el.queue.length >= QUEUE_CAP ? QUEUE_CAP + "+" : el.queue.length;
+        elThroughputEl.textContent = elThroughput.toFixed(1) + " req/s";
+        elLatencyEl.textContent = fmtMs(elP50) + " / " + fmtMs(elP99);
+        elRhoEl.textContent = elRho.toFixed(2);
+        setBadge(elBadge, elRho);
+
+        drawChart(tpChart, tp.history);
+        drawChart(elChart, el.history);
+
+        updateNote(tpRho, elRho, cpuBound);
+      }
+
+      [rateEl, workEl, poolEl].forEach(function (elx) {
+        elx.addEventListener("input", function () {
+          rateVal.textContent = rateEl.value;
+          workVal.textContent = workEl.value + "ms";
+          poolVal.textContent = poolEl.value;
+        });
+      });
+
+      runBtn.addEventListener("click", function () {
+        running = !running;
+        runBtn.textContent = running ? "Pause" : "Run";
+      });
+      resetBtn.addEventListener("click", function () {
+        resetSim();
+        render(parseInt(rateEl.value, 10), parseInt(workEl.value, 10), parseInt(poolEl.value, 10), cpuBoundEl.checked, 0);
+      });
+
+      runBtn.textContent = running ? "Pause" : "Run";
+      render(parseInt(rateEl.value, 10), parseInt(workEl.value, 10), parseInt(poolEl.value, 10), cpuBoundEl.checked, 0);
+      setInterval(tick, TICK_MS);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
