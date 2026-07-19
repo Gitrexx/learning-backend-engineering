@@ -50,7 +50,7 @@
       "summary": "Resources, verbs, status codes, idempotency, pagination, error contracts, and versioning.",
       "prerequisites": ["networking-for-backend"],
       "file": "rest-api-design.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "rpc-graphql-streaming",
