@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Designing Clean REST APIs — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the API-design linter widget only. */
+    .lint-controls {
+      display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3);
+      margin-bottom: var(--sp-4);
+    }
+    .lint-controls select {
+      flex: 1 1 260px; min-width: 220px;
+    }
+    .lint-endpoint {
+      display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+      margin-bottom: var(--sp-3);
+    }
+    .verb {
+      font-family: var(--font-mono); font-weight: 700; font-size: var(--fs-sm);
+      padding: 0.2em 0.6em; border-radius: var(--radius-sm);
+      background: var(--blueprint-soft); color: var(--blueprint);
+    }
+    .verb.post { background: var(--ok-soft); color: var(--ok); }
+    .verb.delete { background: var(--danger-soft); color: var(--danger); }
+    .path { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text); }
+
+    .lint-panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); margin-bottom: var(--sp-4); }
+    .lint-panel h4 { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.08em; font-family: var(--font-mono); }
+    .lint-panel pre { margin: 0; box-shadow: none; }
+
+    .guess-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: var(--sp-3) 0; }
+    .guess-btn {
+      font: inherit; font-size: var(--fs-sm); font-weight: 600;
+      padding: 0.45em 0.9em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .guess-btn:hover { border-color: var(--accent); }
+    .guess-btn.chosen { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+    .guess-btn:disabled { cursor: default; }
+
+    .lint-result[hidden] { display: none; }
+    .lint-verdict {
+      font-size: var(--fs-sm); font-weight: 700; margin-bottom: var(--sp-3);
+      padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
+    }
+    .lint-verdict.hit { background: var(--ok-soft); color: var(--ok); }
+    .lint-verdict.miss { background: var(--warn-soft); color: var(--warn); }
+
+    .issue-list { list-style: none; margin: 0 0 var(--sp-4); padding: 0; display: grid; gap: var(--sp-3); }
+    .issue-item {
+      display: grid; grid-template-columns: auto 1fr; gap: var(--sp-3);
+      padding: var(--sp-3) var(--sp-4); border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+    }
+    .issue-item .issue-icon {
+      width: 1.6rem; height: 1.6rem; border-radius: 50%; display: grid; place-items: center;
+      background: var(--danger-soft); color: var(--danger); font-family: var(--font-mono); font-weight: 800;
+    }
+    .issue-item .issue-title { font-weight: 700; margin-bottom: 0.2em; }
+    .issue-item p { margin: 0; font-size: var(--fs-sm); color: var(--text-muted); }
+
+    .fix-toggle { margin-bottom: var(--sp-3); }
+    @media (max-width: 560px) { .lint-controls { flex-direction: column; align-items: stretch; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">APIs &amp; Interfaces // 01</p>
+    <h1>Designing Clean REST APIs</h1>
+
+    <p>
+      Every downstream area of this course — auth, caching, resilience, even the capstone design
+      method — eventually has to cross a wire as an HTTP request. REST won that fight for
+      general-purpose, human-and-machine-readable service interfaces, not because it's
+      theoretically elegant but because it maps cleanly onto the transport you already learned
+      about: <a href="networking-for-backend.html">verbs and status codes are HTTP</a>, so a REST
+      API is "just" a disciplined way of using HTTP as intended. The discipline is the whole game.
+      A REST API that a team can live with for years and one that generates an endless stream of
+      client tickets often differ by a handful of decisions, made once, at design time — and
+      "did you design a clean, evolvable interface" is one of the first things a backend interview
+      probes, because it's cheap to ask and hard to fake.
+    </p>
+
+    <h2>Resources are nouns, not verbs</h2>
+    <p>
+      The foundational idea of REST (<b>RE</b>presentational <b>S</b>tate <b>T</b>ransfer) is that
+      a URL identifies a <span class="term">resource</span> — a thing, a noun — and the HTTP verb
+      says what you're doing to it. <code>/orders/482</code> is a resource; <code>GET</code>,
+      <code>PUT</code>, and <code>DELETE</code> on it are actions. The most common way teams
+      violate this is smuggling the action into the path itself:
+      <code>/getOrder?id=482</code>, <code>/createOrder</code>, <code>/deleteOrder/482</code>.
+      It works, technically — HTTP doesn't enforce REST — but it throws away the part of the
+      contract that makes REST APIs predictable: once you know the noun, every verb behaves the
+      same way across your whole API, and clients, proxies, and caches can reason about requests
+      generically instead of endpoint-by-endpoint.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Shape</th><th>Example</th><th>Why it matters</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Collection</td>
+            <td><code>/orders</code></td>
+            <td><code>GET</code> lists, <code>POST</code> creates a new member</td>
+          </tr>
+          <tr>
+            <td>Item</td>
+            <td><code>/orders/482</code></td>
+            <td><code>GET</code> reads, <code>PUT</code>/<code>PATCH</code> updates, <code>DELETE</code> removes</td>
+          </tr>
+          <tr>
+            <td>Sub-resource</td>
+            <td><code>/orders/482/line-items</code></td>
+            <td>Models a real one-to-many relationship instead of a query parameter</td>
+          </tr>
+          <tr>
+            <td>Action that isn't CRUD</td>
+            <td><code>POST /orders/482/cancel</code></td>
+            <td>A verb-shaped sub-resource for state transitions that don't fit CRUD cleanly — better than inventing a non-standard HTTP method</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>The "action that isn't CRUD" row is the honest escape hatch. Not everything is a clean
+        create/read/update/delete — <em>cancel an order</em>, <em>refund a payment</em>,
+        <em>archive a project</em> are state transitions with side effects (emails, ledger
+        entries, downstream calls) that don't reduce to "replace this resource." Modeling them as
+        <code>POST</code> to a sub-resource named after the action is the pragmatic convention,
+        not a REST purity violation — a pure RPC alternative is covered in the next deep-dive,
+        <em>Beyond REST</em>.</p>
+      </div>
+    </div>
+
+    <h2>Verbs, precisely: safe, idempotent, and neither</h2>
+    <p>
+      Two properties of an HTTP method matter more than any REST style guide will tell you,
+      because they're load-bearing for caching, retries, and resilience patterns you'll meet
+      later:
+    </p>
+
+    <dl class="definition">
+      <dt>Safe</dt>
+      <dd>The request causes no observable side effect on the server — it's read-only. Only
+        <code>GET</code>, <code>HEAD</code>, and <code>OPTIONS</code> are safe. Safety is what
+        lets browsers prefetch links and CDNs cache <code>GET</code> responses without asking
+        permission.</dd>
+      <dt>Idempotent</dt>
+      <dd>Calling it once has the same effect on server state as calling it <var>N</var> times.
+        <code>PUT</code>, <code>DELETE</code>, <code>GET</code>, <code>HEAD</code>, and
+        <code>OPTIONS</code> are idempotent by contract. <code>POST</code> and
+        <code>PATCH</code> are <em>not</em> — repeating them is allowed to (and usually does)
+        change state again.</dd>
+    </dl>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Verb</th><th>Safe?</th><th>Idempotent?</th><th>Typical status on success</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td>Yes</td><td>Yes</td><td><code>200 OK</code></td></tr>
+          <tr><td><code>POST</code></td><td>No</td><td>No</td><td><code>201 Created</code> (or <code>200</code>/<code>202</code> for non-creation actions)</td></tr>
+          <tr><td><code>PUT</code></td><td>No</td><td>Yes</td><td><code>200 OK</code> / <code>204 No Content</code></td></tr>
+          <tr><td><code>PATCH</code></td><td>No</td><td>Depends on the patch semantics</td><td><code>200 OK</code></td></tr>
+          <tr><td><code>DELETE</code></td><td>No</td><td>Yes</td><td><code>204 No Content</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>"Idempotent" describes the <em>contract</em>, not a guarantee your handler
+        automatically satisfies. <code>PUT /orders/482</code> is only idempotent if your handler
+        actually <em>replaces</em> the resource's state with the request body. A <code>PUT</code>
+        handler that appends a row to an audit log, increments a counter, or sends a
+        notification email as a side effect on every call has broken the contract — and every
+        client, proxy, and retry mechanism in the stack that assumes <code>PUT</code> is safe to
+        retry blindly (see <em>Resilience Patterns</em> later) will now double that side effect
+        on a retried request. This is the single most common way idempotency breaks in practice:
+        not a wrong verb, but a correct verb with an impure implementation.</p>
+      </div>
+    </div>
+
+    <p>
+      Why any of this matters beyond taxonomy: idempotency is what makes a request <em>safe to
+      retry</em>. A client (or a load balancer, or a retry-with-backoff layer) that doesn't know
+      whether repeating a call is safe has to guess, and guessing wrong either causes duplicate
+      side effects (double-charging a customer) or gives up on transient failures it could have
+      recovered from. Precise verb semantics turn that guess into a lookup.
+    </p>
+
+    <h2>Status codes as a contract, not decoration</h2>
+    <p>
+      The five status-code classes each promise something specific to a caller that doesn't
+      parse your response body — which is exactly the case for load balancers, retry logic, and
+      monitoring dashboards classifying traffic by status class alone.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Class</th><th>Promise</th><th>Common codes</th></tr></thead>
+        <tbody>
+          <tr><td><b>2xx</b></td><td>Request succeeded</td><td><code>200</code> OK, <code>201</code> Created, <code>202</code> Accepted, <code>204</code> No Content</td></tr>
+          <tr><td><b>3xx</b></td><td>Follow this redirect</td><td><code>301</code> Moved Permanently, <code>304</code> Not Modified</td></tr>
+          <tr><td><b>4xx</b></td><td><em>The client's</em> fault — fix the request, don't retry as-is</td><td><code>400</code> Bad Request, <code>401</code> Unauthorized, <code>403</code> Forbidden, <code>404</code> Not Found, <code>409</code> Conflict, <code>422</code> Unprocessable Entity, <code>429</code> Too Many Requests</td></tr>
+          <tr><td><b>5xx</b></td><td><em>The server's</em> fault — may be transient, safe to retry (if idempotent)</td><td><code>500</code> Internal Server Error, <code>502</code> Bad Gateway, <code>503</code> Service Unavailable, <code>504</code> Gateway Timeout</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>The 4xx/5xx split is really "who should act on this failure." A well-behaved retry
+        policy retries 5xx and 429 (with backoff) but never retries a plain 4xx — a
+        <code>422</code> for a malformed request will fail identically no matter how many times
+        you resend it, so retrying just wastes a request and hides the real bug. Getting this
+        distinction right in your API's status codes is what lets a generic client-side retry
+        layer make correct decisions <em>without</em> knowing anything about your specific
+        endpoints.</p>
+      </div>
+    </div>
+
+    <h2>Idempotency keys: making <code>POST</code> safe to retry</h2>
+    <p>
+      <code>POST</code>'s whole job is often "create a new thing" — pay an invoice, place an
+      order, send a message — which is precisely the kind of action you cannot safely retry
+      blindly: a client that times out waiting for a response has no way to know whether the
+      server actually processed the request before the connection died. Resending risks a
+      duplicate charge; not resending risks silently dropping a legitimate request.
+    </p>
+    <p>
+      The standard fix is an <span class="term">idempotency key</span>: the client generates a
+      unique token (a UUID) once per logical operation and sends it in a header
+      (<code>Idempotency-Key: 6c2f...</code>). The server stores the key alongside the result of
+      the first request it processes with that key; if the same key arrives again — because the
+      client retried after a timeout — the server returns the <em>original</em> stored response
+      instead of processing the operation a second time. This is the same "at-least-once
+      delivery + dedup" pattern that reappears, at a bigger scale, in
+      <em>Messaging, Queues &amp; Event-Driven Architecture</em> and
+      <em>Distributed Transactions, Sagas &amp; Idempotency</em> — a client retry is a
+      miniature version of the exact-once-delivery problem distributed systems fight everywhere.
+    </p>
+
+    <h2>Pagination: offset vs. cursor</h2>
+    <p>
+      Any collection endpoint that can grow needs pagination — an unbounded <code>GET /orders</code>
+      that returns every row is a latency and memory time bomb that just hasn't gone off yet.
+      There are two dominant strategies, and they trade off differently.
+    </p>
+
+    <dl class="definition">
+      <dt>Offset pagination</dt>
+      <dd><code>GET /orders?offset=200&amp;limit=20</code>. Simple, supports "jump to page 7,"
+        but two failure modes: the database still has to scan and discard the first 200 rows
+        (gets slower as offset grows — a preview of <em>SQL Deep-Dive &amp; Query Performance</em>),
+        and rows inserted or deleted between page fetches shift every subsequent offset, causing
+        skipped or duplicated items for a client paging through a live, mutating collection.</dd>
+      <dt>Cursor (keyset) pagination</dt>
+      <dd><code>GET /orders?after=cursor_xyz&amp;limit=20</code>, where the cursor encodes the
+        last-seen row's sort key (often an ID or timestamp, sometimes both for a stable tie-break).
+        The next page's query becomes <code>WHERE (created_at, id) &gt; (last_created_at, last_id)
+        ORDER BY created_at, id LIMIT 20</code> — a query an index serves directly, with no
+        growing scan, and stable under concurrent inserts because it never re-numbers positions.
+        The cost: no "jump to page 7," and the cursor is an opaque token, not a page number.</dd>
+    </dl>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Default to cursor pagination for anything that's actively written to while being
+        paged (feeds, logs, order lists) — it's the difference between "consistent under
+        concurrent writes" and "quietly drops or repeats rows for some users, some of the time,"
+        which is a brutal bug to reproduce because it depends on write timing. Offset pagination
+        is fine for small, mostly-static, or admin-only lists where "jump to an arbitrary page"
+        genuinely matters more than that correctness guarantee.</p>
+      </div>
+    </div>
+
+    <h2>Filtering, sorting, and the shape of query parameters</h2>
+    <p>
+      Query parameters are the conventional place for anything that narrows or orders a
+      collection without changing which resource you're addressing:
+      <code>GET /orders?status=shipped&amp;sort=-created_at&amp;limit=50</code>. Keep the
+      convention consistent across your whole API — the same parameter name for the same concept
+      everywhere (always <code>limit</code>, never <code>page_size</code> on one endpoint and
+      <code>limit</code> on another) — because inconsistency is what actually generates client
+      tickets; the specific convention you pick matters less than picking one and holding the
+      line. Always cap <code>limit</code> server-side regardless of what the client requests
+      (<code>min(requested, 100)</code>, say) — an uncapped limit parameter is just unbounded
+      pagination with extra steps.
+    </p>
+
+    <h2>Error-contract design</h2>
+    <p>
+      A status code alone rarely gives a client (or the engineer debugging a client's bug reports)
+      enough to act on. A consistent, structured error body is one of the highest-leverage,
+      lowest-effort things an API can do for the people who consume it:
+    </p>
+
+    <pre><code>{
+  "error": {
+    "code": "insufficient_inventory",
+    "message": "Cannot fulfill order: 2 units of SKU-4471 requested, 0 in stock.",
+    "field": null,
+    "request_id": "req_9f2c1e"
+  }
+}</code></pre>
+
+    <p>
+      A machine-readable <code>code</code> (stable, for programmatic branching) alongside a
+      human-readable <code>message</code> (for logs and debugging, not for building conditional
+      logic against — messages change wording; codes shouldn't), an optional
+      <code>field</code> for validation errors, and a <code>request_id</code> that ties the
+      response back to your server-side logs and traces (foreshadowing
+      <em>Observability</em>) turns "the API returned an error" into "the API returned a
+      specific, traceable, actionable error."
+    </p>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>Two error-contract mistakes account for most of the pain in practice. First,
+        returning <code>200 OK</code> with an <code>{"error": true}</code> body — this breaks
+        every piece of generic HTTP tooling (load balancers, monitoring, client HTTP libraries'
+        error handling) that classifies success by status code, not body content. Second,
+        leaking internals in a <code>500</code> response — a raw stack trace, a SQL error
+        message, or an internal file path handed straight to the client is both an information
+        disclosure risk (see <em>Backend Security &amp; the OWASP Top 10</em>) and useless to a
+        legitimate caller, who can't do anything with "NullPointerException at
+        OrderService.java:142." Log the detail server-side against the <code>request_id</code>;
+        return the client a stable, generic message.</p>
+      </div>
+    </div>
+
+    <h2>Versioning and backward compatibility</h2>
+    <p>
+      An API is a contract with every client that has ever integrated against it, and some of
+      those clients you can't force to redeploy on your schedule (a mobile app in app-store
+      review, a partner's server you don't control). The practical discipline is knowing which
+      changes are safe to ship without a version bump and which aren't:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Change</th><th>Breaking?</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Adding a new optional field to a response</td><td>No</td><td>Well-behaved clients ignore unknown fields</td></tr>
+          <tr><td>Adding a new optional request parameter</td><td>No</td><td>Existing requests without it keep working</td></tr>
+          <tr><td>Removing a field</td><td>Yes</td><td>Any client reading it breaks</td></tr>
+          <tr><td>Renaming a field</td><td>Yes</td><td>Identical to removal, from the client's view</td></tr>
+          <tr><td>Changing a field's type or meaning</td><td>Yes</td><td>Silent breakage — often worse, because it may not error, just misbehave</td></tr>
+          <tr><td>Making an optional request field required</td><td>Yes</td><td>Existing requests that omit it now fail</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      When you do need a breaking change, the two conventional mechanisms are a version segment
+      in the URL (<code>/v2/orders</code>) or a version in a header
+      (<code>Accept: application/vnd.myapi.v2+json</code>). URL versioning is more visible and
+      cache-friendly (a CDN can key on the path); header versioning keeps URLs stable as the
+      canonical resource identifier and is arguably more "correct" REST — most real APIs pick
+      URL versioning anyway for its operational simplicity. Either way, the discipline that
+      matters more than the mechanism: keep the old version <em>fully functional</em> for a
+      published deprecation window, announce it, and only remove it after the window closes —
+      "we shipped a breaking change with no notice" is the failure mode versioning exists to
+      prevent, and skipping the deprecation window recreates it even with a version number
+      in place.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A model-serving endpoint is a REST API with an extra dimension: the model version is
+        part of the contract too, not just the schema. <code>POST /v1/predict</code> silently
+        swapping the underlying model for a retrained one is exactly the "changing a field's
+        meaning" breakage above, just harder to notice because the response still type-checks —
+        it's a distribution shift instead of a parse error. The same fixes apply: version the
+        model explicitly in the path or a header (<code>model_version: churn-v3</code>), keep the
+        previous model callable during a rollout, and treat "which model produced this
+        prediction" as required, traceable metadata — the inference-time analogue of the
+        <code>request_id</code> above, and a prerequisite for catching training-serving skew
+        (covered in <em>ML Systems as Backend Systems</em>). Idempotency keys matter here too:
+        a client retrying a timed-out inference call against a non-deterministic or
+        side-effecting model (one that writes a prediction to a ledger) needs the same
+        dedup guarantee as a retried payment.</p>
+      </div>
+    </div>
+
+    <p>
+      The widget below packs six of the mistakes above into small, realistic endpoint designs.
+      Pick one, guess how many issues it's hiding, then run the linter to see what it actually
+      catches — and the fixed version.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — API design linter</div>
+
+      <div class="lint-controls">
+        <select id="lintSelect" aria-label="Choose an endpoint design to lint"></select>
+        <button class="btn secondary" id="lintReset" type="button">Reset</button>
+      </div>
+
+      <div class="lint-endpoint" id="lintEndpoint"></div>
+
+      <div class="lint-panel">
+        <h4>Request / response as designed</h4>
+        <pre><code id="lintSnippet"></code></pre>
+      </div>
+
+      <p class="mono muted" style="margin-top:-0.5rem">How many issues is this design hiding?</p>
+      <div class="guess-row" id="guessRow"></div>
+
+      <div class="lint-result" id="lintResult" hidden>
+        <div class="lint-verdict" id="lintVerdict"></div>
+        <ul class="issue-list" id="issueList"></ul>
+        <button class="btn secondary fix-toggle" id="fixToggle" type="button">Show the fixed design</button>
+        <div class="lint-panel" id="fixPanel" hidden>
+          <h4>Fixed design</h4>
+          <pre><code id="fixSnippet"></code></pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A <code>PUT /carts/91</code> handler fully replaces the cart's
+          state on every call, but also sends a "cart updated" notification email each time
+          it's invoked. Is this endpoint idempotent?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Yes — <code>PUT</code> is idempotent by definition, no matter what the handler does.</button>
+          <button class="quiz-option" data-choice="b">No — <code>PUT</code> can never be idempotent if it has any side effect at all.</button>
+          <button class="quiz-option" data-choice="c">No — the resource state ends up the same either way, but repeating the call sends duplicate emails, which is an observable side effect that differs between one call and many.</button>
+        </div>
+        <p class="quiz-explain" hidden>Idempotency is about the total observable effect of repeating the call, not just the primary resource's final state. A side effect that fires on every call (an email, a webhook, an audit-log append) breaks the contract even when the "main" resource ends up identical — which is exactly why a retry layer that trusts the verb blindly can still cause damage.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. Why does cursor (keyset) pagination stay stable under concurrent
+          inserts, while offset pagination can skip or duplicate rows?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Cursor pagination locks the table for the duration of the request, preventing writes.</button>
+          <button class="quiz-option" data-choice="b">A cursor encodes a position relative to a specific row's sort key, so a new row inserted elsewhere doesn't shift it — whereas an offset is a raw position count, and every insert or delete before that position shifts what's actually at it.</button>
+          <button class="quiz-option" data-choice="c">Cursor pagination only works on read replicas, which don't receive writes during a request.</button>
+        </div>
+        <p class="quiz-explain" hidden>Offset pagination asks "give me the rows starting at position 200" — a position that silently shifts if rows are added or removed before it. Cursor pagination asks "give me rows after this specific row's key," which stays correct regardless of what happens elsewhere in the table.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A team adds a required <code>shipping_zone</code> field to the
+          request body of an existing, widely-integrated <code>POST /orders</code> endpoint,
+          with no version bump. What's the risk?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Every existing client that doesn't send <code>shipping_zone</code> starts failing immediately — making an optional field required is a breaking change, version bump or not.</button>
+          <button class="quiz-option" data-choice="b">None — adding fields to a request body is always backward compatible.</button>
+          <button class="quiz-option" data-choice="c">None, as long as the field has a sensible name.</button>
+        </div>
+        <p class="quiz-explain" hidden>Adding an *optional* field is safe; adding a *required* one is not, because every existing request that omits it now fails validation. This is exactly the kind of change that needs either a default value (keeping it optional) or a genuine version bump with a deprecation window for the old behavior.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page covered REST as the default choice. The next deep-dive, <em>Beyond REST: gRPC,
+      GraphQL &amp; Streaming</em>, covers when REST stops being the right tool — service-to-service
+      calls where schema and codegen matter more than human-readability, client-shaped queries
+      that avoid over-fetching, and the streaming use cases (chat, live updates, token-by-token
+      generation) that a request/response model doesn't fit at all.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var SCENARIOS = [
+        {
+          id: "verb-in-path",
+          title: "1. Fetching a single order",
+          method: "GET",
+          path: "/getOrder?id=482",
+          snippet: "GET /getOrder?id=482\n\n200 OK\n{ \"id\": 482, \"status\": \"shipped\" }",
+          issues: [
+            {
+              title: "Verb baked into the path",
+              body: "“getOrder” duplicates what GET already means. The path should name the resource: /orders/482. Once every endpoint follows noun+verb consistently, clients and proxies can reason about any endpoint the same way."
+            },
+            {
+              title: "Identifier in a query parameter instead of the path",
+              body: "482 identifies *which* order — that's part of the resource's address, not a filter on a collection. It belongs in the path: /orders/482."
+            }
+          ],
+          fix: "GET /orders/482\n\n200 OK\n{ \"id\": 482, \"status\": \"shipped\" }"
+        },
+        {
+          id: "impure-put",
+          title: "2. Updating a cart",
+          method: "PUT",
+          path: "/carts/91",
+          snippet: "PUT /carts/91\n{ \"items\": [{\"sku\": \"A1\", \"qty\": 2}] }\n\n(handler replaces cart.items, then\nappends a row to cart_activity_log\nand sends a “cart updated” email\nEVERY time it's called)\n\n200 OK\n{ \"id\": 91, \"items\": [...] }",
+          issues: [
+            {
+              title: "Side effect breaks idempotency",
+              body: "The resource state itself is replaced correctly (that part is idempotent), but the activity-log append and the email fire again on every retry. A client or retry layer that assumes PUT is safe to repeat blindly will cause duplicate emails on a network hiccup."
+            }
+          ],
+          fix: "PUT /carts/91\n{ \"items\": [{\"sku\": \"A1\", \"qty\": 2}] }\n\n(handler replaces cart.items; the\nactivity-log entry and notification\nare only emitted when the new state\nactually differs from the old one)\n\n200 OK\n{ \"id\": 91, \"items\": [...] }"
+        },
+        {
+          id: "unbounded-list",
+          title: "3. Listing orders",
+          method: "GET",
+          path: "/orders",
+          snippet: "GET /orders\n\n200 OK\n[ /* all 4.2 million orders,\n     no limit, no pagination */ ]",
+          issues: [
+            {
+              title: "No pagination at all",
+              body: "An endpoint with no limit returns more rows every day the business grows — a latency and memory failure that hasn't happened yet rather than one that can't happen."
+            },
+            {
+              title: "No server-side cap even if a limit were added later",
+              body: "Whatever pagination gets bolted on needs a server-enforced maximum limit regardless of what a client requests — otherwise ?limit=999999999 just recreates this bug with extra steps."
+            }
+          ],
+          fix: "GET /orders?after=cursor_xyz&limit=50\n\n200 OK\n{\n  \"items\": [ /* 50 orders */ ],\n  \"next_cursor\": \"cursor_abc\"\n}"
+        },
+        {
+          id: "error-as-200",
+          title: "4. Failed validation",
+          method: "POST",
+          path: "/payments",
+          snippet: "POST /payments\n{ \"amount\": -50, \"card\": \"...\" }\n\n200 OK\n{\n  \"error\": true,\n  \"message\": \"NumberFormatException:\n    negative amount at\n    PaymentValidator.java:88\"\n}",
+          issues: [
+            {
+              title: "Error returned with a 2xx status",
+              body: "Load balancers, HTTP client libraries, and monitoring all classify success/failure by status code first. A 200 here means every layer of generic tooling sees this as a successful payment request."
+            },
+            {
+              title: "Internal exception detail leaked to the client",
+              body: "A raw exception message with a file name and line number is an information-disclosure risk and useless to the caller — it can't act on “NumberFormatException.” The client needs a stable error code; the stack trace belongs in server-side logs against a request_id."
+            }
+          ],
+          fix: "POST /payments\n{ \"amount\": -50, \"card\": \"...\" }\n\n422 Unprocessable Entity\n{\n  \"error\": {\n    \"code\": \"invalid_amount\",\n    \"message\": \"Amount must be positive.\",\n    \"field\": \"amount\",\n    \"request_id\": \"req_7a01f\"\n  }\n}"
+        },
+        {
+          id: "silent-breaking-change",
+          title: "5. Evolving the user resource",
+          method: "GET",
+          path: "/users/17",
+          snippet: "-- last week --\nGET /users/17\n200 OK\n{ \"id\": 17, \"phone\": \"+1 555 0100\" }\n\n-- shipped today, same URL, no\n   version bump --\nGET /users/17\n200 OK\n{ \"id\": 17,\n  \"phone\": { \"country\": \"US\",\n              \"number\": \"5550100\" } }",
+          issues: [
+            {
+              title: "Field type changed on a live, unversioned endpoint",
+              body: "phone went from a string to an object with no version bump and no deprecation window. Existing clients parsing phone as a string don't get an error — they get a type mismatch or a silently wrong value, which is harder to detect than a hard failure."
+            }
+          ],
+          fix: "GET /v2/users/17\n200 OK\n{ \"id\": 17,\n  \"phone\": { \"country\": \"US\",\n              \"number\": \"5550100\" } }\n\n(GET /v1/users/17 keeps returning\nthe old string shape until the\npublished deprecation window ends)"
+        },
+        {
+          id: "no-idempotency-key",
+          title: "6. Charging a customer",
+          method: "POST",
+          path: "/payments/charge",
+          snippet: "POST /payments/charge\n{ \"amount\": 4999, \"customer\": \"cus_1\" }\n\n(client times out waiting for a\nresponse and, per its retry policy,\nresends the identical request)",
+          issues: [
+            {
+              title: "No idempotency key on a non-idempotent, money-moving POST",
+              body: "The server has no way to tell “retry of a request I already processed” apart from “a genuinely new charge.” On a timeout, the client can't safely resend (risking a double charge) or safely skip resending (risking a dropped legitimate charge)."
+            }
+          ],
+          fix: "POST /payments/charge\nIdempotency-Key: 6c2f0e2a-...\n{ \"amount\": 4999, \"customer\": \"cus_1\" }\n\n(server stores the result keyed by\nIdempotency-Key; a retried request\nwith the same key returns the\noriginal result instead of\ncharging again)"
+        }
+      ];
+
+      var lintSelect = document.getElementById("lintSelect");
+      var lintEndpoint = document.getElementById("lintEndpoint");
+      var lintSnippet = document.getElementById("lintSnippet");
+      var guessRow = document.getElementById("guessRow");
+      var lintResult = document.getElementById("lintResult");
+      var lintVerdict = document.getElementById("lintVerdict");
+      var issueList = document.getElementById("issueList");
+      var fixToggle = document.getElementById("fixToggle");
+      var fixPanel = document.getElementById("fixPanel");
+      var fixSnippet = document.getElementById("fixSnippet");
+      var lintReset = document.getElementById("lintReset");
+
+      var current = null;
+      var guessed = null;
+
+      function verbClass(method) {
+        if (method === "POST") return "post";
+        if (method === "DELETE") return "delete";
+        return "";
+      }
+
+      function populateSelect() {
+        SCENARIOS.forEach(function (s, i) {
+          var opt = document.createElement("option");
+          opt.value = i;
+          opt.textContent = s.title;
+          lintSelect.appendChild(opt);
+        });
+      }
+
+      function renderGuessRow() {
+        guessRow.innerHTML = "";
+        [0, 1, 2, 3].forEach(function (n) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "guess-btn";
+          b.textContent = n === 3 ? "3+" : String(n);
+          b.dataset.n = n;
+          b.addEventListener("click", function () { onGuess(n, b); });
+          guessRow.appendChild(b);
+        });
+      }
+
+      function loadScenario(idx) {
+        current = SCENARIOS[idx];
+        guessed = null;
+        lintEndpoint.innerHTML =
+          '<span class="verb ' + verbClass(current.method) + '">' + current.method + '</span>' +
+          '<span class="path">' + current.path + '</span>';
+        lintSnippet.textContent = current.snippet;
+        lintResult.hidden = true;
+        fixPanel.hidden = true;
+        fixToggle.textContent = "Show the fixed design";
+        renderGuessRow();
+      }
+
+      function onGuess(n, btn) {
+        if (guessed !== null) return;
+        guessed = n;
+        Array.prototype.forEach.call(guessRow.children, function (c) {
+          c.disabled = true;
+        });
+        btn.classList.add("chosen");
+        revealIssues();
+      }
+
+      function revealIssues() {
+        var actual = current.issues.length;
+        var hit = guessed === actual || (guessed === 3 && actual >= 3);
+        lintVerdict.className = "lint-verdict " + (hit ? "hit" : "miss");
+        lintVerdict.textContent = hit ?
+          ("Good catch — the linter also found " + actual + (actual === 1 ? " issue." : " issues.")) :
+          ("The linter found " + actual + (actual === 1 ? " issue." : " issues.") + " Read through them below.");
+
+        issueList.innerHTML = "";
+        current.issues.forEach(function (issue) {
+          var li = document.createElement("li");
+          li.className = "issue-item";
+          li.innerHTML =
+            '<span class="issue-icon">!</span>' +
+            '<div><div class="issue-title">' + issue.title + '</div>' +
+            '<p>' + issue.body + '</p></div>';
+          issueList.appendChild(li);
+        });
+
+        fixSnippet.textContent = current.fix;
+        lintResult.hidden = false;
+      }
+
+      fixToggle.addEventListener("click", function () {
+        fixPanel.hidden = !fixPanel.hidden;
+        fixToggle.textContent = fixPanel.hidden ? "Show the fixed design" : "Hide the fixed design";
+      });
+
+      lintSelect.addEventListener("change", function () {
+        loadScenario(parseInt(lintSelect.value, 10));
+      });
+
+      lintReset.addEventListener("click", function () {
+        loadScenario(parseInt(lintSelect.value, 10));
+      });
+
+      populateSelect();
+      loadScenario(0);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
