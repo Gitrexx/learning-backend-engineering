@@ -60,7 +60,7 @@
       "summary": "When REST isn't the tool: gRPC/protobuf, GraphQL and the N+1 trap, WebSockets/SSE — and how to choose.",
       "prerequisites": ["rest-api-design"],
       "file": "rpc-graphql-streaming.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "relational-data-modeling",

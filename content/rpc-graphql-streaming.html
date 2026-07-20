@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beyond REST: gRPC, GraphQL &amp; Streaming — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the protocol-picker widget only. */
+    .proto-controls {
+      display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3);
+      margin-bottom: var(--sp-4);
+    }
+    .proto-controls select { flex: 1 1 320px; min-width: 220px; }
+
+    .proto-prompt {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--sp-4) var(--sp-5);
+      margin-bottom: var(--sp-4);
+      font-size: var(--fs-sm);
+    }
+    .proto-prompt p { margin: 0; }
+    .proto-prompt .proto-context { color: var(--text-muted); }
+
+    .proto-choices {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: var(--sp-3); margin-bottom: var(--sp-4);
+    }
+    .proto-choice {
+      font: inherit; font-weight: 700; text-align: center;
+      padding: var(--sp-3) var(--sp-3); border-radius: var(--radius);
+      border: 1px solid var(--border-strong); background: var(--surface-2);
+      color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s, transform .05s;
+    }
+    .proto-choice:hover { border-color: var(--accent); }
+    .proto-choice:active { transform: translateY(1px); }
+    .proto-choice.correct { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    .proto-choice.incorrect { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .proto-choice:disabled { cursor: default; }
+
+    .proto-result[hidden] { display: none; }
+    .proto-verdict {
+      font-size: var(--fs-sm); font-weight: 700; margin-bottom: var(--sp-3);
+      padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
+    }
+    .proto-verdict.hit { background: var(--ok-soft); color: var(--ok); }
+    .proto-verdict.miss { background: var(--warn-soft); color: var(--warn); }
+
+    .fit-badge {
+      display: inline-block; font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.04em; padding: 0.2em 0.55em; border-radius: 999px;
+      border: 1px solid var(--border-strong); white-space: nowrap;
+    }
+    .fit-badge.best { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .fit-badge.works { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+    .fit-badge.wrong { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+
+    @media (max-width: 560px) { .proto-controls { flex-direction: column; align-items: stretch; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">APIs &amp; Interfaces // 02</p>
+    <h1>Beyond REST: gRPC, GraphQL &amp; Streaming</h1>
+
+    <p>
+      The previous deep-dive treated REST as the default — and it is, for the same reason English
+      is the default language of international business: not because it's optimal, but because
+      enough people already speak it that switching costs dominate the decision. REST's cost shows
+      up in three specific places it wasn't optimized for: shaving milliseconds off high-volume
+      service-to-service calls, letting wildly different clients each get exactly the data shape
+      they need, and anything that isn't fundamentally a question-then-answer exchange at all. This
+      page is about recognizing those three shapes and picking the tool built for each — and,
+      just as importantly, about <em>not</em> reaching for them when plain REST still fits, because
+      each one trades away something REST gives you for free.
+    </p>
+
+    <h2>Three shapes that aren't "request, then response"</h2>
+    <p>
+      Every protocol on this page exists because a mismatch between REST's model and a real
+      requirement got expensive enough to justify a different tool:
+    </p>
+    <dl class="definition">
+      <dt>Machine-to-machine efficiency</dt>
+      <dd>Two of your own services calling each other thousands of times a second, where JSON's
+        text parsing and REST's "one resource per call" shape start showing up in latency budgets
+        and CPU bills. <b>gRPC</b> is built for this.</dd>
+      <dt>Client-shaped queries</dt>
+      <dd>Wildly different clients (a mobile app on a slow connection, a admin dashboard, a
+        partner integration) each wanting a different slice and depth of the same underlying data,
+        where REST forces a choice between too little data (many round trips) or too much
+        (wasted bandwidth). <b>GraphQL</b> is built for this.</dd>
+      <dt>Continuous push</dt>
+      <dd>Updates that originate on the server with no client request to respond to — a chat
+        message, a live price tick, the next token of a streaming completion — where "poll
+        repeatedly and hope you're not too late or too early" is the only way to fake it over
+        plain request/response. <b>WebSockets</b> and <b>Server-Sent Events</b> are built for this.</dd>
+    </dl>
+    <p>
+      None of these retire REST — a typical production system runs REST (or GraphQL) at its public
+      edge, gRPC between its internal services, and a streaming channel wherever something needs
+      to be pushed rather than pulled. Knowing which is which, and being able to say why out loud,
+      is exactly the kind of trade-off reasoning a system-design interview is probing for.
+    </p>
+
+    <h2>gRPC: RPC over HTTP/2 with a strict schema</h2>
+    <p>
+      <span class="term">gRPC</span> is a remote-procedure-call framework: instead of designing
+      URLs and verbs around resources, you define <em>functions</em> a service exposes — in a
+      <code>.proto</code> file, using <span class="term">Protocol Buffers</span> (protobuf) as the
+      interface-definition language:
+    </p>
+    <pre><code>service InventoryService {
+  rpc GetStock (StockRequest) returns (StockReply);
+}
+
+message StockRequest {
+  string sku = 1;
+}
+message StockReply {
+  string sku = 1;
+  int32  quantity = 2;
+}</code></pre>
+    <p>
+      A code generator turns that one file into client and server stubs in whatever languages your
+      services are written in — call <code>GetStock(request)</code> in Go, and code you never wrote
+      by hand serializes it to <b>binary</b> (not JSON text), sends it over an
+      <a href="networking-for-backend.html">HTTP/2</a> connection, and deserializes the reply back
+      into a typed Go struct on the other end. Two things fall out of this that REST+JSON doesn't
+      give you: the wire format is compact binary instead of verbose text (materially less CPU and
+      bandwidth at high call volumes), and the contract is <em>enforced at compile time</em> in
+      every language that consumes it — a client and server built from the same <code>.proto</code>
+      literally cannot disagree about a field's name or type, which is a whole category of bug
+      REST's "the docs said it was a string" contracts leave to runtime.
+    </p>
+
+    <h3>Four shapes of RPC</h3>
+    <p>
+      Because gRPC rides on HTTP/2's multiplexed, bidirectional streams (the same primitive that
+      made HTTP/2 fix REST's head-of-line-blocking problem), it can express more than
+      request-then-response on a single call:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>RPC type</th><th>Shape</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Unary</td><td>One request, one response</td><td><code>GetStock(sku)</code> — the REST-equivalent case</td></tr>
+          <tr><td>Server streaming</td><td>One request, a stream of responses</td><td>Subscribe to price updates for one symbol</td></tr>
+          <tr><td>Client streaming</td><td>A stream of requests, one response</td><td>Upload a large file in chunks, get one confirmation</td></tr>
+          <tr><td>Bidirectional streaming</td><td>Both sides stream independently, concurrently</td><td>A live translation session — audio in, translated text out, continuously</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>Protobuf's compile-time safety only holds if you follow its evolution rules: every
+        field has a permanent, immutable <b>field number</b> (the <code>= 1</code>, <code>= 2</code>
+        above) that's what actually gets encoded on the wire — field <em>names</em> are a
+        source-code-only convenience. Reusing a retired field number for a new field means old
+        binary data on disk or in flight gets silently misinterpreted as the new type, with no
+        error. The safe evolution moves are the same spirit as REST's, just enforced by the
+        format instead of convention: add new fields with new numbers, never renumber or reuse a
+        removed field's number, and only ever widen a field's meaning, never narrow it.</p>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>gRPC</th><th>REST + JSON</th></tr></thead>
+        <tbody>
+          <tr><td>Wire format</td><td>Binary (protobuf)</td><td>Text (JSON)</td></tr>
+          <tr><td>Contract</td><td><code>.proto</code>, codegen, compile-time checked</td><td>Documentation / OpenAPI spec, checked at runtime (if at all)</td></tr>
+          <tr><td>Streaming</td><td>Native — all four shapes above</td><td>Bolted on (chunked responses, SSE, polling)</td></tr>
+          <tr><td>Browser support</td><td>Needs a proxy (gRPC-Web) — not native</td><td>Native <code>fetch</code>/XHR</td></tr>
+          <tr><td>Human-debuggability</td><td>Needs <code>grpcurl</code>/a proxy — binary isn't <code>curl</code>-and-read</td><td><code>curl</code> and read it</td></tr>
+          <tr><td>Best fit</td><td>Internal service-to-service, polyglot, latency-sensitive</td><td>Public/partner APIs, broad client compatibility, cacheability</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Browsers can't speak raw gRPC — it depends on HTTP/2 trailer frames that
+        <code>fetch</code>/XHR don't expose. gRPC-Web works around this with a translating proxy
+        (Envoy is the common choice), but that's an extra hop and operational piece most teams
+        don't want for a public-facing API. This alone rules gRPC out for "an API a browser calls
+        directly" — reach for it behind your own edge, between services you control, not as the
+        thing a customer's frontend talks to.</p>
+      </div>
+    </div>
+
+    <h2>GraphQL: let the client shape the response</h2>
+    <p>
+      REST fixes the shape of a resource server-side — <code>GET /orders/482</code> always returns
+      the same fields, so a client that only needs the order's status still downloads the shipping
+      address, the line items, and everything else (<span class="term">over-fetching</span>), while
+      a client that needs an order <em>and</em> its customer's name has to make two round trips
+      (<span class="term">under-fetching</span>). <span class="term">GraphQL</span> inverts this:
+      one endpoint, and the <em>client</em> sends a query describing exactly the shape it wants back.
+    </p>
+    <pre><code>query {
+  order(id: 482) {
+    status
+    customer { name }
+    lineItems { sku quantity }
+  }
+}</code></pre>
+    <p>
+      The server has a schema (a typed graph of object types and the fields/relationships that
+      connect them) and a <span class="term">resolver</span> function per field that knows how to
+      fetch it — often from entirely different backends (a SQL table for orders, a separate
+      service for customers). One request, exactly the fields asked for, arbitrarily nested. This
+      is why GraphQL wins for clients with genuinely different, unpredictable data needs: a mobile
+      app on a metered connection and an internal admin dashboard can hit the <em>same</em> schema
+      and each get their own precise shape, instead of the backend team building (and maintaining)
+      a bespoke REST endpoint per client need.
+    </p>
+
+    <h3>The N+1 trap</h3>
+    <p>
+      The naive way to implement a resolver for <code>lineItems { product { name } }</code> is:
+      fetch the order's line items, then loop over them issuing one query per item to fetch each
+      product's name. For an order with 20 line items, that's 1 query to get the items plus 20 more
+      to get each product — the <span class="term">N+1 problem</span>, and it's the single most
+      common way a naive GraphQL server turns a "one request" pitch into 21 database round trips
+      hidden behind it.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>The fix is <b>batching</b>: instead of each resolver instance firing its own query
+        immediately, it registers "I need product 91" with a per-request batch collector (the
+        <code>DataLoader</code> pattern, originally from GraphQL.js) that waits a tick, gathers
+        every product ID requested during that window, and issues <em>one</em>
+        <code>WHERE id IN (...)</code> query for all of them — turning N+1 queries into 2. This
+        is the same fan-out-amplification problem you'll meet again in <em>Performance, Profiling
+        &amp; Capacity Planning</em>, just triggered by a query's declarative shape instead of an
+        explicit loop in application code — which is exactly why it's easy to miss until a schema
+        allows deep nesting and someone writes a query that walks it.</p>
+      </div>
+    </div>
+
+    <h3>Trade-offs GraphQL doesn't advertise</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>What you gain</th><th>What it costs</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>No over-/under-fetching — client gets exactly its shape</td>
+            <td>Every request is a <code>POST</code> to one URL, so HTTP/CDN caching by URL — a
+              free win for REST's <code>GET /orders/482</code> — mostly stops working; you need a
+              separate caching layer (persisted queries, a response cache keyed on the query+vars)</td>
+          </tr>
+          <tr>
+            <td>Strongly typed schema + introspection (self-documenting, great tooling)</td>
+            <td>A schema is still a versioned contract underneath — you deprecate fields (<code>@deprecated</code>) rather than remove them, same discipline as REST, just with a different mechanism</td>
+          </tr>
+          <tr>
+            <td>One round trip for arbitrarily nested data</td>
+            <td>An arbitrarily nested <em>query</em> is also an attack surface — a client can ask
+              for a deeply recursive shape that fans out into thousands of resolver calls; you must
+              cap query depth/complexity server-side or a single request can DoS you (see
+              <em>Backend Security &amp; the OWASP Top 10</em>)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Push: WebSockets vs. Server-Sent Events</h2>
+    <p>
+      Everything so far is still request-then-response — the client always initiates. Some problems
+      have no natural request: a chat message arrives whenever the other person sends it, not when
+      you ask. Polling ("call <code>GET /messages</code> every 2 seconds") fakes this badly — it's
+      wasteful when nothing changed and adds up to 2 seconds of needless latency when something did.
+      Two real push mechanisms exist, and they aren't interchangeable:
+    </p>
+    <dl class="definition">
+      <dt>WebSockets</dt>
+      <dd>An HTTP request that <em>upgrades</em> the connection to a persistent,
+        <span class="term">full-duplex</span> raw socket — both sides can send at any time,
+        independently, over the same connection. The right tool when the client also needs to push:
+        chat, multiplayer state, collaborative editing (two people typing in the same document).</dd>
+      <dt>Server-Sent Events (SSE)</dt>
+      <dd>A plain HTTP response that never closes — the server keeps writing
+        <code>text/event-stream</code> chunks and the browser's built-in <code>EventSource</code>
+        API delivers each as an event. <span class="term">One-directional, server → client only.</span>
+        The right tool when only the server has something to push: live notifications, a stock
+        ticker, a chat model streaming its reply token by token.</dd>
+    </dl>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>WebSockets</th><th>SSE</th></tr></thead>
+        <tbody>
+          <tr><td>Direction</td><td>Full duplex</td><td>Server → client only</td></tr>
+          <tr><td>Transport</td><td>Upgraded TCP socket (its own framing, not HTTP after the handshake)</td><td>Plain HTTP response, standard infra (proxies, load balancers, CDNs) mostly just works</td></tr>
+          <tr><td>Reconnect</td><td>Manual — you write the retry/backoff logic</td><td>Built into <code>EventSource</code>, including resuming from a <code>Last-Event-ID</code></td></tr>
+          <tr><td>Browser API</td><td><code>WebSocket</code></td><td><code>EventSource</code> (simpler, fewer moving parts)</td></tr>
+          <tr><td>Pick it when</td><td>The client needs to push too</td><td>Only the server pushes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Default to SSE whenever the traffic really is one-directional — it's dramatically less
+        to operate: no custom reconnect logic, no special load-balancer configuration for a raw
+        socket protocol, and it degrades gracefully through plain HTTP infrastructure. Reach for
+        WebSockets only when the client genuinely has its own stream of pushes to send, because
+        that's a real requirement SSE structurally cannot meet — not because WebSockets are the
+        more "advanced" or impressive-looking choice.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Both halves of this page show up directly in ML infrastructure. Model-serving frameworks
+        (TensorFlow Serving, Triton, TorchServe) expose a gRPC endpoint alongside a REST one for
+        exactly the reasons above: internal, latency-sensitive, high-volume inference calls between
+        your own services want binary encoding and a compile-time-checked tensor schema, not JSON
+        parsing overhead on every request. And every major LLM API (chat completions with
+        <code>stream=true</code>) sends tokens back over SSE, not WebSockets — the traffic is
+        genuinely one-directional (you send one prompt, the server pushes tokens), so SSE's simpler
+        operational story wins, and <code>EventSource</code>'s built-in reconnect means a client
+        that drops mid-stream can resume without you hand-rolling that logic. If you've ever
+        consumed a streaming completion API, you've already used SSE — probably without knowing it
+        had a name.</p>
+      </div>
+    </div>
+
+    <h2>A decision framework</h2>
+    <p>
+      In interview-speak, the answer to "REST, gRPC, or GraphQL?" is never "gRPC is faster" in the
+      abstract — it's naming which of these axes matters most for the specific system in front of
+      you, out loud:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>If this is the dominant constraint…</th><th>…reach for</th></tr></thead>
+        <tbody>
+          <tr><td>Broad, unpredictable client compatibility (public API, partners, browsers, <code>curl</code>-ability)</td><td>REST</td></tr>
+          <tr><td>Internal service-to-service, polyglot, latency/CPU-sensitive at high call volume</td><td>gRPC</td></tr>
+          <tr><td>Clients with genuinely different, nested, unpredictable data needs from the same underlying graph</td><td>GraphQL</td></tr>
+          <tr><td>Client also needs to push (chat, collaboration, multiplayer)</td><td>WebSockets</td></tr>
+          <tr><td>Only the server pushes (notifications, live feeds, token streaming)</td><td>SSE</td></tr>
+          <tr><td>HTTP/CDN caching by URL matters a lot</td><td>REST (GraphQL and gRPC both work against this by design)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Real systems combine these rather than picking one globally: a public REST or GraphQL edge,
+      gRPC between the services behind it, and an SSE or WebSocket channel wherever something needs
+      to be pushed. The widget below hands you five concrete scenarios — pick the protocol you'd
+      reach for, then see the full trade-off breakdown, including why the tempting-but-wrong answers
+      fall short.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — pick the protocol</div>
+
+      <div class="proto-controls">
+        <select id="scenarioSelect" aria-label="Choose a use case"></select>
+        <button class="btn secondary" id="scenarioReset" type="button">Reset</button>
+      </div>
+
+      <div class="proto-prompt" id="scenarioPrompt"></div>
+
+      <p class="mono muted" style="margin-top:-0.5rem">Which protocol fits best?</p>
+      <div class="proto-choices" id="protoChoices"></div>
+
+      <div class="proto-result" id="protoResult" hidden>
+        <div class="proto-verdict" id="protoVerdict"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Protocol</th><th>Fit</th><th>Why</th></tr></thead>
+            <tbody id="protoTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. In a <code>.proto</code> file, why is it dangerous to reuse a field
+          number after removing the old field it belonged to?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It isn't dangerous — protobuf tracks fields by name, so the number is just a cosmetic label.</button>
+          <button class="quiz-option" data-choice="b">Protobuf's binary wire format encodes fields by number, not name — old serialized data (on disk, in a queue, in flight) still uses the retired number, so a decoder reading it with the new field definition silently misinterprets the bytes as the wrong type.</button>
+          <button class="quiz-option" data-choice="c">It's dangerous only if the new field has a different name than the old one.</button>
+        </div>
+        <p class="quiz-explain" hidden>Field numbers, not names, are what's actually on the wire. Names exist only in the generated source code. Reusing a number is the protobuf equivalent of REST silently changing a field's type on a live endpoint — except it can corrupt already-serialized data with no parse error at all, which is what makes it worse.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. Why does GraphQL mostly defeat standard HTTP/CDN caching, in a way plain REST doesn't?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Every GraphQL request is typically a <code>POST</code> to the same single URL — HTTP/CDN caching keys on URL (and method), so it can't distinguish two different queries that hit the same endpoint the way it distinguishes <code>/orders/1</code> from <code>/orders/2</code>.</button>
+          <button class="quiz-option" data-choice="b">GraphQL responses are always marked <code>no-cache</code> by the protocol specification.</button>
+          <button class="quiz-option" data-choice="c">GraphQL servers don't support the <code>Cache-Control</code> header.</button>
+        </div>
+        <p class="quiz-explain" hidden>REST's resource-per-URL design is what makes it cache-friendly for free — a CDN can cache <code>GET /orders/482</code> by its URL. GraphQL's single-endpoint, query-shaped-by-the-client model breaks that key, which is why GraphQL deployments need their own caching layer (persisted queries, response caching keyed on the query+variables) to get comparable behavior.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. A team is building a feature where an LLM streams its reply token-by-token to a web chat UI, with no need for the client to send anything mid-stream. Which should they reach for, and why?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">WebSockets, because it's the more modern, general-purpose real-time protocol.</button>
+          <button class="quiz-option" data-choice="b">gRPC server streaming, since browsers can call gRPC directly.</button>
+          <button class="quiz-option" data-choice="c">SSE — the traffic is one-directional (server pushes tokens, client doesn't push back), and <code>EventSource</code> gets automatic reconnect for free, with none of WebSockets' operational overhead for a duplex channel this use case doesn't need.</button>
+        </div>
+        <p class="quiz-explain" hidden>Browsers can't call raw gRPC without a translating proxy, ruling out (b). WebSockets would work but is solving a harder problem (full duplex) than the one that exists (one-directional push) — the general rule from this page: match the mechanism's directionality to the actual requirement, don't reach for the more powerful-sounding tool by default.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This closes out APIs &amp; Interfaces. The next area, <em>Data &amp; Databases</em>, starts
+      with <em>Relational Data Modeling</em> — the schema decisions (keys, relationships,
+      normalization) that everything a REST, gRPC, or GraphQL endpoint ultimately returns has to be
+      read from, since no protocol choice fixes a bad data model underneath it.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var PROTOCOLS = [
+        { key: "rest", label: "REST" },
+        { key: "grpc", label: "gRPC" },
+        { key: "graphql", label: "GraphQL" },
+        { key: "websocket", label: "WebSockets" },
+        { key: "sse", label: "SSE" }
+      ];
+
+      var SCENARIOS = [
+        {
+          id: "mobile-feed",
+          title: "1. Mobile feed with variable-depth nested data",
+          prompt: "A social app's feed screen needs post + author name only; the post-detail screen needs the same post plus its full comment thread, each comment's author, and reply counts. Users are often on slow, metered connections, and the two screens are built by different frontend teams shipping on different schedules.",
+          correct: "graphql",
+          breakdown: {
+            graphql: { fit: "best", why: "Two screens with genuinely different, nested shapes from the same underlying data — the whole reason GraphQL exists. Each screen's query asks for exactly its own depth; neither over-fetches the other's fields, and no backend endpoint has to be redesigned when a screen's needs change." },
+            rest: { fit: "works", why: "Workable with either a fat endpoint (feed screen over-fetches the comment thread it doesn't need) or two bespoke endpoints (more backend surface to maintain as screens evolve) — REST doesn't have a native answer to 'two clients, two shapes, one graph.'" },
+            grpc: { fit: "wrong", why: "Solves machine-to-machine performance, not client-shaped queries — and browsers can't call it directly without a translating proxy, which is a real cost for a feature with no service-to-service performance problem to justify it." },
+            websocket: { fit: "wrong", why: "This is a pull (fetch when the screen opens), not a push — there's no server-initiated update to justify a persistent duplex connection." },
+            sse: { fit: "wrong", why: "Same issue as WebSockets: nothing here originates on the server between requests. SSE solves push, and this is a request." }
+          }
+        },
+        {
+          id: "internal-inventory",
+          title: "2. High-volume internal service-to-service calls",
+          prompt: "Your payment service (Java) calls your inventory service (Go) to check stock before confirming an order — tens of thousands of calls per minute, both services owned by your own team, p99 latency budget under 10ms.",
+          correct: "grpc",
+          breakdown: {
+            grpc: { fit: "best", why: "Exactly the case gRPC is built for: internal, polyglot (Java ↔ Go), high call volume, tight latency budget. Binary protobuf encoding and a compile-time-checked contract shave real milliseconds and eliminate a class of runtime type-mismatch bugs versus JSON." },
+            rest: { fit: "works", why: "Functionally fine, but leaves latency and CPU on the table at this volume — JSON's text parsing and REST's lack of native streaming are exactly the costs gRPC exists to remove for internal, high-frequency calls." },
+            graphql: { fit: "wrong", why: "Solves 'different clients want different shapes of my data' — there's one caller here with one fixed need (stock level for a SKU), so GraphQL's flexibility buys nothing and its caching/complexity costs buy nothing back." },
+            websocket: { fit: "wrong", why: "This is unary request/response at high frequency, not a case where either side needs to push independently of a request — a persistent duplex socket adds complexity with no matching requirement." },
+            sse: { fit: "wrong", why: "No server-initiated push exists here; every call is triggered by a specific order needing a stock check." }
+          }
+        },
+        {
+          id: "collab-editor",
+          title: "3. Real-time collaborative document editing",
+          prompt: "Multiple users edit the same document simultaneously; every keystroke from any user needs to reach every other connected user's screen within roughly 100ms, and any client can originate a change at any moment.",
+          correct: "websocket",
+          breakdown: {
+            websocket: { fit: "best", why: "Genuinely bidirectional: any client can push a change at any time, and the server needs to push other clients' changes back just as freely. This is precisely the case SSE structurally can't handle — the client side of the channel is load-bearing here." },
+            sse: { fit: "wrong", why: "SSE is server → client only. A collaborative editor needs the client to push edits too, so you'd need a second channel (e.g. regular POSTs) just to get changes to the server — reinventing a worse version of what a WebSocket gives you in one connection." },
+            rest: { fit: "wrong", why: "Polling for updates ('any new edits since my last check?') either lags noticeably behind real typing or hammers the server with requests that mostly return nothing — REST's request-then-response model has no good way to represent 'tell me the instant something changes.'" },
+            grpc: { fit: "works", why: "gRPC's bidirectional streaming RPC type can technically do this and is a reasonable choice for a native app talking to your own backend — but for a browser-based editor it needs a gRPC-Web proxy, adding an operational hop a native WebSocket doesn't need." },
+            graphql: { fit: "wrong", why: "GraphQL subscriptions exist and layer push onto a GraphQL schema, but they're typically implemented over WebSockets underneath anyway — GraphQL's core value (client-shaped queries) isn't the problem being solved here, so it adds a schema layer with no matching need." }
+          }
+        },
+        {
+          id: "llm-stream",
+          title: "4. Streaming an LLM's reply token by token to a web chat UI",
+          prompt: "A chat product sends one prompt per turn and streams the model's reply back to the browser as it's generated, so the user sees tokens appear progressively instead of waiting for the full response. The client never needs to push anything mid-reply.",
+          correct: "sse",
+          breakdown: {
+            sse: { fit: "best", why: "The traffic is genuinely one-directional — server pushes tokens, client only reads. SSE fits this exactly, works over plain HTTP through standard proxies/CDNs, and the browser's EventSource gives you automatic reconnect for free (this is precisely how major LLM chat-completion APIs stream today)." },
+            websocket: { fit: "works", why: "Works, but is solving a harder problem (bidirectional) than the one that exists here. You'd also have to hand-roll reconnect/resume logic that EventSource gives SSE for free — extra operational surface with no matching requirement." },
+            grpc: { fit: "works", why: "gRPC server streaming is a natural fit if the caller is another one of your own services (e.g. your backend calling a model-serving layer) — but a browser can't consume it directly without a gRPC-Web proxy, so it's the wrong choice for the browser-facing leg specifically." },
+            rest: { fit: "wrong", why: "Plain REST is request-then-one-response — polling for 'the next token' would add latency per token and hammer the server; it can't represent a single, continuously-updating response at all without abandoning the request/response model." },
+            graphql: { fit: "wrong", why: "GraphQL solves client-shaped queries over a data graph, not incremental server push of a single value — even GraphQL's own subscription mechanism just delegates the actual push transport to something like this page's other options underneath." }
+          }
+        },
+        {
+          id: "public-orders-api",
+          title: "5. A public, partner-facing order-management API",
+          prompt: "An e-commerce platform exposes an API so third-party developers, integration platforms, and internal tools can create and look up orders. Partners span many tech stacks, some just need to script against it with curl, and CDN-level caching of read endpoints matters for cost.",
+          correct: "rest",
+          breakdown: {
+            rest: { fit: "best", why: "Broad, unpredictable client compatibility plus URL-based cacheability are exactly REST's strengths — any HTTP client can call it, it's curl-and-read debuggable, and GET endpoints cache at the CDN by URL with no extra infrastructure." },
+            graphql: { fit: "works", why: "Viable for a public API with genuinely diverse client needs, and plenty of companies do ship public GraphQL APIs — but it costs you free HTTP caching and requires explicit query-complexity limits to stay safe from expensive queries, costs REST doesn't carry for this kind of broad, simple CRUD surface." },
+            grpc: { fit: "wrong", why: "Wrong tool for a partner-facing surface: browsers can't call it directly, and requiring every third-party integrator to adopt protobuf codegen for their language is a much higher integration bar than 'send an HTTP request.'" },
+            websocket: { fit: "wrong", why: "No push requirement exists in 'create and look up orders' — it's request/response, and a persistent duplex connection is unjustified operational overhead for partners who just want to call an endpoint and get a reply." },
+            sse: { fit: "wrong", why: "Same reasoning as WebSockets — there's no server-initiated stream of updates in this use case, just request-then-response CRUD." }
+          }
+        }
+      ];
+
+      var FIT_LABEL = { best: "Best fit", works: "Works, but…", wrong: "Wrong tool" };
+
+      var scenarioSelect = document.getElementById("scenarioSelect");
+      var scenarioPrompt = document.getElementById("scenarioPrompt");
+      var protoChoices = document.getElementById("protoChoices");
+      var protoResult = document.getElementById("protoResult");
+      var protoVerdict = document.getElementById("protoVerdict");
+      var protoTableBody = document.getElementById("protoTableBody");
+      var scenarioReset = document.getElementById("scenarioReset");
+
+      var current = null;
+      var answered = false;
+
+      function populateSelect() {
+        SCENARIOS.forEach(function (s, i) {
+          var opt = document.createElement("option");
+          opt.value = i;
+          opt.textContent = s.title;
+          scenarioSelect.appendChild(opt);
+        });
+      }
+
+      function renderChoices() {
+        protoChoices.innerHTML = "";
+        PROTOCOLS.forEach(function (p) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "proto-choice";
+          b.textContent = p.label;
+          b.dataset.key = p.key;
+          b.addEventListener("click", function () { onChoose(p.key, b); });
+          protoChoices.appendChild(b);
+        });
+      }
+
+      function loadScenario(idx) {
+        current = SCENARIOS[idx];
+        answered = false;
+        scenarioPrompt.innerHTML = '<p class="proto-context">' + current.prompt + '</p>';
+        protoResult.hidden = true;
+        renderChoices();
+      }
+
+      function onChoose(key, btn) {
+        if (answered) return;
+        answered = true;
+        var hit = key === current.correct;
+
+        Array.prototype.forEach.call(protoChoices.children, function (c) {
+          c.disabled = true;
+          if (c.dataset.key === current.correct) c.classList.add("correct");
+          else if (c === btn) c.classList.add("incorrect");
+        });
+
+        protoVerdict.className = "proto-verdict " + (hit ? "hit" : "miss");
+        var correctLabel = PROTOCOLS.filter(function (p) { return p.key === current.correct; })[0].label;
+        protoVerdict.textContent = hit ?
+          ("Right call — " + correctLabel + " is the best fit here.") :
+          (correctLabel + " is the best fit here. See why below.");
+
+        protoTableBody.innerHTML = "";
+        PROTOCOLS.forEach(function (p) {
+          var entry = current.breakdown[p.key];
+          var tr = document.createElement("tr");
+          tr.innerHTML =
+            '<td>' + p.label + '</td>' +
+            '<td><span class="fit-badge ' + entry.fit + '">' + FIT_LABEL[entry.fit] + '</span></td>' +
+            '<td>' + entry.why + '</td>';
+          protoTableBody.appendChild(tr);
+        });
+
+        protoResult.hidden = false;
+      }
+
+      scenarioSelect.addEventListener("change", function () {
+        loadScenario(parseInt(scenarioSelect.value, 10));
+      });
+
+      scenarioReset.addEventListener("click", function () {
+        loadScenario(parseInt(scenarioSelect.value, 10));
+      });
+
+      populateSelect();
+      loadScenario(0);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
