@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Relational Data Modeling — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the "normalize it, then break it" widget only. */
+    .stage-tabs { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+    .stage-tab {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.5em 1.1em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .stage-tab:hover { border-color: var(--accent); }
+    .stage-tab.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+
+    .stage-blurb { font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-4); }
+
+    .rel-tables { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-bottom: var(--sp-4); }
+    .rel-table-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); overflow-x: auto; }
+    .rel-table-card h4 { margin: 0 0 var(--sp-3); font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.08em; }
+    .rel-table-card table { font-size: var(--fs-sm); }
+    .rel-table-card th, .rel-table-card td { padding: var(--sp-2) var(--sp-3); }
+
+    .repeat-group { display: grid; gap: 0.4rem; }
+    .repeat-line { font-family: var(--font-mono); font-size: 0.82rem; display: flex; align-items: center; gap: 0.5em; flex-wrap: wrap; }
+
+    .mini-btn {
+      font: inherit; font-size: 0.72rem; font-weight: 700;
+      padding: 0.2em 0.6em; border-radius: 999px; border: 1px solid var(--accent);
+      background: transparent; color: var(--accent-strong); cursor: pointer; white-space: nowrap;
+    }
+    .mini-btn:hover { background: var(--accent-soft); }
+    .mini-btn:disabled { opacity: 0.35; cursor: default; border-color: var(--border-strong); color: var(--text-faint); }
+
+    .rel-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: var(--sp-4) 0; }
+
+    .outcome[hidden] { display: none; }
+    .outcome {
+      margin-top: var(--sp-3); padding: var(--sp-3) var(--sp-4);
+      border-radius: var(--radius-sm); font-size: var(--fs-sm); font-weight: 600;
+    }
+    .outcome.ok { background: var(--ok-soft); color: var(--ok); }
+    .outcome.bad { background: var(--danger-soft); color: var(--danger); }
+
+    .occ-note { font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-faint); margin: var(--sp-3) 0; }
+    @media (max-width: 560px) { .stage-tabs { flex-direction: column; align-items: stretch; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 01</p>
+    <h1>Relational Data Modeling</h1>
+
+    <p>
+      Every hop in the request lifecycle you traced in <em>Anatomy of a Backend Service</em>
+      eventually bottoms out at a data store, and Data &amp; Databases is the deepest area of this
+      course for a reason: most production incidents that survive past "restart it and see" turn
+      out to be data problems — a schema that allowed a bad state, a query that scans a table it
+      shouldn't, a transaction that raced another one. Relational modeling is where that starts,
+      because the shape of your tables determines which bugs are <em>possible</em> before a single
+      line of application code runs. A schema that models the domain honestly prevents whole
+      classes of bugs by construction; one that doesn't will generate them indefinitely, no matter
+      how careful the code on top of it is.
+    </p>
+
+    <h2>Entities, attributes, and relationships</h2>
+    <p>
+      A relational schema is a claim about the shape of your domain, expressed as tables. Getting
+      the vocabulary precise matters because it's what you reach for when a design goes wrong.
+    </p>
+
+    <dl class="definition">
+      <dt>Entity</dt>
+      <dd>A distinct "thing" your system needs to track — a customer, an order, a product. Becomes
+        a table; each row is one instance of that thing.</dd>
+      <dt>Attribute</dt>
+      <dd>A property of an entity — an order's <code>total_amount</code>, a customer's
+        <code>email</code>. Becomes a column.</dd>
+      <dt>Relationship</dt>
+      <dd>How entities connect — a customer <em>places</em> orders, an order <em>contains</em>
+        products. The cardinality of that connection (one-to-one, one-to-many, many-to-many)
+        determines how you wire the tables together, covered below.</dd>
+    </dl>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Cardinality</th><th>Example</th><th>How it's modeled</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>One-to-one (1:1)</td>
+            <td>A user has one profile</td>
+            <td>Rare in practice — usually the profile's columns just live on the user row, unless
+              split out deliberately (e.g. a large, rarely-read blob kept off the hot table)</td>
+          </tr>
+          <tr>
+            <td>One-to-many (1:N)</td>
+            <td>A customer places many orders</td>
+            <td>Foreign key on the "many" side (<code>orders.customer_id</code>)</td>
+          </tr>
+          <tr>
+            <td>Many-to-many (M:N)</td>
+            <td>Students enroll in many courses; courses have many students</td>
+            <td>A junction table in between (<code>enrollments</code>), covered below</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Keys: natural vs. surrogate</h2>
+    <p>
+      Every table needs a <span class="term">primary key</span> — the column (or columns) that
+      uniquely identifies a row. The choice of <em>which</em> column plays that role is one of the
+      first decisions a schema locks in, and it's more consequential than it looks.
+    </p>
+
+    <dl class="definition">
+      <dt>Candidate key</dt>
+      <dd>Any column (or set of columns) that could uniquely identify a row. A table can have
+        several; you pick one as the primary key.</dd>
+      <dt>Natural key</dt>
+      <dd>A candidate key drawn from real-world data that already means something — an email
+        address, a national ID number, an ISBN.</dd>
+      <dt>Surrogate key</dt>
+      <dd>A key manufactured purely to identify the row, with no business meaning — an
+        auto-incrementing integer or a generated UUID/ULID.</dd>
+      <dt>Composite key</dt>
+      <dd>A primary key made of more than one column together — common on junction tables, e.g.
+        <code>(student_id, course_id)</code>.</dd>
+    </dl>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Choice</th><th>Upside</th><th>Downside</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Natural key</td>
+            <td>No extra column; the key is human-meaningful, useful for debugging</td>
+            <td>Real-world facts change — a person's email or legal name is not a stable identity,
+              and "stable enough until it isn't" is how a natural key ends up needing a migration
+              at the worst time</td>
+          </tr>
+          <tr>
+            <td>Auto-increment integer</td>
+            <td>Small, fast to index, sorts by insertion order (useful for "most recent N")</td>
+            <td>Sequential and guessable (leaks row count and lets an attacker enumerate
+              <code>/orders/1</code>, <code>/orders/2</code>, …); a single point of contention
+              under very high write concurrency; awkward to generate client-side or merge across
+              shards</td>
+          </tr>
+          <tr>
+            <td>UUID (v4, random)</td>
+            <td>Generateable anywhere without coordination (client, multiple services, offline);
+              not guessable; trivially mergeable across shards/replicas</td>
+            <td>16 bytes vs. 4-8 for an integer, and random order means every insert lands in a
+              random spot in a B-tree index — worse cache locality, more index-page splits (see
+              <em>Indexes &amp; Storage Engines</em>)</td>
+          </tr>
+          <tr>
+            <td>ULID / UUIDv7 (time-sortable)</td>
+            <td>Same coordination-free generation as UUIDv4, but the leading bits encode a
+              timestamp, so inserts stay roughly sequential in index order</td>
+            <td>Slightly leaks creation time; still 16 bytes; newer, so tooling support varies</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>Default to a surrogate key for the primary key, and enforce natural keys as a separate
+        <code>UNIQUE</code> constraint (e.g. <code>users.email UNIQUE</code>) instead of using them
+        as the primary key directly. You get the natural key's uniqueness guarantee <em>and</em>
+        the freedom to fix a mistaken or changed value later without a foreign-key migration
+        touching every table that references it — because nothing else in the schema points at
+        the email, only at the surrogate <code>id</code>.</p>
+      </div>
+    </div>
+
+    <h2>Modeling one-to-many</h2>
+    <p>
+      The foreign key always lives on the "many" side, pointing back at the "one." A customer
+      places many orders, so <code>orders</code> gets a <code>customer_id</code> column
+      referencing <code>customers.id</code> — not the other way around, because a customer row
+      can't hold a variable-length list of order IDs in a single column without breaking
+      the atomic-values rule covered under normalization below.
+    </p>
+    <pre><code>customers (id PK, name, email)
+orders    (id PK, customer_id FK -&gt; customers.id, total_amount, created_at)</code></pre>
+
+    <h2>Modeling many-to-many: the junction table</h2>
+    <p>
+      A student can enroll in many courses, and a course has many students — neither side's table
+      can hold a single foreign key to the other, because it would need one value per row and
+      there are many. The fix is a <span class="term">junction table</span> (also called an
+      associative or join table) sitting between them, holding one row per pairing:
+    </p>
+    <pre><code>students    (id PK, name)
+courses     (id PK, title, instructor_id FK)
+enrollments (student_id FK -&gt; students.id,
+             course_id  FK -&gt; courses.id,
+             grade,
+             PRIMARY KEY (student_id, course_id))</code></pre>
+    <p>
+      Notice <code>enrollments</code> has a composite primary key — the pairing itself is the
+      identity, so <code>(student_id, course_id)</code> together must be unique (a student can't
+      enroll in the same course twice). It also carries its own attribute, <code>grade</code>,
+      which belongs to neither the student nor the course alone but to the <em>relationship</em>
+      between them for a specific enrollment. This exact schema — students, courses, and an
+      enrollments junction table — is what the widget below builds up step by step, and it's
+      also the running example for the normalization anomalies that follow.
+    </p>
+
+    <h2>Constraints: the database as the last line of defense</h2>
+    <p>
+      A schema is only as strong as what it refuses to store. Constraints are how you push
+      invariants down to the data layer instead of trusting every code path — every service,
+      script, and future engineer — to remember to check them in application code.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Constraint</th><th>What it prevents</th></tr></thead>
+        <tbody>
+          <tr><td><code>PRIMARY KEY</code></td><td>Duplicate or missing row identity</td></tr>
+          <tr><td><code>FOREIGN KEY</code></td><td>An <code>orders.customer_id</code> pointing at a customer that doesn't exist — an <em>orphaned reference</em></td></tr>
+          <tr><td><code>UNIQUE</code></td><td>Two users registering the same email</td></tr>
+          <tr><td><code>NOT NULL</code></td><td>A required field silently missing — an unset <code>total_amount</code> that later divides-by-null downstream</td></tr>
+          <tr><td><code>CHECK</code></td><td>A structurally valid but semantically nonsense value — a negative <code>price</code> or a <code>quantity</code> of zero</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Foreign keys also govern what happens on delete — a decision that's easy to skip and
+      expensive to get wrong:
+    </p>
+    <dl class="definition">
+      <dt><code>ON DELETE RESTRICT</code></dt>
+      <dd>Refuse to delete the parent row while children reference it (default in most databases).
+        Safe, but surfaces as a confusing error if you didn't expect the dependency.</dd>
+      <dt><code>ON DELETE CASCADE</code></dt>
+      <dd>Deleting the parent deletes all referencing children automatically. Convenient, and
+        dangerous if applied somewhere you didn't mean to cascade — deleting a customer silently
+        deleting their entire order history is rarely what "delete this customer" meant.</dd>
+      <dt><code>ON DELETE SET NULL</code></dt>
+      <dd>Deleting the parent nulls out the child's foreign key instead of deleting the child —
+        appropriate when the child can meaningfully exist without that parent (an order whose
+        <code>referred_by_employee_id</code> employee left the company).</dd>
+    </dl>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>"We validate this in the application layer" is not the same guarantee as a database
+        constraint, and the gap shows up exactly when it's expensive: a batch script that bypasses
+        the ORM, a second service writing to the same table, a manual <code>UPDATE</code> during an
+        incident, a race between two requests that both pass the application check before either
+        commits. Constraints are enforced by the database itself, atomically, no matter what wrote
+        the row — application validation is a good first line for a fast, friendly error message,
+        but the constraint is what actually stops bad data from landing.</p>
+      </div>
+    </div>
+
+    <h2>Normalization: functional dependencies and anomalies</h2>
+    <p>
+      Normalization is the discipline of structuring tables so that each fact is stored exactly
+      once. The formal tool behind it is the <span class="term">functional dependency</span>: column
+      <var>B</var> is functionally dependent on column <var>A</var> if, for any given value of
+      <var>A</var>, there's exactly one possible value of <var>B</var>. <code>instructor_office</code>
+      depends on <code>instructor_name</code> — one instructor, one office. Normal forms are a
+      sequence of rules about which functional dependencies are allowed to exist in a single table.
+    </p>
+
+    <dl class="definition">
+      <dt>1NF — First Normal Form</dt>
+      <dd>Every column holds a single, atomic value — no repeating groups (a comma-separated list
+        of course IDs crammed into one cell), no arrays-as-strings.</dd>
+      <dt>2NF — Second Normal Form</dt>
+      <dd>1NF, plus: every non-key column depends on the <em>entire</em> primary key, not just
+        part of it. Only matters when the key is composite — a column that depends on just one
+        column of a multi-column key is a <span class="term">partial dependency</span>.</dd>
+      <dt>3NF — Third Normal Form</dt>
+      <dd>2NF, plus: no non-key column depends on <em>another non-key column</em> instead of the
+        key directly — a <span class="term">transitive dependency</span>. The classic mnemonic
+        (William Kent): every non-key attribute must depend on <em>the key, the whole key, and
+        nothing but the key</em>.</dd>
+    </dl>
+
+    <p>
+      The payoff for following these rules isn't academic tidiness — it's avoiding three specific,
+      concrete failure modes that show up the moment a table stores the same fact in more than one
+      place:
+    </p>
+
+    <dl class="definition">
+      <dt>Insertion anomaly</dt>
+      <dd>You can't record a fact until an unrelated fact also exists — e.g. you can't add a new
+        course to the catalog until at least one student has enrolled in it, because "course"
+        isn't its own row anywhere.</dd>
+      <dt>Update anomaly</dt>
+      <dd>The same fact is duplicated across rows, so changing it means updating every copy — miss
+        one, and the data now contradicts itself.</dd>
+      <dt>Deletion anomaly</dt>
+      <dd>Deleting one row's data destroys an unrelated fact as a side effect — deleting the only
+        student enrolled in a course deletes all record of the course ever existing.</dd>
+    </dl>
+
+    <p>
+      The widget below walks through exactly this progression — UNF → 1NF → 2NF → 3NF — on a
+      students/courses/instructors schema, and lets you actually trigger each anomaly at each
+      stage to see which ones a given normal form does and doesn't fix.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — normalize a schema, then try to break it</div>
+
+      <div class="stage-tabs" id="stageTabs"></div>
+      <p class="stage-blurb" id="stageBlurb"></p>
+
+      <div id="stageTables"></div>
+
+      <p class="mono muted" style="margin-top:-0.5rem">
+        Dr. Singh's office appears in this view — try updating just one occurrence:
+      </p>
+
+      <div class="rel-actions">
+        <button class="btn secondary" id="actAdd" type="button">
+          + Add course "SRE Fundamentals" (Dr. Lee, Room 501 — no students enrolled yet)
+        </button>
+        <button class="btn secondary" id="actDelete" type="button">
+          Delete Carol's only "Cloud Native Systems" enrollment
+        </button>
+        <button class="btn secondary" id="stageReset" type="button">Reset this stage</button>
+      </div>
+
+      <div class="outcome" id="outcomeAdd" hidden></div>
+      <div class="outcome" id="outcomeDelete" hidden></div>
+      <div class="outcome" id="outcomeOffice" hidden></div>
+    </div>
+
+    <h2>Deliberate denormalization</h2>
+    <p>
+      Normalization optimizes for one thing: storing every fact exactly once, so updates can never
+      go inconsistent. That's the right default. But it's not free — a fully normalized schema
+      often means more joins to answer a read, and at high read volume or reporting scale, join
+      cost becomes the bottleneck. Denormalization is the deliberate, informed decision to
+      duplicate data anyway, in exchange for read speed:
+    </p>
+
+    <ul>
+      <li><b>Cached aggregates</b> — storing <code>orders.total_amount</code> precomputed instead
+        of summing <code>line_items</code> on every read. Fast to read; must be kept in sync on
+        every write to <code>line_items</code> (a trigger, or an application-level transaction
+        that updates both).</li>
+      <li><b>Reporting / analytics tables</b> — a wide, flat, denormalized table built by an
+        offline job specifically for dashboards, so analytics queries don't hit the normalized
+        transactional schema (and its indexes tuned for OLTP access patterns) at all.</li>
+      <li><b>Materialized views</b> — a query's result set stored as if it were a table, refreshed
+        on a schedule or on write. Same trade: fast reads, a staleness window you have to accept
+        and document.</li>
+    </ul>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>The dividing line between "deliberate denormalization" and "an update anomaly you'll be
+        debugging at 3 AM" is whether the duplication is <em>documented, owned, and has a defined
+        sync path</em>. The widget's own lesson applies at any storage layer, not just inside a
+        single table: every place the same fact is copied is one more place it can drift, and drift
+        is silent until a customer notices two screens disagree. Denormalize when you've measured
+        that the read cost justifies it — not by default, and not without deciding up front exactly
+        what keeps the copies in sync.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A feature store lives on both sides of this trade-off at once. The <em>offline</em> store
+        — used for building training sets — is typically modeled close to normalized, warehouse-style:
+        entities, events, and joins across them, so training data reflects ground truth without
+        duplication bugs. The <em>online</em> store — used for real-time inference — is aggressively
+        denormalized on purpose: a single row per entity key (user, item) holding every feature that
+        entity needs, precomputed, so serving is an O(1) key lookup instead of a join under a latency
+        budget. <span class="term">Training-serving skew</span> is, structurally, the exact same
+        anomaly as the widget's update anomaly: the same logical fact (a feature's value) computed
+        or stored two different ways in two different pipelines, and nothing enforcing that they
+        agree. The fix is the same instinct as 3NF, generalized: make each fact's computation live
+        in exactly one place, and have both the training and serving paths read from it.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A table has primary key <code>(student_id, course_id)</code> and a
+          column <code>student_name</code> that depends only on <code>student_id</code>. Which
+          normalization rule does this violate?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">1NF — <code>student_name</code> isn't atomic.</button>
+          <button class="quiz-option" data-choice="b">2NF — <code>student_name</code> is a partial dependency: it depends on only part of the composite key, not the whole key.</button>
+          <button class="quiz-option" data-choice="c">3NF — <code>student_name</code> depends on another non-key column.</button>
+        </div>
+        <p class="quiz-explain" hidden>1NF is about atomic values, which this already satisfies. 3NF is about a non-key column depending on another non-key column (a transitive dependency) — that's not what's happening here. This is exactly 2NF's rule: with a composite key, every non-key column must depend on the entire key, and <code>student_name</code> only depends on <code>student_id</code>.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. In the widget, why does the 2NF stage still let Dr. Singh's office go
+          inconsistent if you only click "update" on one of the two Course rows?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Because instructor_office is stored redundantly once per course a person teaches — a transitive dependency (office depends on the instructor, not directly on the course) that 2NF doesn't address.</button>
+          <button class="quiz-option" data-choice="b">Because 2NF doesn't support foreign keys at all.</button>
+          <button class="quiz-option" data-choice="c">It's a bug in the widget — 2NF should fully fix this.</button>
+        </div>
+        <p class="quiz-explain" hidden>2NF only removes *partial* dependencies (columns depending on part of a composite key). It does nothing about a non-key column depending on another non-key column — here, instructor_office really depends on which instructor, and the instructor happens to teach two courses, so the office is copied once per course row. That's a transitive dependency, and fixing it is exactly what 3NF (splitting out an Instructor table) does.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. A reporting table stores <code>orders.total_amount</code> precomputed
+          instead of summing <code>line_items</code> on every read. Is this a normalization
+          mistake?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Yes — every fact should be derivable from a single source, full stop.</button>
+          <button class="quiz-option" data-choice="b">No, because <code>total_amount</code> isn't really a fact, it's a UI concern.</button>
+          <button class="quiz-option" data-choice="c">Not necessarily — it's deliberate denormalization if the read-speed win is measured and there's a defined, owned mechanism keeping <code>total_amount</code> in sync with <code>line_items</code> on every write.</button>
+        </div>
+        <p class="quiz-explain" hidden>Denormalization isn't automatically wrong — it's a trade-off you make on purpose, in a specific place, for a measured reason (here, avoiding a sum-on-every-read). It becomes a bug when the duplication is accidental, undocumented, or has no defined path keeping the copies in sync — at that point it's indistinguishable from the update anomaly the whole normalization discipline exists to prevent.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page covered the shape of the data — entities, keys, relationships, constraints, and
+      the discipline that keeps facts from duplicating and drifting. The next deep-dive,
+      <em>SQL Deep-Dive &amp; Query Performance</em>, picks up exactly where a good schema stops
+      helping on its own: how the database actually executes a query against these tables, why the
+      same query can run in milliseconds or minutes depending on what the planner chooses, and the
+      anti-patterns that turn a clean schema into a slow one anyway.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var FACTS_SEED = [
+        { student: "S1", name: "Alice", course: "C101", title: "Intro to Databases", instr: "Dr. Kim", instrId: "I1", office: "Room 214", grade: "A" },
+        { student: "S1", name: "Alice", course: "C205", title: "Distributed Systems", instr: "Dr. Patel", instrId: "I2", office: "Room 310", grade: "B+" },
+        { student: "S1", name: "Alice", course: "C301", title: "Backend Engineering", instr: "Dr. Singh", instrId: "I3", office: "Room 118", grade: "A" },
+        { student: "S2", name: "Bob", course: "C101", title: "Intro to Databases", instr: "Dr. Kim", instrId: "I1", office: "Room 214", grade: "A-" },
+        { student: "S2", name: "Bob", course: "C205", title: "Distributed Systems", instr: "Dr. Patel", instrId: "I2", office: "Room 310", grade: "A" },
+        { student: "S3", name: "Carol", course: "C301", title: "Backend Engineering", instr: "Dr. Singh", instrId: "I3", office: "Room 118", grade: "B" },
+        { student: "S3", name: "Carol", course: "C450", title: "Cloud Native Systems", instr: "Dr. Singh", instrId: "I3", office: "Room 118", grade: "A" },
+        { student: "S4", name: "Dan", course: "C301", title: "Backend Engineering", instr: "Dr. Singh", instrId: "I3", office: "Room 118", grade: "B+" }
+      ];
+
+      var STAGE_INFO = {
+        unf: {
+          label: "UNF",
+          full: "Unnormalized",
+          blurb: "One row per student; each student's courses are stored as a repeating group inside a single cell — the kind of shape a first-pass spreadsheet import often has."
+        },
+        "1nf": {
+          label: "1NF",
+          full: "First Normal Form",
+          blurb: "Repeating groups flattened: one row per (student, course), every cell atomic. But course_title/instructor/office depend only on course_id, and student name depends only on student_id — partial dependencies on the composite key (student_id, course_id)."
+        },
+        "2nf": {
+          label: "2NF",
+          full: "Second Normal Form",
+          blurb: "Student and Course split into their own tables, so every non-key column depends on its table's whole key. But instructor_office depends on which instructor, not on course_id directly — a transitive dependency still lives inside Course."
+        },
+        "3nf": {
+          label: "3NF",
+          full: "Third Normal Form",
+          blurb: "Instructor becomes its own table. Every non-key column now depends on the key, the whole key, and nothing but the key."
+        }
+      };
+
+      var STAGE_ORDER = ["unf", "1nf", "2nf", "3nf"];
+
+      var state = { stage: "unf", data: null };
+
+      function cloneFacts() {
+        return FACTS_SEED.map(function (f) { return Object.assign({}, f); });
+      }
+
+      function buildStageData(stage) {
+        var facts = cloneFacts();
+        if (stage === "unf" || stage === "1nf") {
+          return { rows: facts };
+        }
+        if (stage === "2nf") {
+          var studentsMap = {}, courseMap = {}, enrollments = [];
+          facts.forEach(function (f) {
+            studentsMap[f.student] = f.name;
+            if (!courseMap[f.course]) {
+              courseMap[f.course] = { course: f.course, title: f.title, instr: f.instr, office: f.office };
+            }
+            enrollments.push({ student: f.student, course: f.course, grade: f.grade });
+          });
+          var students = Object.keys(studentsMap).map(function (id) { return { student: id, name: studentsMap[id] }; });
+          var courses = Object.keys(courseMap).map(function (k) { return courseMap[k]; });
+          return { students: students, courses: courses, enrollments: enrollments };
+        }
+        if (stage === "3nf") {
+          var studentsMap2 = {}, instructorMap = {}, courseMap2 = {}, enrollments2 = [];
+          facts.forEach(function (f) {
+            studentsMap2[f.student] = f.name;
+            if (!instructorMap[f.instrId]) {
+              instructorMap[f.instrId] = { instrId: f.instrId, instr: f.instr, office: f.office };
+            }
+            if (!courseMap2[f.course]) {
+              courseMap2[f.course] = { course: f.course, title: f.title, instrId: f.instrId };
+            }
+            enrollments2.push({ student: f.student, course: f.course, grade: f.grade });
+          });
+          var students2 = Object.keys(studentsMap2).map(function (id) { return { student: id, name: studentsMap2[id] }; });
+          var instructors = Object.keys(instructorMap).map(function (k) { return instructorMap[k]; });
+          var courses2 = Object.keys(courseMap2).map(function (k) { return courseMap2[k]; });
+          return { students: students2, instructors: instructors, courses: courses2, enrollments: enrollments2 };
+        }
+      }
+
+      var stageTabs = document.getElementById("stageTabs");
+      var stageBlurb = document.getElementById("stageBlurb");
+      var stageTables = document.getElementById("stageTables");
+      var actAdd = document.getElementById("actAdd");
+      var actDelete = document.getElementById("actDelete");
+      var stageResetBtn = document.getElementById("stageReset");
+      var outcomeAdd = document.getElementById("outcomeAdd");
+      var outcomeDelete = document.getElementById("outcomeDelete");
+      var outcomeOffice = document.getElementById("outcomeOffice");
+
+      function setOutcome(el, ok, msg) {
+        el.hidden = false;
+        el.className = "outcome " + (ok ? "ok" : "bad");
+        el.textContent = msg;
+      }
+
+      function officeButton(currentOffice, action, id) {
+        var updated = currentOffice === "Room 125";
+        return '<button class="mini-btn" data-action="' + action + '" data-id="' + id + '"' +
+          (updated ? " disabled" : "") + '>' + (updated ? "Updated" : "Move to Room 125") + "</button>";
+      }
+
+      function renderUNF(rows) {
+        var byStudent = {};
+        var order = [];
+        rows.forEach(function (r) {
+          if (!byStudent[r.student]) { byStudent[r.student] = { name: r.name, entries: [] }; order.push(r.student); }
+          byStudent[r.student].entries.push(r);
+        });
+        var html = '<div class="rel-table-card"><h4>students (unnormalized)</h4>' +
+          '<table><thead><tr><th>student_id</th><th>name</th><th>courses (repeating group)</th></tr></thead><tbody>';
+        order.forEach(function (sid) {
+          var s = byStudent[sid];
+          var lines = s.entries.map(function (e) {
+            var btn = e.instr === "Dr. Singh" ? officeButton(e.office, "upd-office-unf", sid + "|" + e.course) : "";
+            return '<div class="repeat-line">' + e.course + " — " + e.title + " — " + e.instr +
+              " — " + e.office + " (" + e.grade + ")" + btn + "</div>";
+          }).join("");
+          html += "<tr><td>" + sid + "</td><td>" + s.name + '</td><td><div class="repeat-group">' + lines + "</div></td></tr>";
+        });
+        html += "</tbody></table></div>";
+        stageTables.innerHTML = html;
+      }
+
+      function renderFlat(rows) {
+        var html = '<div class="rel-table-card"><h4>enrollments_flat (1NF)</h4>' +
+          '<table><thead><tr><th>student_id</th><th>name</th><th>course_id</th><th>title</th><th>instructor</th><th>office</th><th>grade</th></tr></thead><tbody>';
+        rows.forEach(function (r, i) {
+          var btn = r.instr === "Dr. Singh" ? officeButton(r.office, "upd-office-flat", String(i)) : "";
+          html += "<tr><td>" + r.student + "</td><td>" + r.name + "</td><td>" + r.course + "</td><td>" + r.title +
+            "</td><td>" + r.instr + "</td><td>" + r.office + " " + btn + "</td><td>" + r.grade + "</td></tr>";
+        });
+        html += "</tbody></table></div>";
+        stageTables.innerHTML = html;
+      }
+
+      function render2NF(data) {
+        var html = '<div class="rel-tables">';
+        html += '<div class="rel-table-card"><h4>students</h4><table><thead><tr><th>student_id</th><th>name</th></tr></thead><tbody>';
+        data.students.forEach(function (s) { html += "<tr><td>" + s.student + "</td><td>" + s.name + "</td></tr>"; });
+        html += "</tbody></table></div>";
+
+        html += '<div class="rel-table-card"><h4>courses</h4><table><thead><tr><th>course_id</th><th>title</th><th>instructor</th><th>office</th></tr></thead><tbody>';
+        data.courses.forEach(function (c) {
+          var btn = c.instr === "Dr. Singh" ? officeButton(c.office, "upd-office-2nf", c.course) : "";
+          html += "<tr><td>" + c.course + "</td><td>" + c.title + "</td><td>" + c.instr + "</td><td>" + c.office + " " + btn + "</td></tr>";
+        });
+        html += "</tbody></table></div>";
+
+        html += '<div class="rel-table-card"><h4>enrollments</h4><table><thead><tr><th>student_id</th><th>course_id</th><th>grade</th></tr></thead><tbody>';
+        data.enrollments.forEach(function (e) { html += "<tr><td>" + e.student + "</td><td>" + e.course + "</td><td>" + e.grade + "</td></tr>"; });
+        html += "</tbody></table></div>";
+        html += "</div>";
+        stageTables.innerHTML = html;
+      }
+
+      function render3NF(data) {
+        var html = '<div class="rel-tables">';
+        html += '<div class="rel-table-card"><h4>students</h4><table><thead><tr><th>student_id</th><th>name</th></tr></thead><tbody>';
+        data.students.forEach(function (s) { html += "<tr><td>" + s.student + "</td><td>" + s.name + "</td></tr>"; });
+        html += "</tbody></table></div>";
+
+        html += '<div class="rel-table-card"><h4>instructors</h4><table><thead><tr><th>instructor_id</th><th>name</th><th>office</th></tr></thead><tbody>';
+        data.instructors.forEach(function (ins) {
+          var btn = ins.instr === "Dr. Singh" ? officeButton(ins.office, "upd-office-3nf", ins.instrId) : "";
+          html += "<tr><td>" + ins.instrId + "</td><td>" + ins.instr + "</td><td>" + ins.office + " " + btn + "</td></tr>";
+        });
+        html += "</tbody></table></div>";
+
+        html += '<div class="rel-table-card"><h4>courses</h4><table><thead><tr><th>course_id</th><th>title</th><th>instructor_id</th></tr></thead><tbody>';
+        data.courses.forEach(function (c) { html += "<tr><td>" + c.course + "</td><td>" + c.title + "</td><td>" + c.instrId + "</td></tr>"; });
+        html += "</tbody></table></div>";
+
+        html += '<div class="rel-table-card"><h4>enrollments</h4><table><thead><tr><th>student_id</th><th>course_id</th><th>grade</th></tr></thead><tbody>';
+        data.enrollments.forEach(function (e) { html += "<tr><td>" + e.student + "</td><td>" + e.course + "</td><td>" + e.grade + "</td></tr>"; });
+        html += "</tbody></table></div>";
+        html += "</div>";
+        stageTables.innerHTML = html;
+      }
+
+      function render() {
+        stageTabs.innerHTML = "";
+        STAGE_ORDER.forEach(function (key) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "stage-tab" + (state.stage === key ? " active" : "");
+          b.textContent = STAGE_INFO[key].label;
+          b.addEventListener("click", function () { switchStage(key); });
+          stageTabs.appendChild(b);
+        });
+        stageBlurb.textContent = STAGE_INFO[state.stage].full + " — " + STAGE_INFO[state.stage].blurb;
+
+        if (state.stage === "unf") renderUNF(state.data.rows);
+        else if (state.stage === "1nf") renderFlat(state.data.rows);
+        else if (state.stage === "2nf") render2NF(state.data);
+        else render3NF(state.data);
+
+        actAdd.disabled = false;
+        actDelete.disabled = false;
+      }
+
+      function switchStage(key) {
+        state.stage = key;
+        state.data = buildStageData(key);
+        outcomeAdd.hidden = true;
+        outcomeDelete.hidden = true;
+        outcomeOffice.hidden = true;
+        render();
+      }
+
+      function doAdd() {
+        if (state.stage === "unf" || state.stage === "1nf") {
+          setOutcome(outcomeAdd, false,
+            "Blocked: there's no student enrolled in SRE Fundamentals yet, so there's no row to put it in. " +
+            "The only way to force it into this schema is a fake row with student_id = NULL — which breaks " +
+            "the (student_id, course_id) primary key. The course can't be recorded until someone signs up for it.");
+          return;
+        }
+        if (state.stage === "2nf") {
+          if (state.data.courses.some(function (c) { return c.course === "C500"; })) return;
+          state.data.courses.push({ course: "C500", title: "SRE Fundamentals", instr: "Dr. Lee", office: "Room 501" });
+          setOutcome(outcomeAdd, true, "Added straight to the courses table. Zero enrollments or students touched.");
+        } else {
+          if (state.data.courses.some(function (c) { return c.course === "C500"; })) return;
+          if (!state.data.instructors.some(function (i) { return i.instrId === "I4"; })) {
+            state.data.instructors.push({ instrId: "I4", instr: "Dr. Lee", office: "Room 501" });
+          }
+          state.data.courses.push({ course: "C500", title: "SRE Fundamentals", instrId: "I4" });
+          setOutcome(outcomeAdd, true,
+            "Added a new instructors row for Dr. Lee once, then a courses row pointing at it. The next new " +
+            "course Dr. Lee teaches reuses that same instructor row — no re-entry, no risk of a typo'd office number.");
+        }
+        render();
+      }
+
+      function doDelete() {
+        if (state.stage === "unf" || state.stage === "1nf") {
+          var before = state.data.rows.length;
+          state.data.rows = state.data.rows.filter(function (r) { return !(r.student === "S3" && r.course === "C450"); });
+          if (state.data.rows.length === before) return;
+          var stillThere = state.data.rows.some(function (r) { return r.course === "C450"; });
+          setOutcome(outcomeDelete, stillThere, stillThere ?
+            "Cloud Native Systems is still recorded elsewhere." :
+            "Gone: Cloud Native Systems' title, instructor, and room just vanished. Nothing else in this table ever mentioned C450 — Carol's row was the only record of the course existing at all.");
+        } else {
+          var beforeLen = state.data.enrollments.length;
+          state.data.enrollments = state.data.enrollments.filter(function (e) { return !(e.student === "S3" && e.course === "C450"); });
+          if (state.data.enrollments.length === beforeLen) return;
+          setOutcome(outcomeDelete, true,
+            "Only the enrollment link disappeared. The courses row for C450 — title, instructor, room — is still there, completely untouched by deleting Carol's enrollment.");
+        }
+        render();
+      }
+
+      function officeStatusMessage(occurrences) {
+        var total = occurrences.length;
+        var updated = occurrences.filter(function (o) { return o === "Room 125"; }).length;
+        if (updated === 0) return null;
+        if (updated < total) {
+          return { ok: false, msg: "Inconsistent: " + updated + " of " + total + " occurrence(s) updated. Right now the data disagrees with itself about Dr. Singh's office." };
+        }
+        if (total === 1) {
+          return { ok: true, msg: "Updated once. There was only one row that could ever have gotten out of sync, so it's automatically consistent." };
+        }
+        return { ok: true, msg: "All " + total + " occurrences updated and consistent — but it took " + total + " separate edits to get there." };
+      }
+
+      stageTables.addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-action]");
+        if (!btn) return;
+        var action = btn.dataset.action;
+        var id = btn.dataset.id;
+
+        if (action === "upd-office-unf") {
+          var parts = id.split("|");
+          state.data.rows.forEach(function (r) {
+            if (r.student === parts[0] && r.course === parts[1]) r.office = "Room 125";
+          });
+        } else if (action === "upd-office-flat") {
+          state.data.rows[parseInt(id, 10)].office = "Room 125";
+        } else if (action === "upd-office-2nf") {
+          state.data.courses.forEach(function (c) { if (c.course === id) c.office = "Room 125"; });
+        } else if (action === "upd-office-3nf") {
+          state.data.instructors.forEach(function (ins) { if (ins.instrId === id) ins.office = "Room 125"; });
+        } else {
+          return;
+        }
+
+        var occurrences;
+        if (state.stage === "unf" || state.stage === "1nf") {
+          occurrences = state.data.rows.filter(function (r) { return r.instr === "Dr. Singh"; }).map(function (r) { return r.office; });
+        } else if (state.stage === "2nf") {
+          occurrences = state.data.courses.filter(function (c) { return c.instr === "Dr. Singh"; }).map(function (c) { return c.office; });
+        } else {
+          occurrences = state.data.instructors.filter(function (i) { return i.instrId === "I3"; }).map(function (i) { return i.office; });
+        }
+        var status = officeStatusMessage(occurrences);
+        if (status) setOutcome(outcomeOffice, status.ok, status.msg);
+        render();
+      });
+
+      actAdd.addEventListener("click", doAdd);
+      actDelete.addEventListener("click", doDelete);
+      stageResetBtn.addEventListener("click", function () { switchStage(state.stage); });
+
+      switchStage("unf");
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
