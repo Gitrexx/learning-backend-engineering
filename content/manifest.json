@@ -80,7 +80,7 @@
       "summary": "How joins execute, the query planner, reading EXPLAIN, and the anti-patterns that kill latency.",
       "prerequisites": ["relational-data-modeling"],
       "file": "sql-and-query-performance.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "indexing-and-storage-engines",
