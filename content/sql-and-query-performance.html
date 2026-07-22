@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQL Deep-Dive &amp; Query Performance — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the mini query-planner widget only. */
+    .stage-tabs { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+    .stage-tab {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.5em 1.1em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .stage-tab:hover { border-color: var(--accent); }
+    .stage-tab.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+
+    .control-row {
+      display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3);
+      margin: var(--sp-3) 0; padding: var(--sp-2) 0;
+    }
+    .control-row label { font-size: var(--fs-sm); font-weight: 600; width: 260px; flex-shrink: 0; }
+    .control-row input[type="range"] { flex: 1; min-width: 140px; }
+    .control-row .control-value {
+      font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--accent-strong);
+      width: 110px; text-align: right; flex-shrink: 0;
+    }
+    .control-row.checkish label { width: auto; }
+    .control-check { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); }
+    .control-check input { width: 1.1em; height: 1.1em; accent-color: var(--accent); }
+
+    .cost-panel { margin-top: var(--sp-4); }
+    .cost-row {
+      display: flex; align-items: center; gap: var(--sp-3);
+      margin: var(--sp-2) 0; font-family: var(--font-mono); font-size: var(--fs-sm);
+    }
+    .cost-row .cost-label { width: 190px; flex-shrink: 0; color: var(--text-muted); }
+    .cost-bar-track {
+      flex: 1; background: var(--surface-2); border-radius: 999px; height: 12px;
+      overflow: hidden; border: 1px solid var(--border);
+    }
+    .cost-bar-fill { height: 100%; background: var(--blueprint); transition: width .2s; }
+    .cost-bar-fill.winner { background: var(--accent); }
+    .cost-row .cost-value { width: 110px; text-align: right; flex-shrink: 0; }
+    .cost-row.disabled { opacity: 0.4; }
+
+    .plan-verdict {
+      margin-top: var(--sp-4); padding: var(--sp-3) var(--sp-4);
+      border-radius: var(--radius); font-size: var(--fs-sm); font-weight: 600;
+      background: var(--ok-soft); color: var(--ok);
+      display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+    }
+    .plan-verdict .mono { font-weight: 700; }
+
+    .panel-block[hidden] { display: none; }
+    @media (max-width: 640px) {
+      .control-row label { width: 100%; }
+      .cost-row .cost-label { width: 130px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 02</p>
+    <h1>SQL Deep-Dive &amp; Query Performance</h1>
+
+    <p>
+      <em>Relational Data Modeling</em> covered the shape of the data — the schema that determines
+      which bugs are possible before any code runs. This page covers the other half: what actually
+      happens when that schema meets a query. The same <code>SELECT</code>, against the same
+      schema, can return in 2 milliseconds or 2 minutes depending entirely on how the database
+      chooses to execute it — and that choice is invisible unless you know how to ask for it. Of
+      every skill in this course, reading a query plan and knowing why it's slow is the one you'll
+      use the most: most production "the database is slow" incidents are not exotic distributed-
+      systems problems, they're one query doing something needlessly expensive, and the fix is
+      usually a single index or a rewritten predicate.
+    </p>
+
+    <h2>How a query actually executes</h2>
+    <p>
+      SQL is <span class="term">declarative</span> — you state <em>what</em> you want, not
+      <em>how</em> to get it. Turning that statement into an actual sequence of steps is the job of
+      four stages every query passes through:
+    </p>
+    <dl class="definition">
+      <dt>Parse</dt>
+      <dd>Check the SQL is syntactically valid and refers to real tables/columns; build a parse tree.</dd>
+      <dt>Plan / optimize</dt>
+      <dd>The <span class="term">query planner</span> (optimizer) considers multiple physical ways
+        to execute the same logical query — different access paths, join orders, join algorithms —
+        estimates the cost of each using table statistics, and picks the cheapest one it can find.
+        This is the stage that decides whether your query is fast or slow.</dd>
+      <dt>Execute</dt>
+      <dd>The chosen plan runs: a tree of physical operators (scan nodes, join nodes, sort nodes)
+        that pull rows from each other, bottom-up.</dd>
+      <dt>Return</dt>
+      <dd>Rows stream back to the client, often before the whole result set is even materialized.</dd>
+    </dl>
+    <p>
+      The planner is doing a genuinely hard combinatorial search — for a query joining five tables,
+      there are thousands of possible join orders and algorithm combinations — so it isn't
+      guaranteed to find the true optimum, only a good-enough one under a cost model. That cost
+      model is only as good as the statistics feeding it, which is why "the planner picked a bad
+      plan" is almost always really "the planner picked the cheapest plan <em>according to stale or
+      misleading statistics</em>" — a distinction that matters when you go looking for the fix.
+    </p>
+
+    <h2>Access paths: how a single table gets read</h2>
+    <p>
+      Before any join happens, each table in the query has to be read somehow. The planner chooses
+      between a small set of <span class="term">access paths</span>:
+    </p>
+    <dl class="definition">
+      <dt>Sequential scan (seq scan / table scan)</dt>
+      <dd>Read every page of the table, in physical order, and test each row against the filter.
+        Cost is proportional to table size, <em>regardless of how selective the filter is</em>. No
+        setup cost, no index needed — the reliable fallback.</dd>
+      <dt>Index scan</dt>
+      <dd>Walk a B-tree index to find the matching key(s), then fetch each matching row from the
+        table's heap by its physical location — one extra, potentially random, page read per
+        matching row (unless that row is already cached). Cost is roughly proportional to how many
+        rows match, not to table size.</dd>
+      <dt>Index-only scan</dt>
+      <dd>Same as an index scan, but every column the query needs is already present in the index
+        itself, so the heap fetch is skipped entirely (subject to a visibility check against
+        recently-modified rows). Dramatically cheaper than a regular index scan — this is what a
+        <span class="term">covering index</span> buys you.</dd>
+      <dt>Bitmap heap scan</dt>
+      <dd>A hybrid: use the index to build an in-memory bitmap of matching page locations, sort
+        those locations, then fetch the pages in physical order instead of one random read per row.
+        This is why, in practice, indexes stay competitive at higher selectivity than a naive
+        "one random read per matching row" model predicts — it converts many random reads into
+        fewer, sequential-ish ones.</dd>
+    </dl>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>The universal rule of thumb: <strong>indexes win when few rows match; sequential scans
+        win when many do.</strong> If a query matches 40% of a table, reading the whole table once
+        sequentially is cheaper than following an index pointer for every one of those rows — this
+        is exactly why the planner will sometimes, correctly, <em>ignore an index you built</em>.
+        That's not a bug to work around; the widget below lets you find the crossover yourself.</p>
+      </div>
+    </div>
+
+    <h2>Join algorithms: how two tables get combined</h2>
+    <p>
+      Once each table's rows can be produced, a join has to combine them. There are three physical
+      strategies, and the right one depends on table sizes, whether an index exists on the join
+      key, and whether the inputs are already sorted:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Algorithm</th><th>How it works</th><th>Favored when</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Nested loop</td>
+            <td>For each row in the outer table, probe the inner table for matches.</td>
+            <td>Outer side is small — cost scales with outer rows × per-probe cost, so it's cheap
+              even against a huge inner table <em>if</em> the inner table has an index on the join
+              key. Without that index, it degrades to comparing every outer row against every inner
+              row — O(N·M), catastrophic past small tables.</td>
+          </tr>
+          <tr>
+            <td>Hash join</td>
+            <td>Build an in-memory hash table from the smaller ("build") side, keyed on the join
+              column; scan the larger ("probe") side once, looking up each row in the hash table.</td>
+            <td>Both tables are large, no useful index exists, and there's no ordering to exploit.
+              Cost scales with the <em>sum</em> of both table sizes, not their product — the
+              default workhorse for big, unindexed joins.</td>
+          </tr>
+          <tr>
+            <td>Merge join</td>
+            <td>Walk both inputs in join-key order simultaneously, like merging two sorted lists.</td>
+            <td>Both inputs are already sorted on the join key (e.g. from an index scan, or a
+              preceding sort) — then it's the cheapest option, since no hashing or per-row probing
+              is needed. If either input isn't sorted, the planner has to pay for an explicit sort
+              first, which usually makes hash join win instead.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>The cost-based optimizer, in one paragraph</h2>
+    <p>
+      For each candidate plan, the planner estimates a cost in abstract units built from a handful
+      of constants — a sequential page read, a random page read (typically modeled as several times
+      more expensive than sequential, since random I/O defeats read-ahead and, on spinning disks,
+      costs a seek), and a small per-row CPU cost. It multiplies those by <em>row-count estimates</em>
+      pulled from statistics the database maintains about each table (row counts, most-common
+      values, histograms of value distribution) — kept fresh by an <code>ANALYZE</code> pass, run
+      automatically after enough rows change. <strong>Every part of this depends on those estimates
+      being roughly right.</strong> Bulk-load a table and forget to run <code>ANALYZE</code>, and the
+      planner is costing plans using row counts from before the load — often picking a nested loop
+      because it still thinks a table has 100 rows when it now has 100 million.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — mini query planner</div>
+      <div class="stage-tabs" id="planTabs"></div>
+
+      <div class="panel-block" id="accessPanel">
+        <p class="stage-blurb">
+          Query: <code>SELECT&nbsp;...&nbsp;FROM orders WHERE customer_id = ?</code> — pick a table
+          size and how selective the filter is, and watch which access path is actually cheaper.
+        </p>
+
+        <div class="control-row">
+          <label for="accRows">Table size (rows)</label>
+          <input type="range" id="accRows" min="0" max="4" step="1" value="2" />
+          <span class="control-value" id="accRowsVal"></span>
+        </div>
+        <div class="control-row">
+          <label for="accSel">Filter selectivity (% of rows matching)</label>
+          <input type="range" id="accSel" min="0" max="9" step="1" value="2" />
+          <span class="control-value" id="accSelVal"></span>
+        </div>
+        <div class="control-row checkish">
+          <label class="control-check"><input type="checkbox" id="accIndex" checked /> Index exists on <code>customer_id</code></label>
+        </div>
+        <div class="control-row checkish">
+          <label class="control-check"><input type="checkbox" id="accCovering" /> Index is covering (index-only scan possible)</label>
+        </div>
+
+        <div class="cost-panel" id="accCosts"></div>
+        <div class="plan-verdict" id="accVerdict"></div>
+      </div>
+
+      <div class="panel-block" id="joinPanel" hidden>
+        <p class="stage-blurb">
+          Query: <code>SELECT&nbsp;...&nbsp;FROM orders JOIN customers ON orders.customer_id = customers.id</code>
+          — pick both table sizes and whether an index or sort order is available on the join key.
+        </p>
+
+        <div class="control-row">
+          <label for="joinOuter">Outer table rows (orders, filtered)</label>
+          <input type="range" id="joinOuter" min="0" max="4" step="1" value="1" />
+          <span class="control-value" id="joinOuterVal"></span>
+        </div>
+        <div class="control-row">
+          <label for="joinInner">Inner table rows (customers)</label>
+          <input type="range" id="joinInner" min="0" max="4" step="1" value="3" />
+          <span class="control-value" id="joinInnerVal"></span>
+        </div>
+        <div class="control-row checkish">
+          <label class="control-check"><input type="checkbox" id="joinIndex" checked /> Index exists on <code>customers.id</code> (the join key)</label>
+        </div>
+        <div class="control-row checkish">
+          <label class="control-check"><input type="checkbox" id="joinSorted" /> Both inputs already sorted by join key</label>
+        </div>
+
+        <div class="cost-panel" id="joinCosts"></div>
+        <div class="plan-verdict" id="joinVerdict"></div>
+      </div>
+    </div>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>This widget's cost formulas are simplified for teaching, not a reimplementation of any
+        real optimizer — real planners also weigh physical row clustering (a <code>correlation</code>
+        statistic — how close an index's order is to the table's physical order), page-cache
+        residency, parallel workers, and bitmap heap scans that blunt the "random read per row"
+        penalty modeled here. Treat the crossover points as illustrative of the <em>shape</em> of
+        the trade-off, not literal thresholds — then go find the real one with <code>EXPLAIN
+        ANALYZE</code> on your own data, covered next.</p>
+      </div>
+    </div>
+
+    <h2>Reading <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code></h2>
+    <p>
+      <code>EXPLAIN</code> shows the plan the optimizer <em>would</em> choose, with its cost
+      estimates, without running the query. <code>EXPLAIN ANALYZE</code> actually runs it and adds
+      real numbers alongside the estimate — which is where the interesting bugs live, in the gap
+      between the two:
+    </p>
+    <pre><code>EXPLAIN ANALYZE
+SELECT * FROM orders WHERE customer_id = 4821 AND status = 'shipped';
+
+Index Scan using orders_customer_id_idx on orders
+  (cost=0.43..612.10 rows=850 width=96)
+  (actual time=0.08..41.32 rows=48000 loops=1)
+  Index Cond: (customer_id = 4821)
+  Filter: (status = 'shipped')
+  Rows Removed by Filter: 39
+  Buffers: shared hit=210 read=1840
+Planning Time: 0.21 ms
+Execution Time: 41.58 ms</code></pre>
+    <dl class="definition">
+      <dt><code>cost=0.43..612.10</code></dt>
+      <dd>Estimated cost to return the <em>first</em> row and <em>all</em> rows, in the planner's
+        abstract units — useful only for comparing plans against each other, not as wall-clock time.</dd>
+      <dt><code>rows=850</code> (estimated) vs. <code>actual ... rows=48000</code></dt>
+      <dd>The single most useful number on the page. The planner expected 850 matching rows and got
+        48,000 — a <strong>~56× misestimate</strong>. That gap is exactly the kind of thing that
+        makes a planner pick an index scan (cheap for 850 rows) when a sequential scan would have
+        actually been cheaper for 48,000. Stale statistics after a bulk load, or a correlated filter
+        the planner can't model (rows matching <code>customer_id</code> happen to cluster with
+        <code>status</code>), are the usual causes.</dd>
+      <dt><code>Rows Removed by Filter</code></dt>
+      <dd>Rows the index condition matched that then failed the <em>non-indexed</em> part of the
+        <code>WHERE</code> clause (here, <code>status</code>) — read from the heap for nothing.
+        A composite index on <code>(customer_id, status)</code> would let the index itself filter
+        both columns.</dd>
+      <dt><code>Buffers: shared hit=210 read=1840</code></dt>
+      <dd><code>hit</code> = pages found already in the database's cache; <code>read</code> = pages
+        pulled from disk. A high <code>read</code> count relative to <code>hit</code> on a query
+        that runs often is a sign of either a cold cache or a working set bigger than available
+        cache — often the real story behind "it's fast the second time I run it."</dd>
+      <dt>Planning Time vs. Execution Time</dt>
+      <dd>Planning time exploding on a simple query usually means an extremely complex query (many
+        joins, many possible plans to weigh) rather than a data problem.</dd>
+    </dl>
+
+    <h2>Anti-patterns that turn a clean schema into a slow query</h2>
+    <p>
+      A well-modeled schema (the previous page) doesn't protect you from a query that defeats its
+      own indexes. These five show up constantly in production code review:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Anti-pattern</th><th>Why it hurts</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>N+1 queries</td>
+            <td>Fetch a list of N rows, then loop over them issuing one more query per row (a
+              common ORM default: load orders, then <code>order.customer</code> lazily triggers a
+              separate query per order). N+1 round trips at network latency each dwarfs one query's
+              execution time — 200 orders at 2ms round-trip is 400ms of pure waiting, invisible in
+              any single query's <code>EXPLAIN</code>.</td>
+            <td>A single query with a <code>JOIN</code>, or a batched second query
+              (<code>WHERE customer_id IN (...)</code>) — one round trip either way.</td>
+          </tr>
+          <tr>
+            <td><code>SELECT *</code></td>
+            <td>Pulls columns you don't need — wasted I/O and network — and silently defeats
+              index-only scans, since the planner needs every selected column present in the index
+              to skip the heap fetch. It's also a schema-change landmine: a column added later
+              changes your result shape without any code change flagging it.</td>
+            <td>Name the columns you actually use. It's more typing and it's worth it.</td>
+          </tr>
+          <tr>
+            <td>Functions or casts on an indexed column</td>
+            <td><code>WHERE LOWER(email) = 'a@b.com'</code> or
+              <code>WHERE created_at::date = '2026-01-01'</code> can't use a plain B-tree index on
+              <code>email</code>/<code>created_at</code>, because the index stores the <em>raw</em>
+              column value, not the transformed one — the predicate is no longer
+              <span class="term">sargable</span> (Search ARGument-ABLE).</td>
+            <td>Rewrite to keep the column bare (<code>created_at &gt;= '2026-01-01' AND
+              created_at &lt; '2026-01-02'</code> instead of casting), or build a functional/expression
+              index that indexes the transformed value directly.</td>
+          </tr>
+          <tr>
+            <td>Leading wildcard <code>LIKE</code></td>
+            <td><code>WHERE name LIKE '%smith'</code> can't use a standard B-tree index — the tree
+              is ordered by the string's <em>prefix</em>, and a leading wildcard means there's no
+              prefix to seek on, forcing a full scan. <code>LIKE 'smith%'</code> (trailing wildcard
+              only) can use the index fine.</td>
+            <td>If leading-wildcard/substring search is a real requirement, reach for a trigram or
+              full-text index built for that access pattern, not a plain B-tree.</td>
+          </tr>
+          <tr>
+            <td>Wrong composite index column order</td>
+            <td>A composite index on <code>(a, b, c)</code> can only be used efficiently for
+              predicates on <code>a</code> alone, <code>(a, b)</code>, or <code>(a, b, c)</code> —
+              the <span class="term">leftmost prefix rule</span>. A query filtering on <code>b</code>
+              alone gets no help from that index at all.</td>
+            <td>Order composite index columns by how queries actually filter: equality columns
+              first, then the column used for range filtering or sorting last.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Batch scoring jobs get N+1'd constantly: "for each of 10,000 users, fetch their features"
+        as 10,000 separate lookups is the exact same anti-pattern as an ORM lazily loading a
+        customer per order, just wearing a feature-store costume — the fix is the same batched
+        <code>IN (...)</code>/join query instead of a loop. Online, low-latency inference paths take
+        the opposite lesson from the composite-index row above: production feature stores are
+        deliberately designed so the hot lookup is a single-key, index-only fetch — no join, no
+        multi-column predicate to get the order wrong on — because a p99 latency budget of a few
+        milliseconds has no room for a query the planner has to think hard about. When a serving
+        path <em>does</em> need a join (enriching a request with account-tier data, say), the same
+        "small outer side, indexed inner side ⇒ nested loop" reasoning from the widget above is
+        what tells you whether that join is safe at your latency budget or needs to be precomputed
+        and denormalized ahead of time instead.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A query's <code>EXPLAIN ANALYZE</code> shows
+          <code>rows=120</code> estimated but <code>actual ... rows=61000</code>. What does this
+          most directly explain?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The query is definitely using the wrong index entirely — the estimate is irrelevant to plan choice.</button>
+          <button class="quiz-option" data-choice="b">The planner chose its plan (e.g. an index scan) based on the 120-row estimate; with the real 61,000-row match count, a sequential scan may well have been cheaper — the misestimate, likely from stale statistics, is the actual root cause to fix.</button>
+          <button class="quiz-option" data-choice="c">Nothing — planner estimates are only cosmetic and don't affect which plan gets chosen.</button>
+        </div>
+        <p class="quiz-explain" hidden>The planner picks a plan using its cost estimate, which is built from the row-count estimate. A 500x underestimate means whatever plan looked cheap for 120 rows may be badly wrong for 61,000 — the fix is usually running <code>ANALYZE</code> to refresh statistics, not manually forcing a different plan.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. A composite index exists on <code>(status, created_at)</code>. A
+          query filters only on <code>created_at &gt; '2026-01-01'</code>, with no filter on
+          <code>status</code>. What happens?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The index can't be used efficiently for this query — the leftmost prefix rule means an index on (status, created_at) only helps queries that filter on status (alone, or status + created_at), not created_at alone.</button>
+          <button class="quiz-option" data-choice="b">The index is used automatically, just in reverse column order.</button>
+          <button class="quiz-option" data-choice="c">The database throws an error, since the index doesn't match the query.</button>
+        </div>
+        <p class="quiz-explain" hidden>Composite indexes are only efficiently searchable via their leftmost columns. Skipping straight to the second column without constraining the first means the tree can't be usefully seeked into — the planner falls back to a sequential scan (or a much less efficient full index scan). If created_at-only lookups are common, that needs its own index.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. Joining a 50-row "outer" table against a 20-million-row "inner"
+          table, with a B-tree index on the inner table's join column. Which join algorithm is
+          almost certainly cheapest, and why?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Hash join — it's the general-purpose default for any join.</button>
+          <button class="quiz-option" data-choice="b">Merge join — merging is always the cheapest algorithm when an index is present.</button>
+          <button class="quiz-option" data-choice="c">Nested loop — cost scales with the small outer table's 50 rows times one indexed probe each, never with the inner table's 20 million rows.</button>
+        </div>
+        <p class="quiz-explain" hidden>Nested loop with an index on the inner side is exactly the case it's built for: the outer side is tiny, so 50 cheap indexed probes beats building a 20-million-row hash table or sorting either side. Hash join would still work but pays to scan/hash the full 20 million rows up front — wasted work when only 50 probes are needed.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page was about how a query is <em>executed</em> against whatever indexes already exist.
+      The next deep-dive, <em>Indexes &amp; Storage Engines</em>, goes one level deeper: how a
+      B-tree index is actually built and maintained page by page, why LSM-trees (the structure
+      behind Cassandra, RocksDB, and friends) trade read latency for write throughput instead, and
+      why that single trade-off explains why Postgres and Cassandra feel like fundamentally
+      different tools even though both call the thing you query an "index."
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var ROW_OPTIONS = [1000, 10000, 100000, 1000000, 10000000];
+      var SEL_OPTIONS = [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50];
+
+      var SEQ_PAGE_COST = 1;
+      var CPU_TUPLE_COST = 0.01;
+      var TUPLES_PER_PAGE = 100;
+      var RANDOM_PAGE_COST = 4;
+      var CPU_INDEX_TUPLE_COST = 0.015;
+      var COVERING_TUPLE_COST = 0.01;
+
+      function fmtRows(n) {
+        if (n >= 1000000) return (n / 1000000) + "M rows";
+        if (n >= 1000) return (n / 1000) + "k rows";
+        return n + " rows";
+      }
+      function fmtCost(c) {
+        if (c >= 1000) return (c / 1000).toFixed(1) + "k units";
+        return c.toFixed(1) + " units";
+      }
+      function log2(x) { return Math.log(x) / Math.LN2; }
+
+      /* ---------------- Tabs ---------------- */
+      var TABS = [
+        { key: "access", label: "Access path: seq scan vs. index scan", panel: "accessPanel" },
+        { key: "join", label: "Join strategy: nested loop vs. hash vs. merge", panel: "joinPanel" }
+      ];
+      var activeTab = "access";
+      var planTabs = document.getElementById("planTabs");
+
+      function renderTabs() {
+        planTabs.innerHTML = "";
+        TABS.forEach(function (t) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "stage-tab" + (activeTab === t.key ? " active" : "");
+          b.textContent = t.label;
+          b.addEventListener("click", function () {
+            activeTab = t.key;
+            TABS.forEach(function (o) { document.getElementById(o.panel).hidden = o.key !== activeTab; });
+            renderTabs();
+          });
+          planTabs.appendChild(b);
+        });
+      }
+      renderTabs();
+
+      /* ---------------- Access-path panel ---------------- */
+      var accRows = document.getElementById("accRows");
+      var accSel = document.getElementById("accSel");
+      var accIndex = document.getElementById("accIndex");
+      var accCovering = document.getElementById("accCovering");
+      var accRowsVal = document.getElementById("accRowsVal");
+      var accSelVal = document.getElementById("accSelVal");
+      var accCosts = document.getElementById("accCosts");
+      var accVerdict = document.getElementById("accVerdict");
+
+      function costBar(label, cost, maxCost, isWinner, disabled) {
+        var pct = maxCost > 0 ? Math.max(2, Math.round((cost / maxCost) * 100)) : 0;
+        return '<div class="cost-row' + (disabled ? " disabled" : "") + '">' +
+          '<div class="cost-label">' + label + "</div>" +
+          '<div class="cost-bar-track"><div class="cost-bar-fill' + (isWinner ? " winner" : "") +
+          '" style="width:' + pct + '%"></div></div>' +
+          '<div class="cost-value">' + (disabled ? "n/a" : fmtCost(cost)) + "</div></div>";
+      }
+
+      function renderAccess() {
+        var N = ROW_OPTIONS[+accRows.value];
+        var selPct = SEL_OPTIONS[+accSel.value];
+        accRowsVal.textContent = fmtRows(N);
+        accSelVal.textContent = selPct + "%";
+        var hasIndex = accIndex.checked;
+        var covering = accCovering.checked;
+        accCovering.disabled = !hasIndex;
+
+        var matching = Math.max(1, Math.round(N * (selPct / 100)));
+
+        var seqCost = (N / TUPLES_PER_PAGE) * SEQ_PAGE_COST + N * CPU_TUPLE_COST;
+        var indexCost = matching * (RANDOM_PAGE_COST + CPU_TUPLE_COST) + log2(N) * CPU_INDEX_TUPLE_COST;
+        var indexOnlyCost = matching * COVERING_TUPLE_COST + log2(N) * CPU_INDEX_TUPLE_COST;
+
+        var effectiveIndexCost = covering ? indexOnlyCost : indexCost;
+        var indexLabel = covering ? "Index-only scan" : "Index scan";
+
+        var chosen = "Sequential Scan";
+        var chosenCost = seqCost;
+        if (hasIndex && effectiveIndexCost < seqCost) {
+          chosen = indexLabel;
+          chosenCost = effectiveIndexCost;
+        }
+
+        var maxCost = Math.max(seqCost, hasIndex ? effectiveIndexCost : 0);
+        var html = "";
+        html += costBar("Sequential scan", seqCost, maxCost, chosen === "Sequential Scan", false);
+        html += costBar(indexLabel, effectiveIndexCost, maxCost, chosen === indexLabel, !hasIndex);
+        accCosts.innerHTML = html;
+
+        accVerdict.innerHTML = "Planner would choose: <span class=\"mono\">" + chosen + "</span> — " +
+          fmtCost(chosenCost) + " vs. " + fmtCost(chosen === "Sequential Scan" ? (hasIndex ? effectiveIndexCost : seqCost) : seqCost) +
+          " for the alternative, matching " + matching.toLocaleString() + " of " + N.toLocaleString() + " rows (" + selPct + "%).";
+      }
+
+      [accRows, accSel, accIndex, accCovering].forEach(function (el) {
+        el.addEventListener("input", renderAccess);
+      });
+      renderAccess();
+
+      /* ---------------- Join-strategy panel ---------------- */
+      var joinOuter = document.getElementById("joinOuter");
+      var joinInner = document.getElementById("joinInner");
+      var joinIndex = document.getElementById("joinIndex");
+      var joinSorted = document.getElementById("joinSorted");
+      var joinOuterVal = document.getElementById("joinOuterVal");
+      var joinInnerVal = document.getElementById("joinInnerVal");
+      var joinCosts = document.getElementById("joinCosts");
+      var joinVerdict = document.getElementById("joinVerdict");
+
+      function renderJoin() {
+        var outerN = ROW_OPTIONS[+joinOuter.value];
+        var innerN = ROW_OPTIONS[+joinInner.value];
+        joinOuterVal.textContent = fmtRows(outerN);
+        joinInnerVal.textContent = fmtRows(innerN);
+        var hasIndex = joinIndex.checked;
+        var sorted = joinSorted.checked;
+
+        var nestedLoopCost = hasIndex
+          ? outerN * (RANDOM_PAGE_COST + CPU_TUPLE_COST + log2(innerN) * CPU_INDEX_TUPLE_COST)
+          : outerN * (innerN * 0.02);
+
+        var hashJoinCost = (innerN + outerN) * 0.033;
+
+        var mergeJoinCost = sorted
+          ? (innerN + outerN) * 0.01
+          : innerN * log2(innerN) * 0.005 + outerN * log2(outerN) * 0.005 + (innerN + outerN) * 0.01;
+
+        var costs = [
+          { label: "Nested loop" + (hasIndex ? " (indexed)" : " (no index)"), cost: nestedLoopCost },
+          { label: "Hash join", cost: hashJoinCost },
+          { label: "Merge join" + (sorted ? " (pre-sorted)" : " (needs sort)"), cost: mergeJoinCost }
+        ];
+        var maxCost = Math.max.apply(null, costs.map(function (c) { return c.cost; }));
+        var minCost = Math.min.apply(null, costs.map(function (c) { return c.cost; }));
+
+        var html = "";
+        costs.forEach(function (c) {
+          html += costBar(c.label, c.cost, maxCost, c.cost === minCost, false);
+        });
+        joinCosts.innerHTML = html;
+
+        var winner = costs.filter(function (c) { return c.cost === minCost; })[0];
+        joinVerdict.innerHTML = "Planner would choose: <span class=\"mono\">" + winner.label + "</span> — " +
+          fmtCost(winner.cost) + " for " + fmtRows(outerN) + " outer &times; " + fmtRows(innerN) + " inner.";
+      }
+
+      [joinOuter, joinInner, joinIndex, joinSorted].forEach(function (el) {
+        el.addEventListener("input", renderJoin);
+      });
+      renderJoin();
+
+      /* ---------------- Quiz ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
