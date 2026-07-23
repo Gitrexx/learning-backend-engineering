@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Indexes &amp; Storage Engines — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the B-tree / LSM-tree visualizer only. */
+    .idx-controls {
+      display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3);
+      margin-bottom: var(--sp-5); padding-bottom: var(--sp-4);
+      border-bottom: 1px dashed var(--border);
+    }
+    .idx-controls .field { display: flex; align-items: center; gap: var(--sp-2); }
+    .idx-controls label { font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); }
+    .idx-controls input[type="number"] { width: 5.5em; }
+    .idx-controls .spacer { flex: 1 1 auto; min-width: var(--sp-4); }
+
+    .structure-grid { margin: 0; }
+    .structure-col h4 {
+      display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+      margin-top: 0;
+    }
+    .structure-stats {
+      font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted);
+      margin: var(--sp-3) 0; line-height: 1.7;
+    }
+    .structure-stats strong { color: var(--text); }
+
+    /* B-tree render */
+    .bt-tree { display: flex; justify-content: center; padding: var(--sp-3) 0; overflow-x: auto; }
+    .bt-node-wrap { display: flex; flex-direction: column; align-items: center; }
+    .bt-node {
+      display: flex; gap: 3px; padding: 4px; border-radius: var(--radius-sm);
+      background: var(--surface); border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-1);
+    }
+    .bt-key {
+      font-family: var(--font-mono); font-size: 0.78rem; font-weight: 700;
+      min-width: 1.6em; text-align: center; padding: 2px 5px;
+      border-radius: 4px; background: var(--surface-2); color: var(--text);
+    }
+    .bt-node.on-path { border-color: var(--accent); box-shadow: var(--ring); }
+    .bt-key.hit { background: var(--accent); color: #04120f; }
+    @media (prefers-color-scheme: dark) { .bt-key.hit { color: #04211d; } }
+    :root[data-theme="dark"] .bt-key.hit { color: #04211d; }
+    .bt-children {
+      display: flex; gap: var(--sp-4); margin-top: var(--sp-4); padding-top: var(--sp-4);
+      border-top: 1px solid var(--border); position: relative;
+    }
+    .bt-empty { font-size: var(--fs-sm); color: var(--text-faint); font-style: italic; padding: var(--sp-3) 0; }
+
+    /* LSM render */
+    .lsm-structure { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-3) 0; }
+    .lsm-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+    .lsm-row-label {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--text-faint); width: 92px; flex-shrink: 0;
+    }
+    .lsm-box {
+      display: flex; gap: 3px; padding: 5px 7px; border-radius: var(--radius-sm);
+      background: var(--surface); border: 1px solid var(--border-strong); flex-wrap: wrap;
+      max-width: 100%;
+    }
+    .lsm-box.memtable { border-color: var(--blueprint); }
+    .lsm-box.checked { border-color: var(--accent); box-shadow: var(--ring); }
+    .lsm-key { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 700; padding: 2px 5px; }
+    .lsm-key.hit { color: var(--accent-strong); }
+    .lsm-empty-slot {
+      font-size: var(--fs-sm); color: var(--text-faint); font-style: italic;
+      padding: 5px 7px;
+    }
+
+    .idx-log {
+      margin-top: var(--sp-5); background: var(--surface-code); color: var(--text-on-code);
+      border-radius: var(--radius); padding: var(--sp-3) var(--sp-4);
+      font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.7;
+      max-height: 8.5em; overflow-y: auto;
+    }
+    .idx-log .log-line { opacity: 0.65; }
+    .idx-log .log-line:last-child { opacity: 1; }
+    .idx-log .log-line .tag { color: var(--accent-strong); font-weight: 700; }
+    .idx-log .log-line .tag.lsm-tag { color: var(--blueprint); }
+
+    @media (max-width: 720px) {
+      .idx-controls .field { width: 100%; justify-content: space-between; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 03</p>
+    <h1>Indexes &amp; Storage Engines</h1>
+
+    <p>
+      The last deep-dive treated the index as a box: given a query, the planner either uses one or
+      it doesn't, and the cost model tells you which is cheaper. That's the right level for tuning
+      queries, but it leaves a question unanswered — <em>why</em> does an index scan cost roughly
+      <code>log(N)</code> plus one read per matching row? Why does <code>INSERT</code>-heavy
+      workloads make some databases sweat and others shrug? Why does Postgres feel nothing like
+      Cassandra even though both index data for fast lookup? The answer is that "index" isn't one
+      thing — it's a data structure, physically laid out on disk, with its own write path and read
+      path and its own trade-offs. This page opens the box. There are really only two designs that
+      matter in production, and almost every database you'll touch is built on one of them.
+    </p>
+
+    <h2>What an index actually costs you</h2>
+    <p>
+      Start from a definition precise enough to reason with: an index is <strong>a second,
+      redundant copy of some columns, physically organized for fast lookup by a key you didn't
+      pick for the table's primary storage order.</strong> Redundant is the operative word. Every
+      index is data that has to be kept correct as the underlying table changes — every
+      <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> on an indexed column now
+      writes to the table <em>and</em> touches every index that covers it. An index isn't a free
+      accelerator; it's a standing trade of write cost and disk space for read speed on one
+      specific access pattern. The two dominant structures make that trade very differently.
+    </p>
+
+    <h2>B-trees: the workhorse of relational databases</h2>
+    <p>
+      A <span class="term">B-tree</span> is a balanced, sorted tree where each node holds many
+      keys — not two, like a binary tree, but as many as fit in one disk page (Postgres pages are
+      8&nbsp;KB by default). That single design choice is the whole point: disk (and even SSD) I/O
+      happens in whole-page units, so a data structure built around "how much fits in one page
+      read" minimizes the number of page reads needed to find anything.
+    </p>
+    <dl class="definition">
+      <dt>Fanout / branching factor</dt>
+      <dd>How many children each internal node has. With ~30-byte index entries in an 8&nbsp;KB
+        page, a node can hold on the order of 200–300 keys — so each level of the tree multiplies
+        how many rows it "covers" by roughly 200–300x.</dd>
+      <dt>Height stays tiny</dt>
+      <dd>A B-tree over 1 billion rows with fanout 200 has height
+        <code>log&#8322;&#8320;&#8320;(1,000,000,000) ≈ 3.7</code> — rounded up, <strong>4 levels</strong>.
+        Four page reads (three internal + one leaf, often fewer once the top levels are cached in
+        memory) locate any row in a billion-row table. That's the entire reason "index scan" reads
+        as instant even at huge scale — logarithmic growth is almost flat once the base is in the
+        hundreds.</dd>
+      <dt>Write path</dt>
+      <dd>Descend from the root comparing keys to pick a child, all the way to a leaf, then insert
+        the key there in sorted position — an in-place, random-access write. If the leaf is now
+        over capacity, it <span class="term">splits</span> into two nodes and pushes its median key
+        up into the parent, which may itself overflow and split, cascading up to the root in the
+        rare case the whole tree grows a level. Splits are what make B-tree writes more expensive
+        than they look: an insert is usually one page write, occasionally a cascade of several.</dd>
+      <dt>Read path</dt>
+      <dd>Descend the same way, comparing the search key against each node's keys to pick the next
+        child, until a leaf either contains the key or doesn't. <code>O(log N)</code> page reads,
+        each one a potentially random disk access — which is exactly the <code>RANDOM_PAGE_COST</code>
+        constant from the previous deep-dive's cost model.</dd>
+    </dl>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Production databases actually use <span class="term">B+-trees</span>, a variant where
+        <em>only leaf nodes</em> hold row data — internal nodes hold copies of keys purely for
+        routing — and leaves are linked in a chain for fast in-order range scans. The visualizer
+        below draws a classic B-tree (data at every node) because it makes the split/promote
+        mechanics easier to see in a small example; the branching-factor-keeps-height-low argument,
+        which is the part that matters for reasoning about cost, is identical either way.</p>
+      </div>
+    </div>
+
+    <h3>Clustered vs. secondary indexes</h3>
+    <p>
+      Once you know a B-tree's leaves hold the "real" data, one more distinction falls out for
+      free. A <span class="term">clustered index</span> is one where the table's physical row order
+      <em>is</em> the index order — the leaves don't point to rows elsewhere, they <em>are</em> the
+      rows. MySQL/InnoDB always clusters the table by its primary key. A
+      <span class="term">secondary (non-clustered) index</span> is a separate tree whose leaves
+      store a pointer to the row rather than the row itself — in Postgres that pointer is a
+      <span class="term">TID</span> (page + offset in the heap); in InnoDB, a secondary index's leaf
+      stores the primary key value, so a secondary-index lookup is really <em>two</em> B-tree
+      descents: one down the secondary index to get the PK, one down the clustered index to get the
+      row. A table can have exactly one clustered index (rows can only be physically sorted one
+      way) but any number of secondary ones — which is why picking the clustering key well (usually
+      the column your hottest range queries filter on) is a real, mostly-one-time design decision.
+    </p>
+    <p>
+      This is also the mechanical reason the leftmost-prefix rule and covering indexes from the
+      previous page work the way they do. A composite index on <code>(status, created_at)</code> is
+      literally one B-tree keyed on the <em>concatenation</em> of those columns — sorted by
+      <code>status</code> first, then by <code>created_at</code> within each <code>status</code>
+      value — so you can only binary-search into it starting from the column it's sorted by first.
+      A covering index skips the heap fetch for the same reason an index-only scan is cheap: if
+      every column the query needs is already sitting in that leaf entry, there's nothing left to
+      go fetch.
+    </p>
+
+    <h2>LSM-trees: trading read latency for write throughput</h2>
+    <p>
+      A <span class="term">Log-Structured Merge-tree</span> (LSM-tree) starts from the opposite
+      premise: random-access in-place writes are the expensive thing to avoid, so never do one.
+      Instead, batch writes in memory and only ever write to disk <em>sequentially</em>, in bulk.
+      This is the structure behind Cassandra, HBase, RocksDB, LevelDB, and (as the storage engine
+      inside) many time-series and embedded key-value stores.
+    </p>
+    <dl class="definition">
+      <dt>Memtable</dt>
+      <dd>An in-memory sorted structure (often a skip list or balanced tree) that absorbs every
+        write. A write here is about as cheap as a write gets — no disk seek, no page split, just
+        an in-memory insert — usually paired with an append to a
+        <span class="term">write-ahead log (WAL)</span> on disk so a crash doesn't lose data that
+        hasn't been flushed yet.</dd>
+      <dt>Flush → SSTable</dt>
+      <dd>When the memtable hits a size threshold, its entire sorted contents are written to disk
+        as one immutable file — a <span class="term">Sorted String Table (SSTable)</span> — in a
+        single sequential write. A fresh, empty memtable takes over. SSTables are never modified
+        after they're written, only replaced by compaction.</dd>
+      <dt>Compaction</dt>
+      <dd>A background process that merges multiple SSTables into fewer, larger ones — like the
+        merge step of a merge sort — dropping overwritten and deleted keys (deletes are written as
+        <span class="term">tombstones</span>, not in-place removals) along the way. Compaction is
+        what keeps read cost and disk usage bounded; skip it and both grow without limit.</dd>
+      <dt>Read path</dt>
+      <dd>Check the memtable first (newest data). If the key isn't there, check on-disk SSTables —
+        newest to oldest, since a later SSTable's value for a key overrides an earlier one — until
+        it's found or every SSTable has been checked. A key that was written once and never
+        compacted may require checking <em>every</em> SSTable to confirm it's absent — the
+        structural reason LSM reads are slower and less predictable than B-tree reads. Real systems
+        blunt this with a <span class="term">Bloom filter</span> per SSTable: a compact
+        probabilistic structure that can say "definitely not in this file" for free and skip the
+        read entirely, at the cost of an occasional false positive (never a false negative).</dd>
+    </dl>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Amplification: the vocabulary this trade-off is measured in</span>
+      <div class="callout-body">
+        <p><strong>Write amplification</strong> — total bytes physically written to storage per
+        byte of application data written. B-trees keep this low on the write itself (one page,
+        occasionally a split cascade) but pay it back on <em>reads</em>: random page I/O per level
+        descended. LSM-trees keep the initial write nearly free but pay write amplification later,
+        in compaction — the same byte gets rewritten every time it's merged into a bigger SSTable,
+        commonly 10–30x the original bytes over a key's lifetime in a leveled-compaction system.
+        <strong>Read amplification</strong> — number of physical reads needed to answer one logical
+        read — is low and predictable for a B-tree (<code>≈ tree height</code>) and higher and
+        workload-dependent for an LSM-tree (memtable + however many SSTables a Bloom filter
+        couldn't rule out). <strong>Space amplification</strong> — how much more disk an LSM-tree
+        uses than the logical data size, from old versions and tombstones not yet compacted away.
+        The <span class="term">RUM conjecture</span> (Athanassoulis et al.) formalizes what the
+        widget below lets you feel directly: no structure minimizes all three — <strong>R</strong>ead,
+        <strong>U</strong>pdate, and <strong>M</strong>emory amplification — at once; every storage
+        engine is a chosen point on that triangle.</p>
+      </div>
+    </div>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — insert the same keys into both structures</div>
+      <p class="stage-blurb">
+        Insert keys and watch a B-tree grow by splitting, and an LSM-tree grow by flushing sorted
+        runs to disk. Then look up a key and see exactly how many nodes or files each structure has
+        to touch to answer — and how compaction changes that number for the LSM-tree.
+      </p>
+
+      <div class="idx-controls">
+        <div class="field">
+          <label for="idxInsertKey">Key (1–99)</label>
+          <input type="number" id="idxInsertKey" min="1" max="99" value="42" />
+        </div>
+        <button class="btn" id="idxInsertBtn">Insert</button>
+        <button class="btn secondary" id="idxRandomBtn">Insert random</button>
+        <div class="spacer"></div>
+        <div class="field">
+          <label for="idxLookupKey">Look up</label>
+          <input type="number" id="idxLookupKey" min="1" max="99" value="42" />
+        </div>
+        <button class="btn secondary" id="idxLookupBtn">Find</button>
+        <button class="btn secondary" id="idxResetBtn">Reset</button>
+      </div>
+
+      <div class="grid-2 structure-grid">
+        <div class="structure-col">
+          <h4>B-tree <span class="badge accent">order 4 · max 3 keys/node</span></h4>
+          <div class="bt-tree" id="btTree"></div>
+          <div class="structure-stats" id="btStats"></div>
+        </div>
+        <div class="structure-col">
+          <h4>LSM-tree <span class="badge accent">memtable cap 4</span></h4>
+          <div class="lsm-structure" id="lsmStructure"></div>
+          <div class="structure-stats" id="lsmStats"></div>
+          <button class="btn secondary" id="compactBtn">Compact Level 0 → Level 1</button>
+        </div>
+      </div>
+
+      <div class="idx-log" id="idxLog"></div>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Try this sequence: insert 8–10 keys to grow the B-tree past one split and fill more than
+        one LSM SSTable, then look up a key you inserted <em>early</em>. In the B-tree the lookup
+        cost barely moves — height grows by one only every ~3 keys here (order 4 is deliberately
+        tiny so you can see it happen at all; real fanout is ~200–300). In the LSM-tree, that lookup
+        may have to check the memtable <em>and</em> every uncompacted Level-0 SSTable before it
+        finds an old key — then click <strong>Compact</strong> and look it up again to watch that
+        cost collapse back down to one structure.</p>
+      </div>
+    </div>
+
+    <h2>Choosing between them, concretely</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>B-tree</th><th>LSM-tree</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Write cost</td>
+            <td>In-place random write per insert; occasional split cascade. Gets more expensive as
+              the working set outgrows cache (more random page I/O).</td>
+            <td>Sequential append to memtable + WAL — close to the fastest write a storage device
+              can do. Cost is deferred to background compaction, off the write's critical path.</td>
+          </tr>
+          <tr>
+            <td>Read cost</td>
+            <td>Predictable, low: <code>O(log N)</code> page reads, largely independent of write
+              history.</td>
+            <td>Variable: memtable + however many SSTables a Bloom filter can't rule out. Best case
+              (well-compacted, filter hits) close to a B-tree; worst case (write-heavy, behind on
+              compaction) noticeably worse.</td>
+          </tr>
+          <tr>
+            <td>Space usage</td>
+            <td>Compact; roughly the data size plus index overhead. Deletes and updates are
+              in-place, no extra copies to reclaim.</td>
+            <td>Higher until compaction catches up — old versions and tombstones sit on disk taking
+              space and read-amplifying until merged away.</td>
+          </tr>
+          <tr>
+            <td>Where it shows up</td>
+            <td>Postgres, MySQL/InnoDB, SQL Server, SQLite — anything optimized for mixed
+              read/write OLTP with unpredictable ad-hoc queries.</td>
+            <td>Cassandra, ScyllaDB, HBase; RocksDB/LevelDB as an embedded engine inside many
+              time-series DBs, stream processors, and some feature stores. Anything dominated by
+              high-volume writes/appends with comparatively sparse point reads.</td>
+          </tr>
+          <tr>
+            <td>The 3&nbsp;AM failure mode</td>
+            <td>A hot table's working set no longer fits in cache — every index descent now hits
+              disk, and write-heavy tables fragment pages, bloating index size until a
+              <code>REINDEX</code>/vacuum catches up.</td>
+            <td>Compaction falls behind a sustained write spike — SSTable count balloons, reads slow
+              down step-wise as more files must be checked per lookup, and disk fills faster than
+              expected from space amplification. "Why did reads get slow with no code change" is
+              almost always this.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>This trade-off maps almost exactly onto training vs. serving workloads. Feature-logging
+        and event pipelines — every prediction request, every label arriving hours or days later,
+        high-volume appends that are read back in bulk for the next training run — are a textbook
+        LSM workload, which is exactly why so many feature stores and time-series stores are built
+        on Cassandra/ScyllaDB or embed RocksDB: writes never block on the ingestion critical path.
+        Low-latency online feature serving is the opposite shape — a small, hot set of keys read
+        far more often than written — which is why the serving side of a feature store usually sits
+        on a B-tree-backed or in-memory store (Postgres, DynamoDB, Redis) instead, even when the
+        offline store right next to it is LSM-based. "Why does our feature store use two different
+        databases" is this exact trade-off, made explicit.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A B-tree index has fanout (branching factor) 200 and covers 1 billion
+          rows. Doubling the table to 2 billion rows changes the tree's height by roughly:</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Doubles it — twice the rows means twice the levels.</button>
+          <button class="quiz-option" data-choice="b">Barely at all — height is logarithmic in row count (log base 200), so doubling the input adds a tiny fraction of a level; height only increases by a whole level when the row count crosses another factor-of-200 boundary.</button>
+          <button class="quiz-option" data-choice="c">It becomes unbalanced and lookups degrade to O(N).</button>
+        </div>
+        <p class="quiz-explain" hidden>log base 200 grows extremely slowly — log₂₀₀(1B) ≈ 3.7, log₂₀₀(2B) ≈ 3.83. Height is very likely to stay at the same integer number of levels after rounding up. This is precisely why index lookups feel "instant" regardless of table size — the height barely moves even across huge growth.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. A service does very high-volume writes (event ingestion) with rare,
+          non-latency-critical reads (nightly batch export). Which storage engine shape fits best,
+          and why?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">LSM-tree — writes are cheap, sequential appends to memtable/WAL, and read cost/predictability matters far less here than write throughput.</button>
+          <button class="quiz-option" data-choice="b">B-tree — it's the general-purpose default for any workload regardless of read/write ratio.</button>
+          <button class="quiz-option" data-choice="c">Neither matters; storage engine choice never affects throughput, only query syntax.</button>
+        </div>
+        <p class="quiz-explain" hidden>This is the canonical LSM-shaped workload: write-dominated, latency-insensitive reads. Paying write amplification later via background compaction, in exchange for near-free writes now, is exactly the right trade here — the opposite of an OLTP app doing frequent point lookups on user-facing pages, where a B-tree's predictable low read cost matters more.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. An LSM-backed store's read latency has been creeping up for weeks with
+          no code or query changes. What's the most likely storage-engine-level cause?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The B-tree index needs a REINDEX — this only happens to B-trees.</button>
+          <button class="quiz-option" data-choice="b">Fanout has decreased because the keys got longer.</button>
+          <button class="quiz-option" data-choice="c">Compaction is falling behind sustained write volume, so Level-0 SSTable count keeps growing — each read now has to check more files (higher read amplification) before it can rule a key in or out, even with Bloom filters helping.</button>
+        </div>
+        <p class="quiz-explain" hidden>A slow, code-change-free creep in read latency on an LSM-backed store is the classic signature of compaction debt: writes keep flushing new SSTables faster than compaction can merge them away, so every read has more files to check. The fix is usually more compaction throughput/threads or write-rate limiting, not a query change.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Indexes and storage engines explain how data gets found fast — and how it gets written. What
+      they don't explain is what happens when <em>two things happen to the same data at once</em>: two
+      transactions racing to update the same row, a reader seeing a half-finished write, a crash
+      mid-transaction. The next deep-dive, <em>Transactions, ACID &amp; Isolation Levels</em>, covers
+      exactly that — the guarantees a database does and doesn't give you under concurrency, and the
+      anomalies that slip through when you pick an isolation level without understanding what it
+      actually promises.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var BT_MAX_KEYS = 3;
+      var MEMTABLE_CAP = 4;
+
+      var btRoot = { keys: [], children: null, leaf: true };
+      var btHighlightNodes = null; // Set of node refs on last lookup path
+      var btHighlightKey = null;
+      var btLastFound = null;
+
+      var memtable = [];
+      var level0 = []; // array of sorted arrays, index 0 = newest
+      var level1 = []; // array of sorted arrays (post-compaction)
+      var lsmHighlight = null; // { memtable: bool, level0: Set(idx), level1: Set(idx) }
+      var lsmLastFound = null;
+      var lsmLastKey = null;
+
+      var logLines = [];
+
+      function log(tag, tagClass, msg) {
+        logLines.push('<div class="log-line"><span class="tag ' + tagClass + '">' + tag + '</span> ' + msg + '</div>');
+        if (logLines.length > 30) logLines.shift();
+        document.getElementById("idxLog").innerHTML = logLines.join("");
+        var el = document.getElementById("idxLog");
+        el.scrollTop = el.scrollHeight;
+      }
+
+      /* ---------------- B-tree ---------------- */
+
+      function insertSorted(arr, key) {
+        var i = 0;
+        while (i < arr.length && arr[i] < key) i++;
+        if (arr[i] === key) return false;
+        arr.splice(i, 0, key);
+        return true;
+      }
+
+      function btContains(key) {
+        var node = btRoot;
+        while (node) {
+          if (node.keys.indexOf(key) !== -1) return true;
+          if (node.leaf) return false;
+          var idx = 0;
+          while (idx < node.keys.length && key > node.keys[idx]) idx++;
+          node = node.children[idx];
+        }
+        return false;
+      }
+
+      function btSplit(node) {
+        var mid = Math.floor(node.keys.length / 2);
+        var promoted = node.keys[mid];
+        var leftKeys = node.keys.slice(0, mid);
+        var rightKeys = node.keys.slice(mid + 1);
+        var right;
+        if (node.leaf) {
+          right = { keys: rightKeys, children: null, leaf: true };
+          node.keys = leftKeys;
+        } else {
+          var leftChildren = node.children.slice(0, mid + 1);
+          var rightChildren = node.children.slice(mid + 1);
+          right = { keys: rightKeys, children: rightChildren, leaf: false };
+          node.keys = leftKeys;
+          node.children = leftChildren;
+        }
+        return { promoted: promoted, right: right };
+      }
+
+      function btInsertNode(node, key, splitCount) {
+        if (node.leaf) {
+          insertSorted(node.keys, key);
+        } else {
+          var idx = 0;
+          while (idx < node.keys.length && key > node.keys[idx]) idx++;
+          var res = btInsertNode(node.children[idx], key, splitCount);
+          if (res) {
+            node.keys.splice(idx, 0, res.promoted);
+            node.children.splice(idx + 1, 0, res.right);
+          }
+        }
+        if (node.keys.length > BT_MAX_KEYS) {
+          splitCount.n++;
+          return btSplit(node);
+        }
+        return null;
+      }
+
+      function btInsert(key) {
+        var splitCount = { n: 0 };
+        var res = btInsertNode(btRoot, key, splitCount);
+        var grewRoot = false;
+        if (res) {
+          btRoot = { keys: [res.promoted], children: [btRoot, res.right], leaf: false };
+          grewRoot = true;
+        }
+        return { splits: splitCount.n, grewRoot: grewRoot };
+      }
+
+      function btHeight(node) {
+        var h = 1;
+        while (node.children) { h++; node = node.children[0]; }
+        return h;
+      }
+
+      function btSearchPath(key) {
+        var path = [];
+        var node = btRoot;
+        while (node) {
+          path.push(node);
+          if (node.keys.indexOf(key) !== -1) return { found: true, path: path };
+          if (node.leaf) return { found: false, path: path };
+          var idx = 0;
+          while (idx < node.keys.length && key > node.keys[idx]) idx++;
+          node = node.children[idx];
+        }
+        return { found: false, path: path };
+      }
+
+      function renderBtNode(node) {
+        var highlighted = btHighlightNodes && btHighlightNodes.indexOf(node) !== -1;
+        var html = '<div class="bt-node-wrap"><div class="bt-node' + (highlighted ? " on-path" : "") + '">';
+        node.keys.forEach(function (k) {
+          var isHit = highlighted && btHighlightKey === k;
+          html += '<span class="bt-key' + (isHit ? " hit" : "") + '">' + k + "</span>";
+        });
+        html += "</div>";
+        if (node.children) {
+          html += '<div class="bt-children">';
+          node.children.forEach(function (c) { html += renderBtNode(c); });
+          html += "</div>";
+        }
+        html += "</div>";
+        return html;
+      }
+
+      function renderBt() {
+        var el = document.getElementById("btTree");
+        if (btRoot.keys.length === 0) {
+          el.innerHTML = '<div class="bt-empty">empty — insert a key</div>';
+        } else {
+          el.innerHTML = renderBtNode(btRoot);
+        }
+        var statsEl = document.getElementById("btStats");
+        var lookupLine = "";
+        if (btHighlightNodes) {
+          lookupLine = "Lookup for <strong>" + btHighlightKey + "</strong>: " +
+            (btLastFound ? "found" : "not found") + " — touched <strong>" + btHighlightNodes.length + "</strong> node(s).";
+        } else {
+          lookupLine = "Look up a key to see the read path.";
+        }
+        statsEl.innerHTML =
+          "Height: <strong>" + btHeight(btRoot) + "</strong> level(s) &middot; " + lookupLine;
+      }
+
+      /* ---------------- LSM-tree ---------------- */
+
+      function lsmContains(key) {
+        if (memtable.indexOf(key) !== -1) return true;
+        for (var i = 0; i < level0.length; i++) if (level0[i].indexOf(key) !== -1) return true;
+        for (var j = 0; j < level1.length; j++) if (level1[j].indexOf(key) !== -1) return true;
+        return false;
+      }
+
+      function lsmInsert(key) {
+        insertSorted(memtable, key);
+        var flushed = false;
+        if (memtable.length >= MEMTABLE_CAP) {
+          level0.unshift(memtable.slice());
+          memtable = [];
+          flushed = true;
+        }
+        return { flushed: flushed };
+      }
+
+      function lsmCompact() {
+        if (level0.length === 0) return false;
+        var all = {};
+        level0.forEach(function (t) { t.forEach(function (k) { all[k] = true; }); });
+        level1.forEach(function (t) { t.forEach(function (k) { all[k] = true; }); });
+        var merged = Object.keys(all).map(Number).sort(function (a, b) { return a - b; });
+        level1 = [merged];
+        level0 = [];
+        return true;
+      }
+
+      function lsmSearchTrace(key) {
+        var checked = { memtable: false, level0: [], level1: [] };
+        checked.memtable = true;
+        if (memtable.indexOf(key) !== -1) return { found: true, checked: checked };
+        for (var i = 0; i < level0.length; i++) {
+          checked.level0.push(i);
+          if (level0[i].indexOf(key) !== -1) return { found: true, checked: checked };
+        }
+        for (var j = 0; j < level1.length; j++) {
+          checked.level1.push(j);
+          if (level1[j].indexOf(key) !== -1) return { found: true, checked: checked };
+        }
+        return { found: false, checked: checked };
+      }
+
+      function lsmBox(keys, extraClass, checked, hitKey) {
+        var cls = "lsm-box" + (extraClass ? " " + extraClass : "") + (checked ? " checked" : "");
+        var html = '<div class="' + cls + '">';
+        if (keys.length === 0) {
+          html += '<span class="lsm-empty-slot">empty</span>';
+        } else {
+          keys.forEach(function (k) {
+            html += '<span class="lsm-key' + (checked && k === hitKey ? " hit" : "") + '">' + k + "</span>";
+          });
+        }
+        html += "</div>";
+        return html;
+      }
+
+      function renderLsm() {
+        var el = document.getElementById("lsmStructure");
+        var hitKey = lsmLastFound ? lsmLastKey : null;
+        var html = "";
+
+        html += '<div class="lsm-row"><span class="lsm-row-label">Memtable</span>' +
+          lsmBox(memtable, "memtable", lsmHighlight && lsmHighlight.memtable, hitKey) + "</div>";
+
+        html += '<div class="lsm-row"><span class="lsm-row-label">Level 0</span>';
+        if (level0.length === 0) {
+          html += '<span class="lsm-empty-slot">no SSTables yet</span>';
+        } else {
+          level0.forEach(function (t, i) {
+            html += lsmBox(t, "", lsmHighlight && lsmHighlight.level0.indexOf(i) !== -1, hitKey);
+          });
+        }
+        html += "</div>";
+
+        html += '<div class="lsm-row"><span class="lsm-row-label">Level 1</span>';
+        if (level1.length === 0) {
+          html += '<span class="lsm-empty-slot">no compacted SSTable yet</span>';
+        } else {
+          level1.forEach(function (t, i) {
+            html += lsmBox(t, "", lsmHighlight && lsmHighlight.level1.indexOf(i) !== -1, hitKey);
+          });
+        }
+        html += "</div>";
+
+        el.innerHTML = html;
+
+        var statsEl = document.getElementById("lsmStats");
+        var lookupLine;
+        if (lsmHighlight) {
+          var touched = (lsmHighlight.memtable ? 1 : 0) + lsmHighlight.level0.length + lsmHighlight.level1.length;
+          lookupLine = "Lookup for <strong>" + lsmLastKey + "</strong>: " +
+            (lsmLastFound ? "found" : "not found") + " — touched <strong>" + touched + "</strong> structure(s).";
+        } else {
+          lookupLine = "Look up a key to see the read path.";
+        }
+        statsEl.innerHTML =
+          "Memtable: <strong>" + memtable.length + "/" + MEMTABLE_CAP + "</strong> &middot; " +
+          "Level 0 SSTables: <strong>" + level0.length + "</strong> &middot; " +
+          "Level 1 SSTables: <strong>" + level1.length + "</strong><br />" + lookupLine;
+      }
+
+      /* ---------------- Wiring ---------------- */
+
+      function clearHighlights() {
+        btHighlightNodes = null;
+        lsmHighlight = null;
+      }
+
+      function doInsert(key) {
+        if (isNaN(key) || key < 1 || key > 99) return;
+        clearHighlights();
+        if (btContains(key)) {
+          log(key, "tag", "already present in both structures — skipped.");
+          renderBt(); renderLsm();
+          return;
+        }
+        var btRes = btInsert(key);
+        var btMsg = btRes.grewRoot
+          ? "leaf overflowed, split cascaded to a new root (height +1)."
+          : (btRes.splits > 0 ? "leaf overflowed and split (" + btRes.splits + " split(s))." : "inserted into a leaf, no split needed.");
+        log(key, "tag", "B-tree: " + btMsg);
+
+        var lsmRes = lsmInsert(key);
+        var lsmMsg = lsmRes.flushed
+          ? "appended to memtable — memtable hit capacity, flushed as a new Level-0 SSTable."
+          : "appended to memtable (O(1), sequential — no disk touched yet).";
+        log(key, "lsm-tag", "LSM-tree: " + lsmMsg);
+
+        renderBt();
+        renderLsm();
+      }
+
+      document.getElementById("idxInsertBtn").addEventListener("click", function () {
+        var key = parseInt(document.getElementById("idxInsertKey").value, 10);
+        doInsert(key);
+      });
+
+      document.getElementById("idxRandomBtn").addEventListener("click", function () {
+        var key = null;
+        for (var i = 0; i < 40; i++) {
+          var candidate = 1 + Math.floor(Math.random() * 99);
+          if (!btContains(candidate)) { key = candidate; break; }
+        }
+        if (key === null) { log("!", "tag", "Structures are full across the 1–99 range — hit Reset."); return; }
+        document.getElementById("idxInsertKey").value = key;
+        doInsert(key);
+      });
+
+      document.getElementById("idxLookupBtn").addEventListener("click", function () {
+        var key = parseInt(document.getElementById("idxLookupKey").value, 10);
+        if (isNaN(key) || key < 1 || key > 99) return;
+
+        var btRes = btSearchPath(key);
+        btHighlightNodes = btRes.path;
+        btHighlightKey = key;
+        btLastFound = btRes.found;
+        log(key, "tag", "B-tree lookup: " + (btRes.found ? "found" : "not found") + " — " + btRes.path.length + " node(s) touched.");
+
+        var lsmRes = lsmSearchTrace(key);
+        lsmHighlight = lsmRes.checked;
+        lsmLastKey = key;
+        lsmLastFound = lsmRes.found;
+        var touched = (lsmRes.checked.memtable ? 1 : 0) + lsmRes.checked.level0.length + lsmRes.checked.level1.length;
+        log(key, "lsm-tag", "LSM lookup: " + (lsmRes.found ? "found" : "not found") + " — " + touched + " structure(s) touched.");
+
+        renderBt();
+        renderLsm();
+      });
+
+      document.getElementById("compactBtn").addEventListener("click", function () {
+        var before = level0.length;
+        var did = lsmCompact();
+        if (did) {
+          log("*", "lsm-tag", "Compaction: merged " + before + " Level-0 SSTable(s) into 1 Level-1 SSTable (old versions/duplicates dropped).");
+          lsmHighlight = null;
+          renderLsm();
+        } else {
+          log("*", "lsm-tag", "Nothing to compact — Level 0 is empty.");
+        }
+      });
+
+      document.getElementById("idxResetBtn").addEventListener("click", function () {
+        btRoot = { keys: [], children: null, leaf: true };
+        memtable = [];
+        level0 = [];
+        level1 = [];
+        clearHighlights();
+        btLastFound = null;
+        lsmLastFound = null;
+        logLines = [];
+        document.getElementById("idxLog").innerHTML = "";
+        renderBt();
+        renderLsm();
+        log("reset", "tag", "Both structures cleared.");
+      });
+
+      renderBt();
+      renderLsm();
+
+      /* ---------------- Quiz ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

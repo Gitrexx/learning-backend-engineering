@@ -90,7 +90,7 @@
       "summary": "B-trees vs LSM-trees, clustered vs secondary indexes, composite order, and the write/read trade-off.",
       "prerequisites": ["sql-and-query-performance"],
       "file": "indexing-and-storage-engines.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "transactions-and-isolation",
