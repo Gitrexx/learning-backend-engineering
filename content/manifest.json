@@ -100,7 +100,7 @@
       "summary": "ACID precisely, the isolation levels, the anomalies they permit, MVCC vs locking, and deadlocks.",
       "prerequisites": ["relational-data-modeling"],
       "file": "transactions-and-isolation.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "nosql-and-data-stores",
