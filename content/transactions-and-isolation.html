@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transactions, ACID &amp; Isolation Levels — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the two-transaction stepper widget only. */
+    .stepper-controls { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+    .stage-tab {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.5em 1.1em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .stage-tab:hover { border-color: var(--accent); }
+    .stage-tab.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+    .level-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: var(--sp-3) 0 var(--sp-4); }
+    .level-tab {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.5em 1.1em; border-radius: var(--radius); border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .level-tab:hover { border-color: var(--blueprint); }
+    .level-tab.active { border-color: var(--blueprint); background: var(--blueprint-soft); color: var(--blueprint); }
+    .scenario-blurb { font-size: var(--fs-sm); color: var(--text-muted); margin: 0 0 var(--sp-4); }
+    .timeline { list-style: none; margin: var(--sp-4) 0; padding: 0; display: grid; gap: var(--sp-2); }
+    .timeline li {
+      display: grid; grid-template-columns: 3.2em 1fr; gap: var(--sp-3);
+      align-items: start; padding: var(--sp-2) var(--sp-3);
+      border-radius: var(--radius-sm); border: 1px solid transparent;
+      opacity: 0.25; transition: opacity .2s, border-color .2s, background .2s;
+      font-size: var(--fs-sm);
+    }
+    .timeline li.revealed { opacity: 1; }
+    .timeline li.t1 { border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: var(--accent-soft); }
+    .timeline li.t2 { border-color: color-mix(in srgb, var(--blueprint) 35%, transparent); background: var(--blueprint-soft); }
+    .timeline li.sys { background: var(--surface-2); border-color: var(--border); }
+    .timeline .actor-tag {
+      font-family: var(--font-mono); font-weight: 700; font-size: var(--fs-eyebrow);
+      text-transform: uppercase; padding-top: 0.15em;
+    }
+    .timeline li.t1 .actor-tag { color: var(--accent-strong); }
+    .timeline li.t2 .actor-tag { color: var(--blueprint); }
+    .timeline li.sys .actor-tag { color: var(--text-faint); }
+    .timeline .note { display: block; margin-top: 0.2em; color: var(--text-muted); font-size: 0.92em; }
+    .stepper-buttons { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; margin-top: var(--sp-3); }
+    .step-progress { font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-faint); }
+    .verdict-box {
+      margin-top: var(--sp-4); padding: var(--sp-3) var(--sp-4);
+      border-radius: var(--radius); font-size: var(--fs-sm); font-weight: 600;
+      display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+    }
+    .verdict-box.ok { background: var(--ok-soft); color: var(--ok); }
+    .verdict-box.bad { background: var(--danger-soft); color: var(--danger); }
+    .verdict-box[hidden] { display: none; }
+    @media (max-width: 640px) {
+      .timeline li { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 04</p>
+    <h1>Transactions, ACID &amp; Isolation Levels</h1>
+
+    <p>
+      Every deep-dive so far assumed a single query running alone. Production databases never work
+      that way — dozens or thousands of transactions run <em>concurrently</em>, many touching the
+      same rows. What happens when two of them overlap is not obvious, and getting it wrong doesn't
+      throw an exception; it silently produces a wrong answer that looks fine until an audit, a
+      double-booked seat, or a bank balance that doesn't add up surfaces it. This page is about the
+      guarantees a database gives you under concurrency and failure, precisely enough that you can
+      reason about which guarantee you actually need — because the honest answer to "what isolation
+      level should I use" is almost always "it depends on which anomaly you can't afford," not
+      "the strictest one, always."
+    </p>
+
+    <h2>ACID, precisely</h2>
+    <p>
+      ACID names four guarantees a transaction gives you. Each is doing different work, and
+      conflating them is a common source of fuzzy reasoning:
+    </p>
+    <dl class="definition">
+      <dt>Atomicity</dt>
+      <dd>A transaction's writes happen <em>all or nothing</em>. If a transaction touches three
+        rows and crashes after the second write, the database guarantees you see neither write,
+        not just one — implemented via a write-ahead log (WAL) that lets a crash-recovery pass roll
+        back anything not confirmed committed.</dd>
+      <dt>Consistency</dt>
+      <dd>The database moves from one valid state to another — <em>application-defined</em>
+        invariants (foreign keys, check constraints, "balance can't go negative") hold before and
+        after every transaction. Unlike the other three letters, the database doesn't fully deliver
+        this one for you; it enforces the constraints you declare, but an invariant you never told
+        it about (e.g. "the sum of two accounts must stay constant during a transfer") is on you to
+        preserve inside the transaction logic.</dd>
+      <dt>Isolation</dt>
+      <dd>Concurrent transactions don't see each other's uncommitted, or sometimes even committed,
+        intermediate state — exactly how much they're shielded from each other is a dial, not a
+        fixed guarantee, and it's the subject of the rest of this page.</dd>
+      <dt>Durability</dt>
+      <dd>Once a transaction commits, it survives a crash — the WAL record is <code>fsync</code>'d
+        to durable storage before the client is told "committed," so a power loss a millisecond
+        later can't undo an acknowledged write.</dd>
+    </dl>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>The "C" in ACID and the "C" in CAP (covered later in <em>Consistency Models, CAP &amp;
+        Consensus</em>) are <strong>different guarantees that happen to share a letter</strong> —
+        ACID's Consistency is about application invariants on a single node; CAP's Consistency is
+        about whether replicas agree with each other. Interviewers use this collision to check
+        whether you're pattern-matching on the word or actually understand both. Keep them separate
+        in your head.</p>
+      </div>
+    </div>
+
+    <h2>What isolation actually protects you from: four anomalies</h2>
+    <p>
+      "Isolation" is really shorthand for "which of these things can't happen." Four anomalies show
+      up over and over, and the isolation levels are literally defined by which subset of them each
+      one rules out:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Anomaly</th><th>What happens</th><th>Why it's dangerous</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Dirty read</td>
+            <td>T1 reads a row that T2 has modified but <em>not yet committed</em> — then T2 rolls
+              back, and T1 acted on a value that never actually existed.</td>
+            <td>The most severe anomaly; almost no real database allows it by default (SQL's "Read
+              Uncommitted" permits it in theory, but Postgres, for one, doesn't actually implement a
+              level that allows it).</td>
+          </tr>
+          <tr>
+            <td>Non-repeatable read</td>
+            <td>T1 reads the same row twice in one transaction and gets <em>different</em> values,
+              because T2 committed a change to that row in between.</td>
+            <td>Breaks the assumption that a transaction sees one consistent world — a report that
+              sums a value at the start and re-checks it at the end can disagree with itself.</td>
+          </tr>
+          <tr>
+            <td>Phantom read</td>
+            <td>T1 re-runs the same <em>range</em> query twice (e.g. "count orders over $100") and
+              gets a different set of rows, because T2 committed an <code>INSERT</code>/
+              <code>DELETE</code> matching that range in between.</td>
+            <td>Like a non-repeatable read but for row existence, not row values — row-level locks
+              can't prevent it, since the phantom row didn't exist to lock yet.</td>
+          </tr>
+          <tr>
+            <td>Lost update / write skew</td>
+            <td>Two transactions each read a value, compute a new value from it, and write back —
+              and one write silently clobbers the other, or both writes individually look fine but
+              together they violate an invariant neither transaction alone broke.</td>
+            <td>The one that doesn't announce itself with an error. Both transactions commit
+              successfully; the bug is in the <em>data</em>, discovered later if at all. The stepper
+              widget below is built around exactly this anomaly, because it's the one most engineers
+              underestimate.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>The SQL standard's isolation levels</h2>
+    <p>
+      The SQL standard defines four isolation levels purely in terms of which of the above anomalies
+      they permit — a specification of the <em>ceiling</em> on bad behavior, not of how the database
+      has to achieve it:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Read Uncommitted</td><td>Allowed</td><td>Allowed</td><td>Allowed</td></tr>
+          <tr><td>Read Committed</td><td>Prevented</td><td>Allowed</td><td>Allowed</td></tr>
+          <tr><td>Repeatable Read</td><td>Prevented</td><td>Prevented</td><td>Allowed <em>(by the standard)</em></td></tr>
+          <tr><td>Serializable</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution — the standard is a floor, not a spec of behavior</span>
+      <div class="callout-body">
+        <p>Real databases routinely give you <em>more</em> than the standard requires at a given
+        level, and which anomalies remain possible is engine-specific — this is a frequent
+        interview trap. Two concrete deviations in Postgres, the reference most backend engineers
+        meet first:</p>
+        <ul>
+          <li>Postgres has no true Read Uncommitted — requesting it silently gets you Read
+            Committed. Dirty reads are simply not something Postgres will ever show you.</li>
+          <li>Postgres's Repeatable Read is implemented as <span class="term">snapshot
+            isolation</span>, which happens to also prevent phantom reads — stricter than the
+            standard requires at that name. But (this is the important part) snapshot isolation
+            does <strong>not</strong> prevent write skew, an anomaly the 1995 SQL standard's anomaly
+            table doesn't even name. "Repeatable Read" sounding safe is exactly the trap the write-skew
+            scenario in the widget below is built to demonstrate.</li>
+        </ul>
+        <p>The takeaway: know the anomaly you're worried about, then check your specific database's
+        docs for that level — never assume from the name alone.</p>
+      </div>
+    </div>
+
+    <h2>MVCC vs. locking: two ways to implement isolation</h2>
+    <p>
+      The isolation levels above describe <em>what</em> is guaranteed; there are two fundamentally
+      different engineering approaches to actually delivering it:
+    </p>
+    <dl class="definition">
+      <dt>Two-phase locking (2PL)</dt>
+      <dd>A transaction acquires a shared (read) or exclusive (write) lock on each row it touches,
+        holds every lock until commit, and never acquires a new lock after releasing one (the "two
+        phases": growing, then shrinking). Simple to reason about, but readers block writers and
+        writers block readers — a long-running report can stall unrelated writes to rows it merely
+        reads.</dd>
+      <dt>MVCC (multi-version concurrency control)</dt>
+      <dd>Instead of locking rows for reads, the database keeps multiple versions of each row and
+        gives every transaction a consistent <em>snapshot</em> — reads never block writes and writes
+        never block reads, because a reader simply sees the version of the row that was committed as
+        of its snapshot, while a writer creates a new version. This is what Postgres, MySQL/InnoDB,
+        and Oracle all use, and it's why "a slow <code>SELECT</code>" almost never blocks an
+        unrelated <code>UPDATE</code> in those engines the way naive 2PL would.</dd>
+    </dl>
+    <p>
+      MVCC isn't free: old row versions have to be garbage-collected once no active transaction can
+      still see them (Postgres's <code>VACUUM</code>), and a long-running transaction that holds a
+      snapshot open prevents that cleanup — table bloat from a forgotten open transaction is a
+      genuine, recurring 3-AM incident in Postgres shops. MVCC still needs <em>some</em> locking for
+      write-write conflicts (two transactions can't both win when they update the very same row);
+      that's the "first updater wins" rule the lost-update scenario below walks through.
+    </p>
+
+    <h2>Deadlocks</h2>
+    <p>
+      Whenever transactions acquire locks in different orders, they can each end up waiting on a
+      lock the other holds — a <span class="term">deadlock</span>. T1 locks row A then waits for row
+      B; T2 locks row B then waits for row A; neither can ever proceed. Databases detect this by
+      building a <em>wait-for graph</em> (an edge from transaction X to Y whenever X is blocked
+      waiting on a lock Y holds) and periodically checking for a cycle; when one's found, the
+      database picks a victim — usually the transaction that's done the least work — and aborts it
+      with a deadlock error, letting the other proceed.
+    </p>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>Deadlocks are a code-review-catchable class of bug, not a database flaw to route around
+        with retries alone: the fix is a <strong>consistent lock/update ordering</strong> across every
+        code path (e.g. always update the lower account ID first in a transfer), plus keeping
+        transactions short so the window for a conflicting interleaving is small. Retry-on-deadlock
+        is a reasonable safety net on top of that discipline, not a substitute for it.</p>
+      </div>
+    </div>
+
+    <h2>Interactive — step through a concurrency conflict</h2>
+    <p>
+      Pick a scenario, pick the isolation level it runs at, and step through what each transaction
+      does and sees. The lost-update and write-skew scenarios are the two worth studying closely:
+      they show a case Repeatable Read <em>does</em> catch automatically, and a case it silently
+      lets through even though it "sounds" strict.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — two-transaction stepper</div>
+      <div class="stepper-controls" id="scenarioTabs"></div>
+      <div class="level-row" id="levelTabs"></div>
+      <p class="scenario-blurb" id="scenarioBlurb"></p>
+
+      <ul class="timeline" id="timeline"></ul>
+
+      <div class="stepper-buttons">
+        <button class="btn" id="stepBtn" type="button">Step →</button>
+        <button class="btn secondary" id="resetBtn" type="button">Reset</button>
+        <span class="step-progress" id="stepProgress"></span>
+      </div>
+
+      <div class="verdict-box" id="verdict" hidden></div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Write skew shows up constantly in ML infrastructure under a different name. Two feature
+        pipeline runs that each read "current row count for partition X," decide independently that
+        it's safe to proceed, and both write — that's the on-call-doctors scenario with
+        <code>partitions</code> instead of <code>doctors</code>. A model registry's "promote to
+        production" transition guarded by "read current production model, check it's not already
+        being promoted, then flip the pointer" has the exact same shape: two concurrent promotion
+        jobs can both pass the check under Repeatable Read and both flip the pointer, leaving the
+        registry in a state neither job intended. The fix is the same one covered here — either
+        <code>SELECT ... FOR UPDATE</code> to take an explicit lock on the rows the invariant depends
+        on, or run the transaction at <code>SERIALIZABLE</code> and handle the resulting serialization
+        failure with a retry. "It passed the check" is not the same as "it's still true when I
+        commit" — the entire lesson of this page in one sentence.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. T1 reads a row twice in the same transaction and gets two different
+          values, because T2 committed an update to that row in between. Which isolation level is
+          the <em>minimum</em> that prevents this, per the SQL standard's anomaly table?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Read Committed</button>
+          <button class="quiz-option" data-choice="b">Repeatable Read</button>
+          <button class="quiz-option" data-choice="c">Read Uncommitted</button>
+        </div>
+        <p class="quiz-explain" hidden>This is a non-repeatable read by definition. Read Committed permits it — each statement sees a fresh snapshot of committed data, so T1's second read can legitimately differ from its first. Repeatable Read (via a snapshot taken at transaction start) is the first level in the standard's table that rules it out.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. Two transactions each check "at least 2 of N rows satisfy condition X"
+          before independently flipping a different row from true to false, and both commit,
+          leaving fewer than the required minimum. Running both at Postgres's Repeatable Read
+          (snapshot isolation), what happens?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Repeatable Read always prevents this — it's exactly what "repeatable" means.</button>
+          <button class="quiz-option" data-choice="b">One transaction is automatically blocked until the other commits, then re-checks.</button>
+          <button class="quiz-option" data-choice="c">Both commit successfully — this is write skew, and because the two transactions write to different rows, snapshot isolation's write-write conflict check never triggers. Only true Serializable (via Postgres's SSI, detecting the read/write dependency cycle) catches it.</button>
+        </div>
+        <p class="quiz-explain" hidden>This is the write-skew trap: Repeatable Read/snapshot isolation only blocks conflicting writes to the *same* row. Two transactions writing to disjoint rows based on a shared read never trip that check, so the invariant they were jointly protecting can still be violated. Preventing it requires either SERIALIZABLE or an explicit SELECT ... FOR UPDATE on the rows the check depends on.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. Under MVCC, a long-running analytics query starts a transaction, then
+          takes 10 minutes to finish. What's the main operational cost of that, even though the
+          query never blocks any writer?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It holds its snapshot open, which prevents the database from garbage-collecting old row versions that writers are producing in the meantime — leading to table/index bloat until the transaction ends.</button>
+          <button class="quiz-option" data-choice="b">It has no cost at all — MVCC readers are completely free, with no downstream effect on the rest of the system.</button>
+          <button class="quiz-option" data-choice="c">It forces every concurrent writer to wait for a lock, identical to two-phase locking.</button>
+        </div>
+        <p class="quiz-explain" hidden>MVCC's defining feature is that readers don't block writers — but the trade-off is that old row versions can't be reclaimed while any transaction might still need to see them. A long-open transaction (even a read-only one) pins the vacuum horizon, which is why "a report that's been running for hours" is a classic cause of unexpected table bloat in Postgres.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page covered correctness under concurrency on a <em>single</em> database. The next
+      deep-dive, <em>NoSQL &amp; Choosing a Data Store</em>, widens the lens to the other axis of the
+      data layer: when a relational engine's data model — and the very transactional guarantees
+      covered here — isn't the right fit for the access pattern, what the alternatives (key-value,
+      document, wide-column, graph) actually trade away to get there, and how to choose deliberately
+      instead of by hype.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var LEVELS = [
+        { key: "rc", label: "Read Committed" },
+        { key: "rr", label: "Repeatable Read (snapshot)" },
+        { key: "ser", label: "Serializable" }
+      ];
+
+      function li(actorClass, actorLabel, text, note) {
+        return {
+          cls: actorClass,
+          tag: actorLabel,
+          html: text + (note ? '<span class="note">' + note + "</span>" : "")
+        };
+      }
+      var T1 = function (text, note) { return li("t1", "T1", text, note); };
+      var T2 = function (text, note) { return li("t2", "T2", text, note); };
+      var SYS = function (text, note) { return li("sys", "—", text, note); };
+
+      var SCENARIOS = {
+        nonrep: {
+          label: "Non-repeatable read",
+          blurb: "T1 reads the same row twice; T2 commits a change to it in between. Does T1's second read match its first?",
+          levels: {
+            rc: {
+              steps: [
+                T1("BEGIN"),
+                T1("SELECT balance FROM accounts WHERE id = 1", "→ T1 sees $100"),
+                T2("BEGIN"),
+                T2("UPDATE accounts SET balance = 150 WHERE id = 1"),
+                T2("COMMIT", "→ committed: balance is now $150"),
+                T1("SELECT balance FROM accounts WHERE id = 1 (again)", "→ T1 now sees $150 — different from its first read!"),
+                T1("COMMIT")
+              ],
+              anomaly: true,
+              verdict: "Non-repeatable read occurred. Under Read Committed, each statement re-reads the latest committed data — T1's two reads legitimately disagree."
+            },
+            rr: {
+              steps: [
+                T1("BEGIN", "→ T1's snapshot is fixed as of this point"),
+                T1("SELECT balance FROM accounts WHERE id = 1", "→ T1 sees $100"),
+                T2("BEGIN"),
+                T2("UPDATE accounts SET balance = 150 WHERE id = 1"),
+                T2("COMMIT", "→ committed: balance is now $150, but invisible to T1's snapshot"),
+                T1("SELECT balance FROM accounts WHERE id = 1 (again)", "→ T1 still sees $100 — its own snapshot, unaffected by T2"),
+                T1("COMMIT")
+              ],
+              anomaly: false,
+              verdict: "Prevented. Repeatable Read gives T1 one consistent snapshot for its whole transaction — T2's committed change simply isn't visible to it."
+            },
+            ser: {
+              steps: [
+                T1("BEGIN"),
+                T1("SELECT balance FROM accounts WHERE id = 1", "→ T1 sees $100"),
+                T2("BEGIN"),
+                T2("UPDATE accounts SET balance = 150 WHERE id = 1"),
+                T2("COMMIT"),
+                T1("SELECT balance FROM accounts WHERE id = 1 (again)", "→ T1 still sees $100 — same snapshot guarantee as Repeatable Read"),
+                T1("COMMIT", "→ succeeds: T1 made no writes for SSI to find a conflict on")
+              ],
+              anomaly: false,
+              verdict: "Prevented, same as Repeatable Read here — Serializable is a superset of RR's guarantees, and this scenario doesn't need the extra write-conflict detection to be safe."
+            }
+          }
+        },
+        lostupdate: {
+          label: "Lost update (same row)",
+          blurb: "T1 and T2 both read stock = 10, each computes a new value from that stale read, and both try to write it back.",
+          levels: {
+            rc: {
+              steps: [
+                T1("BEGIN"), T1("SELECT stock FROM items WHERE id = 9", "→ T1 sees 10, plans stock − 3 = 7"),
+                T2("BEGIN"), T2("SELECT stock FROM items WHERE id = 9", "→ T2 sees 10, plans stock − 4 = 6"),
+                T1("UPDATE items SET stock = 7 WHERE id = 9"),
+                T1("COMMIT", "→ committed: stock is now 7"),
+                T2("UPDATE items SET stock = 6 WHERE id = 9", "→ blind write, computed from T2's stale read of 10"),
+                T2("COMMIT", "→ committed: stock is now 6 — T1's −3 decrement is gone, only −4 survived")
+              ],
+              anomaly: true,
+              verdict: "Lost update. Read Committed lets T2's blind write proceed unconditionally — it never checks whether the row changed since T2 read it. Net effect should have been −7; it's −4."
+            },
+            rr: {
+              steps: [
+                T1("BEGIN"), T1("SELECT stock FROM items WHERE id = 9", "→ T1 sees 10, plans stock − 3 = 7"),
+                T2("BEGIN"), T2("SELECT stock FROM items WHERE id = 9", "→ T2 sees 10, plans stock − 4 = 6"),
+                T1("UPDATE items SET stock = 7 WHERE id = 9"),
+                T1("COMMIT", "→ committed: stock is now 7"),
+                T2("UPDATE items SET stock = 6 WHERE id = 9", "→ Postgres detects the row changed since T2's snapshot began"),
+                T2("ERROR: could not serialize access due to concurrent update", "→ T2's transaction is aborted; the application must retry it")
+              ],
+              anomaly: false,
+              verdict: "Prevented, via abort-and-retry. Postgres's Repeatable Read uses “first updater wins” for same-row conflicts: T2's write is rejected outright rather than silently overwriting T1's committed change."
+            },
+            ser: {
+              steps: [
+                T1("BEGIN"), T1("SELECT stock FROM items WHERE id = 9", "→ T1 sees 10, plans stock − 3 = 7"),
+                T2("BEGIN"), T2("SELECT stock FROM items WHERE id = 9", "→ T2 sees 10, plans stock − 4 = 6"),
+                T1("UPDATE items SET stock = 7 WHERE id = 9"),
+                T1("COMMIT", "→ committed: stock is now 7"),
+                T2("UPDATE items SET stock = 6 WHERE id = 9"),
+                T2("ERROR: could not serialize access due to concurrent update", "→ same outcome as Repeatable Read for this same-row case; T2 must retry")
+              ],
+              anomaly: false,
+              verdict: "Prevented, same mechanism as Repeatable Read — a direct same-row write conflict is already caught at RR, so Serializable's extra machinery isn't even needed here."
+            }
+          }
+        },
+        writeskew: {
+          label: "Write skew (disjoint rows)",
+          blurb: "Invariant: at least 1 of 2 on-call doctors must remain on call. Alice and Bob each independently request to go off call.",
+          levels: {
+            rc: {
+              steps: [
+                T1("BEGIN", "T1 = Alice's request"),
+                T1("SELECT count(*) FROM doctors WHERE on_call", "→ T1 sees 2 (Alice + Bob)"),
+                T2("BEGIN", "T2 = Bob's request"),
+                T2("SELECT count(*) FROM doctors WHERE on_call", "→ T2 sees 2 (Alice + Bob)"),
+                T1("count ≥ 2, so it's safe → UPDATE doctors SET on_call = false WHERE name = 'alice'"),
+                T2("count ≥ 2, so it's safe → UPDATE doctors SET on_call = false WHERE name = 'bob'"),
+                T1("COMMIT", "→ succeeds"),
+                T2("COMMIT", "→ succeeds — both doctors are now off call, invariant violated")
+              ],
+              anomaly: true,
+              verdict: "Write skew. Read Committed never even tries to track this — each read/write pair looks locally fine."
+            },
+            rr: {
+              steps: [
+                T1("BEGIN", "T1 = Alice's request — snapshot fixed here"),
+                T1("SELECT count(*) FROM doctors WHERE on_call", "→ T1 sees 2"),
+                T2("BEGIN", "T2 = Bob's request — separate snapshot fixed here"),
+                T2("SELECT count(*) FROM doctors WHERE on_call", "→ T2 sees 2, from its own snapshot"),
+                T1("count ≥ 2 → UPDATE doctors SET on_call = false WHERE name = 'alice'"),
+                T2("count ≥ 2 → UPDATE doctors SET on_call = false WHERE name = 'bob'", "→ different row than T1's write — no write-write conflict to detect"),
+                T1("COMMIT", "→ succeeds"),
+                T2("COMMIT", "→ ALSO succeeds — RR only checks conflicts on the *same* row, and these are different rows")
+              ],
+              anomaly: true,
+              verdict: "NOT prevented — this is the trap. Repeatable Read's snapshot isolation only guards same-row writes; two transactions reading a shared count and writing disjoint rows sail through untouched, even though together they broke the invariant."
+            },
+            ser: {
+              steps: [
+                T1("BEGIN", "T1 = Alice's request"),
+                T1("SELECT count(*) FROM doctors WHERE on_call", "→ T1 sees 2"),
+                T2("BEGIN", "T2 = Bob's request"),
+                T2("SELECT count(*) FROM doctors WHERE on_call", "→ T2 sees 2"),
+                T1("count ≥ 2 → UPDATE doctors SET on_call = false WHERE name = 'alice'"),
+                T2("count ≥ 2 → UPDATE doctors SET on_call = false WHERE name = 'bob'"),
+                T1("COMMIT", "→ succeeds"),
+                T2("COMMIT", "→ Postgres's Serializable Snapshot Isolation (SSI) detects the read/write dependency cycle between T1 and T2 and refuses this commit"),
+                SYS("ERROR: could not serialize access due to read/write dependencies among transactions", "→ T2 aborted; application retries, re-reads count = 1, correctly refuses to also take Bob off call")
+              ],
+              anomaly: false,
+              verdict: "Prevented. True Serializable (Postgres's SSI) tracks read/write dependencies across different rows, not just write/write conflicts on the same row — this is precisely the extra guarantee Repeatable Read doesn't give you."
+            }
+          }
+        }
+      };
+
+      var scenarioKey = "nonrep";
+      var levelKey = "rc";
+      var stepIndex = 0;
+
+      var scenarioTabs = document.getElementById("scenarioTabs");
+      var levelTabs = document.getElementById("levelTabs");
+      var scenarioBlurb = document.getElementById("scenarioBlurb");
+      var timelineEl = document.getElementById("timeline");
+      var stepBtn = document.getElementById("stepBtn");
+      var resetBtn = document.getElementById("resetBtn");
+      var stepProgress = document.getElementById("stepProgress");
+      var verdictEl = document.getElementById("verdict");
+
+      function currentRun() {
+        return SCENARIOS[scenarioKey].levels[levelKey];
+      }
+
+      function renderTabs() {
+        scenarioTabs.innerHTML = "";
+        Object.keys(SCENARIOS).forEach(function (key) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "stage-tab" + (key === scenarioKey ? " active" : "");
+          b.textContent = SCENARIOS[key].label;
+          b.addEventListener("click", function () {
+            scenarioKey = key;
+            stepIndex = 0;
+            renderAll();
+          });
+          scenarioTabs.appendChild(b);
+        });
+
+        levelTabs.innerHTML = "";
+        LEVELS.forEach(function (lvl) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "level-tab" + (lvl.key === levelKey ? " active" : "");
+          b.textContent = lvl.label;
+          b.addEventListener("click", function () {
+            levelKey = lvl.key;
+            stepIndex = 0;
+            renderAll();
+          });
+          levelTabs.appendChild(b);
+        });
+      }
+
+      function renderTimeline() {
+        var run = currentRun();
+        timelineEl.innerHTML = "";
+        run.steps.forEach(function (step, i) {
+          var el = document.createElement("li");
+          el.className = step.cls + (i < stepIndex ? " revealed" : "");
+          el.innerHTML = '<span class="actor-tag">' + step.tag + "</span><span>" + step.html + "</span>";
+          timelineEl.appendChild(el);
+        });
+
+        var total = run.steps.length;
+        stepProgress.textContent = "Step " + Math.min(stepIndex, total) + " of " + total;
+        stepBtn.disabled = stepIndex >= total;
+        stepBtn.textContent = stepIndex >= total ? "Done" : "Step →";
+
+        if (stepIndex >= total) {
+          verdictEl.hidden = false;
+          verdictEl.className = "verdict-box " + (run.anomaly ? "bad" : "ok");
+          verdictEl.textContent = (run.anomaly ? "✗ " : "✓ ") + run.verdict;
+        } else {
+          verdictEl.hidden = true;
+        }
+      }
+
+      function renderAll() {
+        renderTabs();
+        scenarioBlurb.textContent = SCENARIOS[scenarioKey].blurb;
+        renderTimeline();
+      }
+
+      stepBtn.addEventListener("click", function () {
+        var total = currentRun().steps.length;
+        if (stepIndex < total) {
+          stepIndex++;
+          renderTimeline();
+        }
+      });
+      resetBtn.addEventListener("click", function () {
+        stepIndex = 0;
+        renderTimeline();
+      });
+
+      renderAll();
+
+      /* ---------------- Quiz ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
