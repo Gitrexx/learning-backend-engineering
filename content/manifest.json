@@ -110,7 +110,7 @@
       "summary": "Key-value, document, wide-column, graph — their models, and choosing from access patterns not hype.",
       "prerequisites": ["relational-data-modeling"],
       "file": "nosql-and-data-stores.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "caching-strategies",
