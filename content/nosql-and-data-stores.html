@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NoSQL &amp; Choosing a Data Store — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the "match the workload to the store" widget only. */
+    .game-progress {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--text-faint); margin-bottom: var(--sp-3);
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-2);
+    }
+    .game-score { color: var(--accent-strong); font-weight: 700; }
+    .scenario-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4);
+    }
+    .scenario-card h4 { margin: 0 0 var(--sp-2); color: var(--text); }
+    .scenario-card p { margin: 0; font-size: var(--fs-sm); }
+    .family-row {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: var(--sp-2); margin-bottom: var(--sp-4);
+    }
+    .family-btn {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.65em 0.8em; border-radius: var(--radius); border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s, transform .05s;
+    }
+    .family-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .family-btn:active:not(:disabled) { transform: translateY(1px); }
+    .family-btn:disabled { cursor: default; opacity: 0.55; }
+    .family-btn.correct { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    .family-btn.incorrect { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .verdict-panel { margin-top: var(--sp-4); display: grid; gap: var(--sp-3); }
+    .verdict-panel[hidden] { display: none; }
+    .verdict-note {
+      padding: var(--sp-3) var(--sp-4); border-radius: var(--radius); border-left: 4px solid var(--border-strong);
+      background: var(--surface-2); font-size: var(--fs-sm);
+    }
+    .verdict-note.your-pick.right { border-left-color: var(--ok); }
+    .verdict-note.your-pick.wrong { border-left-color: var(--danger); }
+    .verdict-note.correct-answer { border-left-color: var(--accent); }
+    .verdict-note .verdict-label {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow); text-transform: uppercase;
+      letter-spacing: 0.06em; font-weight: 700; display: block; margin-bottom: 0.35em; color: var(--text-faint);
+    }
+    .game-nav { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-4); flex-wrap: wrap; }
+    .game-final {
+      text-align: center; padding: var(--sp-5); font-size: var(--fs-md); font-weight: 700;
+    }
+    .game-final[hidden] { display: none; }
+    .game-final .big-score { font-size: var(--fs-2xl); color: var(--accent-strong); display: block; margin-bottom: var(--sp-2); }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 05</p>
+    <h1>NoSQL &amp; Choosing a Data Store</h1>
+
+    <p>
+      Every deep-dive in this section so far has quietly assumed one storage model: rows, columns,
+      foreign keys, joins. That model is extremely good at what it's good at — but "the relational
+      database" was never the only answer, and the last two decades produced an entire family of
+      stores built by companies that hit a specific wall the relational model doesn't handle well:
+      Amazon's Dynamo paper (2007) came from needing a shopping cart that stays writable even during
+      a network partition; Google's Bigtable paper (2006) came from needing to store the entire
+      crawled web, sparse and sharded across thousands of machines. Neither problem is "we don't like
+      SQL" — both are "our access pattern and our scale don't fit a single-machine, row-oriented,
+      strongly-consistent design." That's the right frame for this whole page: NoSQL isn't a
+      replacement for relational databases, it's a set of <em>other</em> data models, each one a
+      deliberate trade of something relational databases give you (joins, ad hoc queries, multi-row
+      transactions) for something else (horizontal scale, write throughput, schema flexibility, a
+      shape that matches one specific access pattern exactly). Picking one without knowing which
+      trade you're making is how "we went NoSQL for scale" becomes "we went NoSQL and now nobody can
+      answer a simple cross-entity question without three round trips."
+    </p>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>"NoSQL" is a marketing-era umbrella term, not a technical category — the more accurate
+        (if clunkier) name that stuck in some circles is <strong>"not only SQL."</strong> The useful
+        unit of analysis isn't "SQL vs. NoSQL," it's the specific <em>data model</em> a store
+        commits to, because that's what determines which access patterns it's fast at and which
+        ones it's actively bad at. This page covers four families.</p>
+      </div>
+    </div>
+
+    <h2>The four data-model families</h2>
+    <p>
+      Every NoSQL store you'll meet in production is built around one of these four data models
+      (some, like Cosmos DB, offer more than one through different APIs on the same engine — but the
+      underlying model per API is still one of these four).
+    </p>
+
+    <h3>Key-value</h3>
+    <p>
+      The simplest possible model: an opaque key maps to an opaque value. The store has no idea
+      what's inside the value — it's a blob to <code>GET</code>, <code>SET</code>, or
+      <code>DELETE</code> by key. No query language, no secondary indexes (in the purest form), no
+      schema.
+    </p>
+    <dl class="definition">
+      <dt>Access pattern it's built for</dt>
+      <dd>Point lookups by a known key, at extreme low latency and extreme scale. If your query is
+        always "give me the thing with ID X," a key-value store does it about as fast as physically
+        possible — often sub-millisecond, in-memory.</dd>
+      <dt>Examples</dt>
+      <dd><strong>Redis</strong> and <strong>Memcached</strong> (in-memory, often used as a cache —
+        see the next deep-dive), <strong>DynamoDB</strong> and <strong>Riak</strong> (durable,
+        partitioned, key-value at the core, with some secondary-index bolt-ons).</dd>
+      <dt>Where it breaks down</dt>
+      <dd>The moment you need to ask "which values have field <code>X</code> equal to <code>Y</code>"
+        without knowing the key. A pure key-value store can't answer that without scanning every
+        value client-side — you have to build your own secondary index (e.g. a second key-value
+        entry mapping <code>X → key</code>) and keep it in sync yourself.</dd>
+    </dl>
+
+    <h3>Document</h3>
+    <p>
+      A step up in structure: values are semi-structured documents (JSON/BSON in practice), and the
+      store <em>does</em> understand the internal structure well enough to query and index into
+      nested fields, not just the top-level key.
+    </p>
+    <dl class="definition">
+      <dt>Access pattern it's built for</dt>
+      <dd>"Fetch (or query) one aggregate whose shape varies between records and changes over time" —
+        a user profile, a product listing, a CMS article with an arbitrary set of custom fields.
+        Read patterns that want the whole nested object back in one round trip, without a join.</dd>
+      <dt>Examples</dt>
+      <dd><strong>MongoDB</strong>, <strong>Firestore</strong>, <strong>Couchbase</strong>. Several
+        relational databases (Postgres's <code>JSONB</code>, MySQL's <code>JSON</code> type) now
+        embed a document model as a column type — a sign of how blurry this line has gotten.</dd>
+      <dt>Where it breaks down</dt>
+      <dd>Multi-document, ad hoc, relational-style querying across different document types —
+        "join" is either unsupported, expensive, or an application-side fan-out of multiple queries.
+        And schema flexibility is a double-edged sword: nothing stops five services from writing
+        five subtly different shapes of "the same" document unless you add your own validation
+        layer.</dd>
+    </dl>
+
+    <h3>Wide-column (column-family)</h3>
+    <p>
+      Rows are grouped under a <span class="term">partition key</span>, and within a partition,
+      data is physically sorted by a <span class="term">clustering (sort) key</span> — so a row can
+      have an effectively unbounded, sparse set of columns, and the store is built to write huge
+      volumes fast and scan a bounded range within one partition efficiently.
+    </p>
+    <dl class="definition">
+      <dt>Access pattern it's built for</dt>
+      <dd>Extremely high write volume, queried by <code>(partition key, sort-key range)</code> —
+        time-series, event logs, IoT telemetry, messaging history. "Give me everything for partition
+        P between time T1 and T2," known in advance, is the query this model is built around;
+        anything not indexed by the partition key requires a full scatter-gather across the whole
+        cluster.</dd>
+      <dt>Examples</dt>
+      <dd><strong>Cassandra</strong>, <strong>HBase</strong>, <strong>Google Bigtable</strong>. Most
+        of these are LSM-tree-backed under the hood — worth reconnecting to the <em>Indexes &amp;
+        Storage Engines</em> deep-dive: the reason wide-column stores absorb huge write volume is
+        the same LSM write path (sequential append to a memtable, flush to sorted files, merge later
+        in the background) covered there. This isn't a coincidence — the storage engine and the data
+        model co-evolved to serve the same workload.</dd>
+      <dt>Where it breaks down</dt>
+      <dd>Any query that doesn't start from the partition key becomes a full-cluster scan — there is
+        no free-form <code>WHERE</code> on a non-key column the way a relational index gives you.
+        You must know your access patterns <em>before</em> you design the table, because the
+        partition/sort key choice <em>is</em> the query plan.</dd>
+    </dl>
+
+    <h3>Graph</h3>
+    <p>
+      Data is modeled explicitly as nodes and edges (often with properties on both), and the engine
+      is built to traverse relationships — not to look them up by scanning join tables, but to walk
+      pointers directly from node to node.
+    </p>
+    <dl class="definition">
+      <dt>Access pattern it's built for</dt>
+      <dd>Multi-hop relationship traversal: "friends of friends," shortest path, recommendation via
+        shared connections, fraud rings via shared attributes. Called <span class="term">index-free
+        adjacency</span> — each node stores direct pointers to its neighbors, so hopping from one
+        node to the next is <code>O(1)</code> regardless of how many total nodes are in the graph,
+        instead of an index lookup (or worse, a join) per hop.</dd>
+      <dt>Examples</dt>
+      <dd><strong>Neo4j</strong> (property graph, Cypher query language), <strong>Amazon
+        Neptune</strong> (property graph or RDF), <strong>ArangoDB</strong> (multi-model, graph
+        included).</dd>
+      <dt>Where it breaks down</dt>
+      <dd>Bulk analytical scans over the whole dataset, or high-volume simple key lookups — graph
+        engines are optimized for traversal depth, not for "aggregate this column across ten million
+        rows," which a wide-column or columnar analytical store does far better.</dd>
+    </dl>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">And relational is still one of the options</span>
+      <div class="callout-body">
+        <p>It's worth saying plainly: the relational model from the earlier deep-dives — rows,
+        normalized tables, joins, multi-row ACID transactions — is not "the old way" that NoSQL
+        superseded. It's the right answer whenever the access pattern genuinely needs ad hoc,
+        unpredictable joins across entities, or an all-or-nothing transaction spanning multiple
+        records. The rest of this page is about recognizing when it <em>isn't</em> the best fit —
+        not about assuming it never is.</p>
+      </div>
+    </div>
+
+    <h2>What you give up, precisely</h2>
+    <p>
+      None of the four families above are "the relational model minus limitations" — they are
+      different trades, and naming the trade precisely is what lets you reason about it instead of
+      guessing.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Give up</th><th>What that costs you in practice</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Ad hoc joins</td>
+            <td>A question you didn't anticipate at design time ("which customers in city X bought
+              product Y last month") is cheap in a relational store with the right indexes, and
+              often outright unsupported — or an expensive application-side fan-out — in the other
+              three families. You're trading query flexibility for the performance of the queries
+              you <em>did</em> design for.</td>
+          </tr>
+          <tr>
+            <td>Multi-record ACID transactions</td>
+            <td>Recall from <em>Transactions, ACID &amp; Isolation Levels</em>: atomicity across
+              multiple rows is what stops "payment succeeded, inventory update failed" from leaving
+              visible garbage. Most NoSQL stores guarantee atomicity only <em>within</em> one
+              key/document/partition — some now offer limited multi-item transactions (DynamoDB
+              transactions, MongoDB multi-document transactions), but at a real latency and
+              throughput cost, because it works against the store's whole scale-out design.</td>
+          </tr>
+          <tr>
+            <td>Enforced schema</td>
+            <td>Flexibility to change shape without a migration cuts both ways — nothing stops
+              inconsistent shapes from accumulating in production unless the application layer
+              enforces one. "Schemaless" moves validation from the database to your code; it doesn't
+              remove the need for it.</td>
+          </tr>
+          <tr>
+            <td>A single, simple consistency story</td>
+            <td>Many of these stores are built to keep writing during a network partition by
+              replicating across nodes with weaker consistency guarantees than a single-node
+              relational database's default. That's a deliberate, useful trade for availability —
+              and it's deep enough to be its own deep-dive later (<em>Consistency Models, CAP &amp;
+              Consensus</em>); the short version here is: distributed NoSQL stores generally make you
+              reason explicitly about staleness in a way a single-node relational database doesn't
+              force on you by default.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Choosing from access patterns, not hype</h2>
+    <p>
+      "We're at scale, so we need NoSQL" is usually the wrong reasoning chain — plenty of relational
+      databases handle tens of thousands of writes per second with the right sharding and indexing,
+      and plenty of NoSQL migrations have made a system <em>worse</em> because the access pattern
+      needed joins the team didn't realize they'd need until reporting requirements showed up six
+      months later. The right chain starts from the query, not the database:
+    </p>
+    <ol>
+      <li><strong>Write down your top 3–5 access patterns first</strong> — the literal queries the
+        application will run, with roughly what fraction of traffic each one is. If you can't name
+        them, you don't yet know enough to pick a store.</li>
+      <li><strong>Do any of them need a transaction spanning multiple records?</strong> If yes,
+        that's a strong pull toward relational (or a NoSQL store's limited multi-item transaction
+        feature, accepting the cost).</li>
+      <li><strong>Do any of them need an unpredictable join</strong> — a query shape that wasn't
+        fixed at design time, especially for reporting/analytics? Relational (or a
+        purpose-built analytical/columnar store) usually wins here.</li>
+      <li><strong>Is the dominant pattern "huge write volume, known key + range query"?</strong>
+        Wide-column is built exactly for this.</li>
+      <li><strong>Is the dominant pattern "fetch one variably-shaped aggregate by ID"?</strong>
+        Document fits, especially if the shape changes often.</li>
+      <li><strong>Is the dominant pattern "point lookup by exact key, extreme latency floor"?</strong>
+        Key-value fits — and often sits in front of whichever store above as a cache (next
+        deep-dive).</li>
+      <li><strong>Is the dominant pattern "traverse relationships several hops deep"?</strong> Graph
+        fits, and nothing else comes close once you're past 2–3 hops.</li>
+    </ol>
+    <div class="callout pitfall">
+      <span class="callout-icon">✕</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>"Our schema changes sometimes" is <em>not</em> the same access pattern as "our schema is
+        fundamentally unknowable per record." A bounded, well-understood set of ~50 attributes that
+        occasionally gets a new column is a completely normal relational migration — reach for a
+        document store's flexibility only when different records genuinely need structurally
+        different shapes <em>at read time</em>, not just because "schema changes" sounds like a
+        NoSQL keyword.</p>
+      </div>
+    </div>
+
+    <h2>The trap: schemaless doesn't mean model-less</h2>
+    <p>
+      This is the part teams miss most often when they move fast into a document or wide-column
+      store: you still have to design for your access patterns — the modeling effort from
+      <em>Relational Data Modeling</em> doesn't disappear, it moves. In a relational database you
+      normalize first and let joins reassemble data for whatever query shows up later. In a document
+      or wide-column store, there usually is no cheap join, so you model by <strong>denormalizing on
+      purpose, toward the queries you already know you'll run</strong> — the opposite instinct from
+      normalization, and just as deliberate:
+    </p>
+    <ul>
+      <li><strong>Embed</strong> data that's always read together into one document (a blog post
+        embedding its comments) — trading update cost (editing an embedded comment means rewriting
+        part of the parent document) for read cost (one fetch instead of a join).</li>
+      <li><strong>Reference</strong> (store an ID, fetch separately) data that's large, updated
+        independently, or shared across many parents — trading a second round trip for not
+        duplicating or bloating the primary document.</li>
+      <li>In wide-column stores this goes further: it's common and correct to store the
+        <em>same data twice</em>, once per access pattern, each copy keyed and sorted for one
+        specific query — DynamoDB's "single-table design" is this taken to its logical extreme,
+        deliberately duplicating data across item types so every one of the app's known queries is a
+        single partition read.</li>
+    </ul>
+    <p>
+      None of this is a workaround or a hack — it's the actual design skill this data model demands,
+      and skipping it (treating a document store like "a relational table but schema-optional") is
+      exactly how teams end up doing joins in application code, one document at a time, and wondering
+      why it's slow.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — match the workload to the store</div>
+      <p class="scenario-blurb" style="font-size: var(--fs-sm); color: var(--text-muted); margin: 0 0 var(--sp-4);">
+        Six real access-pattern descriptions. For each, pick the data-model family that fits best —
+        then see the reasoning for every option, including why the trap answers look tempting.
+      </p>
+
+      <div class="game-progress">
+        <span id="gameProgressText">Scenario 1 of 6</span>
+        <span class="game-score">Score: <span id="gameScoreText">0 / 0</span></span>
+      </div>
+
+      <div class="scenario-card">
+        <h4 id="scenarioTitle"></h4>
+        <p id="scenarioPrompt"></p>
+      </div>
+
+      <div class="family-row" id="familyRow"></div>
+
+      <div class="verdict-panel" id="verdictPanel" hidden></div>
+
+      <div class="game-nav">
+        <button class="btn" id="nextScenarioBtn" hidden>Next scenario →</button>
+        <button class="btn secondary" id="restartGameBtn" hidden>Restart</button>
+      </div>
+
+      <div class="game-final" id="gameFinal" hidden>
+        <span class="big-score" id="gameFinalScore"></span>
+        <span id="gameFinalMsg"></span>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge: polyglot persistence in a feature platform</span>
+      <div class="callout-body">
+        <p>A production feature store is rarely one database — it's usually two or three of these
+        families deliberately combined, exactly the "polyglot persistence" pattern this page
+        argues for. The <strong>offline store</strong> (historical features for training) is
+        typically wide-column or a columnar file format on object storage — huge write volume from
+        pipelines, queried by entity + time range, exactly the wide-column access pattern. The
+        <strong>online store</strong> (features for real-time inference) is typically key-value —
+        Redis or DynamoDB — because inference needs a point lookup by entity ID under a strict
+        latency budget, and nothing else fits that shape as well. <strong>Vector databases</strong>
+        (Pinecone, pgvector, Milvus) are a newer, ML-specific fifth family worth naming here: they
+        index embeddings for approximate nearest-neighbor search — a genuinely different access
+        pattern (similarity, not equality or range) from all four families above, which is exactly
+        why they exist as their own category rather than bolting onto one of the others. "Why does
+        our ML platform have four different databases" is this exact reasoning, made concrete.</p>
+      </div>
+    </div>
+
+    <h2>Polyglot persistence, and its own cost</h2>
+    <p>
+      Using several stores in one system — Postgres for the transactional core, Redis for hot-path
+      caching, Elasticsearch for full-text search, Cassandra for event history — lets every access
+      pattern sit on the store built for it. The cost is operational: every extra store is another
+      thing to run, monitor, back up, and keep roughly in sync (usually via change-data-capture or
+      an event stream — a preview of the <em>Messaging, Queues &amp; Event-Driven Architecture</em>
+      deep-dive later in this roadmap), and every sync path is a place staleness can creep in between
+      stores. The rule of thumb: add a second store when a specific access pattern is genuinely
+      failing on your primary one, not preemptively "for scale" — every store you add has to earn
+      its operational cost.
+    </p>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A team picks a document database for a new service mainly "because
+          NoSQL scales better." Three months later, finance needs ad hoc joins across orders,
+          customers, and refunds for reporting, and the team is writing this in application code as
+          multiple sequential queries. What was the modeling mistake?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Document databases can't scale — they should have picked wide-column instead.</button>
+          <button class="quiz-option" data-choice="b">There was no mistake; this is a normal, unavoidable cost of any NoSQL store.</button>
+          <button class="quiz-option" data-choice="c">The access patterns weren't written down first. Unpredictable, ad hoc cross-entity joins are exactly the pattern a document store is weak at and a relational store is built for — the store was chosen by reputation ("NoSQL scales") instead of by the actual query shape needed.</button>
+        </div>
+        <p class="quiz-explain" hidden>The core lesson of this page: start from the top access patterns, not from "which database is trendy right now." Ad hoc, unplanned joins across entities is the single strongest signal to reach for a relational database (or a dedicated analytical store), regardless of scale.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. A time-series workload writes 200,000 sensor readings/second and is
+          almost always queried as "sensor_id + a time range." Which data-model family fits, and
+          why?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Graph — because sensors form a network of relationships to traverse.</button>
+          <button class="quiz-option" data-choice="b">Wide-column — partition by sensor_id, cluster (sort) by time, so both the huge sequential write volume and the range-scan read pattern land exactly on what the model (and its usual LSM-backed storage engine) is built for.</button>
+          <button class="quiz-option" data-choice="c">Key-value — because sensor_id is a key, so any store with a key is fine.</button>
+        </div>
+        <p class="quiz-explain" hidden>Wide-column stores are purpose-built for "huge write volume, query by partition key + a sorted range" — precisely this workload. A key-value store loses the ability to range-scan by time efficiently, since it only supports exact-key lookups.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. Why is "schemaless doesn't mean model-less" the central design
+          discipline for document and wide-column stores?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Because without a join engine to reassemble normalized data at query time, you must deliberately denormalize — embedding or duplicating data — toward the specific access patterns you'll query, or every query becomes an expensive application-side fan-out.</button>
+          <button class="quiz-option" data-choice="b">Because these databases silently reject documents that don't match a fixed schema, so you must define one anyway.</button>
+          <button class="quiz-option" data-choice="c">It isn't true in practice — flexible-schema stores never need any data modeling.</button>
+        </div>
+        <p class="quiz-explain" hidden>Relational normalization defers the "how do I reassemble this for a query" decision to join time. Document and wide-column stores generally don't have a cheap equivalent, so that decision has to be made up front, by denormalizing (embedding, referencing deliberately, or even storing the same data multiple times per access pattern) toward the queries you already know you need.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Choosing the right store for an access pattern solves the "where does the data live"
+      question — but even the right store has a latency floor, and the cheapest way to beat it is
+      often to not query it at all. The next deep-dive, <em>Caching Strategies</em>, covers exactly
+      that: cache-aside vs. write-through, why invalidation is the genuinely hard part, and the
+      thundering-herd failure mode that shows up the moment a cache — any cache, in front of any
+      store from this page — goes cold all at once.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var FAMILY_LABELS = { kv: "Key-Value", doc: "Document", wide: "Wide-Column", graph: "Graph", rel: "Relational" };
+      var FAMILY_ORDER = ["kv", "doc", "wide", "graph", "rel"];
+
+      var SCENARIOS = [
+        {
+          title: "Web session store",
+          prompt: "Every login writes a session blob keyed by a random session ID. Reads and writes are always by that exact key, need single-digit-millisecond latency, and a session should expire automatically after 30 minutes whether or not anyone deletes it.",
+          best: "kv",
+          notes: {
+            kv: "Right fit. Single-key lookup, no query language needed, and TTL expiry is often a first-class feature (Redis EXPIRE, DynamoDB TTL). This is the canonical key-value workload.",
+            doc: "Overkill. You'd get the lookup, but you're paying for a richer query engine and storage format you'll never use — nobody runs a query across session blobs by nested field.",
+            wide: "Wrong shape. Wide-column stores are built for huge datasets scanned by a partition key over sorted ranges; a session store is pure point-by-key lookup, not a range scan.",
+            graph: "Wrong tool entirely — there's no relationship between sessions to traverse.",
+            rel: "Works, but brings transactional and join machinery a session table never uses, and horizontal write scaling is harder than a store built specifically for this."
+          }
+        },
+        {
+          title: "User profile service",
+          prompt: "Each user profile has a bio, 0–5 addresses, and a notification-preferences object whose fields depend on which feature flags are on for that user. You almost always read the whole profile in one request by user ID, and the shape has changed four times this year as features shipped.",
+          best: "doc",
+          notes: {
+            kv: "Partial fit — you could store the whole profile as one JSON blob under the user ID, and point reads would work. But you lose the ability to query into nested fields (e.g. 'users in city X') without bolting on your own secondary index.",
+            doc: "Right fit. Nested, variable-shape data read whole by ID, with a shape that keeps evolving — exactly what a document model handles without a migration per change.",
+            wide: "Wrong shape — there's no high-volume range-scan-by-time pattern here, just point reads of a nested aggregate.",
+            graph: "Wrong tool — profiles aren't primarily being traversed as a relationship graph here.",
+            rel: "Possible — most relational engines now bolt on a JSON column for exactly this — but four schema changes in a year for optional nested structure is the churn pattern a document store's flexible default fits more naturally."
+          }
+        },
+        {
+          title: "IoT sensor ingestion",
+          prompt: "500,000 sensors each write a reading once a second. Queries are always 'sensor_id + a time range' (e.g. sensor 4471's last 24 hours), past readings are essentially never updated, and data older than 90 days is deleted in bulk.",
+          best: "wide",
+          notes: {
+            kv: "Doesn't fit — a single key per reading loses the ability to range-scan by time efficiently; you'd need to fetch every key or build your own range index on top.",
+            doc: "Works in a pinch, but the sustained per-second write volume plus wide time-range scans plays exactly to wide-column's partition-key + sorted-clustering-key design.",
+            wide: "Right fit. Partition by sensor_id, cluster by time — the write path is a sequential append (often LSM-backed, see the indexing deep-dive) built for exactly this volume, and the read path is a bounded range scan within one partition.",
+            graph: "Wrong tool — there's no relationship traversal here, just append-and-range-scan.",
+            rel: "A B-tree-backed relational database can do this, but sustained high-volume sequential inserts plus range scans at this rate is the textbook wide-column/LSM workload — you'd fight write amplification at this volume."
+          }
+        },
+        {
+          title: "Social graph traversal",
+          prompt: "Given a user, find friends-of-friends who aren't already friends, and compute the shortest connection path between two arbitrary users — several hops deep, in real time.",
+          best: "graph",
+          notes: {
+            kv: "Wrong tool — no traversal capability at all beyond a single lookup.",
+            doc: "You could store an adjacency list per user as a document, but a 3+ hop traversal becomes N sequential lookups or an expensive application-side breadth-first search.",
+            wide: "Wrong tool — wide-column is built for range scans by partition key, not multi-hop relationship walks.",
+            graph: "Right fit. Index-free adjacency means each hop follows a direct pointer, O(1) per hop regardless of total graph size — this is exactly the traversal-depth problem graph databases exist to solve.",
+            rel: "Possible with recursive CTEs or repeated self-joins, and fine for 1–2 hops — but performance degrades fast past that, which is precisely why native graph engines exist."
+          }
+        },
+        {
+          title: "Order & payment transaction",
+          prompt: "Placing an order must atomically deduct inventory, create an order record, and charge a payment — all-or-nothing, with no partial state ever visible to another request. Finance also runs ad hoc joins across orders, customers, and products for reporting.",
+          best: "rel",
+          notes: {
+            kv: "No native multi-key ACID transaction, and no join engine at all for the reporting side.",
+            doc: "Some document stores now support limited multi-document transactions, but at a real performance cost, and there's still no ad hoc join engine for finance's reporting queries.",
+            wide: "Wide-column stores generally guarantee atomicity only within one partition — a cross-entity, all-or-nothing transaction like this fights the model directly.",
+            graph: "Wrong tool for this — the requirement is transactional integrity and reporting joins, not relationship traversal.",
+            rel: "Right fit. Multi-row ACID transactions and an ad hoc join engine are exactly what's required here — this is the case where relational is the correct answer, not the legacy one."
+          }
+        },
+        {
+          title: "Product catalog filtering",
+          prompt: "Shoppers filter a catalog by any combination of price range, brand, category, and rating. The catalog has about 50 well-known attributes total, updated by a nightly batch job, and is read far more than it's written.",
+          best: "rel",
+          notes: {
+            kv: "Wrong tool — no multi-attribute filtering is possible without a full scan.",
+            doc: "Tempting because not every product shares every attribute, but multi-attribute ad hoc filtering across a known, bounded attribute set is exactly what indexes (relational or a dedicated search engine) provide — a document store doesn't give you cross-field filtering for free any more than a relational table does.",
+            wide: "Wrong shape — this is multi-attribute filtering, not a partition-key + range-scan pattern.",
+            graph: "Wrong tool — there's no relationship being traversed here.",
+            rel: "Right fit (or a dedicated search index as a close cousin). A bounded, well-understood attribute set with heavy reads and light, batched writes is a relational/search-indexing problem — 'the schema changes sometimes' isn't the same access pattern as 'the schema is unknowable per record.'"
+          }
+        }
+      ];
+
+      var idx = 0;
+      var correctCount = 0;
+      var attempted = 0;
+      var answeredThis = false;
+
+      var progressText = document.getElementById("gameProgressText");
+      var scoreText = document.getElementById("gameScoreText");
+      var titleEl = document.getElementById("scenarioTitle");
+      var promptEl = document.getElementById("scenarioPrompt");
+      var familyRow = document.getElementById("familyRow");
+      var verdictPanel = document.getElementById("verdictPanel");
+      var nextBtn = document.getElementById("nextScenarioBtn");
+      var restartBtn = document.getElementById("restartGameBtn");
+      var gameFinal = document.getElementById("gameFinal");
+      var finalScore = document.getElementById("gameFinalScore");
+      var finalMsg = document.getElementById("gameFinalMsg");
+      var widgetBody = document.querySelector(".widget");
+
+      function renderScenario() {
+        answeredThis = false;
+        verdictPanel.hidden = true;
+        verdictPanel.innerHTML = "";
+        nextBtn.hidden = true;
+        gameFinal.hidden = true;
+        progressText.textContent = "Scenario " + (idx + 1) + " of " + SCENARIOS.length;
+        scoreText.textContent = correctCount + " / " + attempted;
+
+        var s = SCENARIOS[idx];
+        titleEl.textContent = s.title;
+        promptEl.textContent = s.prompt;
+
+        familyRow.innerHTML = "";
+        FAMILY_ORDER.forEach(function (key) {
+          var btn = document.createElement("button");
+          btn.className = "family-btn";
+          btn.textContent = FAMILY_LABELS[key];
+          btn.dataset.choice = key;
+          btn.addEventListener("click", function () { onChoose(key); });
+          familyRow.appendChild(btn);
+        });
+      }
+
+      function onChoose(choiceKey) {
+        if (answeredThis) return;
+        answeredThis = true;
+        attempted++;
+        var s = SCENARIOS[idx];
+        var isCorrect = choiceKey === s.best;
+        if (isCorrect) correctCount++;
+
+        var buttons = familyRow.querySelectorAll(".family-btn");
+        buttons.forEach(function (btn) {
+          btn.disabled = true;
+          if (btn.dataset.choice === s.best) btn.classList.add("correct");
+          else if (btn.dataset.choice === choiceKey) btn.classList.add("incorrect");
+        });
+
+        var html = "";
+        html += '<div class="verdict-note your-pick ' + (isCorrect ? "right" : "wrong") + '">' +
+          '<span class="verdict-label">Your pick — ' + FAMILY_LABELS[choiceKey] + (isCorrect ? " ✓" : " ✕") + '</span>' +
+          "<p style='margin:0;'>" + s.notes[choiceKey] + "</p></div>";
+        if (!isCorrect) {
+          html += '<div class="verdict-note correct-answer">' +
+            '<span class="verdict-label">Best fit — ' + FAMILY_LABELS[s.best] + '</span>' +
+            "<p style='margin:0;'>" + s.notes[s.best] + "</p></div>";
+        }
+        verdictPanel.innerHTML = html;
+        verdictPanel.hidden = false;
+
+        scoreText.textContent = correctCount + " / " + attempted;
+
+        if (idx < SCENARIOS.length - 1) {
+          nextBtn.hidden = false;
+        } else {
+          showFinal();
+        }
+      }
+
+      function showFinal() {
+        finalScore.textContent = correctCount + " / " + SCENARIOS.length;
+        var pct = correctCount / SCENARIOS.length;
+        var msg;
+        if (pct === 1) msg = "Every access pattern matched to its right store. That's the whole skill on this page.";
+        else if (pct >= 0.66) msg = "Solid instincts — re-read the notes on the ones you missed; the trap answers are the point.";
+        else msg = "Worth another pass — re-read the family notes above, then try again. The trap scenarios (5 and 6) are deliberately tempting.";
+        finalMsg.textContent = msg;
+        gameFinal.hidden = false;
+        restartBtn.hidden = false;
+      }
+
+      nextBtn.addEventListener("click", function () {
+        idx++;
+        renderScenario();
+      });
+
+      restartBtn.addEventListener("click", function () {
+        idx = 0;
+        correctCount = 0;
+        attempted = 0;
+        restartBtn.hidden = true;
+        renderScenario();
+      });
+
+      renderScenario();
+
+      /* ---------------- Quiz ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
