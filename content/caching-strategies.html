@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Caching Strategies — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the cache-stampede simulator widget only. */
+    .sim-controls {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--sp-4); margin-bottom: var(--sp-4);
+    }
+    .sim-control label {
+      display: block; font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint);
+      margin-bottom: var(--sp-2);
+    }
+    .sim-control .sim-value { color: var(--accent-strong); font-weight: 700; text-transform: none; letter-spacing: 0; }
+    .sim-toggles { display: flex; gap: var(--sp-5); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+    .sim-toggle { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); cursor: pointer; }
+    .sim-toggle input { accent-color: var(--accent); width: 1.1em; height: 1.1em; }
+    .sim-actions { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-5); flex-wrap: wrap; }
+    .sim-chart {
+      position: relative;
+      height: 180px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--sp-3);
+      display: flex; align-items: flex-end; gap: 2px;
+      margin-bottom: var(--sp-2);
+      overflow: hidden;
+    }
+    .sim-bar {
+      flex: 1 1 auto;
+      min-width: 3px;
+      background: var(--accent);
+      border-radius: 2px 2px 0 0;
+      transition: height 0.12s linear, background-color 0.12s linear;
+    }
+    .sim-bar.over { background: var(--danger); }
+    .sim-capacity-line {
+      position: absolute;
+      left: var(--sp-3); right: var(--sp-3);
+      border-top: 2px dashed var(--warn);
+      pointer-events: none;
+    }
+    .sim-capacity-label {
+      position: absolute;
+      right: var(--sp-3);
+      transform: translateY(-100%);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--warn);
+      background: var(--surface);
+      padding: 0 0.3em;
+    }
+    .sim-chart-caption {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-faint);
+      text-align: center; margin: 0 0 var(--sp-5);
+    }
+    .sim-stats {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: var(--sp-3);
+    }
+    .sim-stat {
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-3) var(--sp-4); text-align: center;
+    }
+    .sim-stat .n { display: block; font-size: var(--fs-lg); font-weight: 700; color: var(--accent-strong); font-family: var(--font-mono); }
+    .sim-stat .l { font-size: var(--fs-eyebrow); text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); }
+    .sim-stat.warn .n { color: var(--danger); }
+    .sim-verdict {
+      margin-top: var(--sp-4); padding: var(--sp-3) var(--sp-4); border-radius: var(--radius);
+      border-left: 4px solid var(--border-strong); background: var(--surface-2); font-size: var(--fs-sm);
+    }
+    .sim-verdict.good { border-left-color: var(--ok); }
+    .sim-verdict.bad { border-left-color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">DATA &amp; DATABASES // 06</p>
+    <h1>Caching Strategies</h1>
+
+    <p>
+      Every deep-dive so far in this section has been about making the backing store itself faster —
+      better schemas, better indexes, the right data model. Caching is a different move entirely: it's
+      about <em>not asking the backing store at all</em>. A cache is a copy of data, kept somewhere
+      faster to reach than its source of truth, on the bet that the same data will be wanted again soon.
+      Done well, it's the single cheapest latency win available to a backend engineer — often turning a
+      10ms database round trip into a 0.1ms memory lookup. Done carelessly, it's also one of the more
+      reliable ways to serve a user data that's simply wrong, or to take an entire system down the moment
+      the cache goes cold. Phil Karlton's famous line — "there are only two hard things in computer
+      science: cache invalidation and naming things" — is a joke with a real point: the mechanics of
+      caching are simple, but knowing <em>when a cached value stops being true</em> is genuinely hard,
+      and most production caching incidents trace back to getting that one question wrong.
+    </p>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>A cache is always a trade of <strong>consistency for latency</strong>. The backing store
+        (usually a database from earlier in this section) remains the source of truth; the cache is a
+        bet that a slightly-stale or eventually-consistent copy is an acceptable price for speed. Every
+        decision on this page — what to cache, how long, how to invalidate — is really a decision about
+        how much staleness a given piece of data can tolerate.</p>
+      </div>
+    </div>
+
+    <h2>Where caching happens</h2>
+    <p>
+      "Caching" isn't one layer — a single request typically passes through several caches before it
+      ever reaches a database, each solving a different distance problem:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>What it caches</th><th>Typical lifetime</th></tr></thead>
+        <tbody>
+          <tr><td>Browser / client</td><td>Static assets, API responses via <code>Cache-Control</code>/<code>ETag</code></td><td>Seconds to days</td></tr>
+          <tr><td>CDN / edge</td><td>Static assets, sometimes whole API responses, close to the user geographically</td><td>Minutes to days</td></tr>
+          <tr><td>Reverse proxy (nginx, Varnish)</td><td>Full HTTP responses in front of the app tier</td><td>Seconds to minutes</td></tr>
+          <tr><td>In-process (app memory)</td><td>Hot config, small lookup tables, per-instance — fastest, but not shared across instances</td><td>Process lifetime or short TTL</td></tr>
+          <tr><td>Distributed cache (Redis, Memcached)</td><td>Query results, computed objects, sessions — shared across every app instance</td><td>Seconds to hours, explicit TTL</td></tr>
+          <tr><td>Database buffer pool / query cache</td><td>Hot pages and (sometimes) query results, managed by the database itself</td><td>Managed internally by the engine</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      This page focuses mostly on the <strong>distributed application cache</strong> layer (Redis-shaped),
+      because that's the one you design and operate directly — the others are largely configuration on
+      top of infrastructure someone else built.
+    </p>
+
+    <h2>The four core caching patterns</h2>
+    <p>
+      These patterns answer two questions independently: who talks to the backing store (the
+      application, or the cache itself), and when does the cache get written relative to the backing
+      store.
+    </p>
+
+    <h3>Cache-aside (lazy loading)</h3>
+    <p>
+      The most common pattern by far. The application owns the logic: on read, check the cache first;
+      on a miss, read the backing store, then write the result into the cache before returning it. On
+      write, update the backing store and either update or (more often) delete the corresponding cache
+      entry.
+    </p>
+    <pre><code>def get_user(user_id):
+    cached = cache.get(f"user:{user_id}")
+    if cached is not None:
+        return cached                      # cache hit
+    user = db.query("SELECT * FROM users WHERE id = %s", user_id)
+    cache.set(f"user:{user_id}", user, ttl=300)
+    return user                            # cache miss, now populated
+
+def update_user(user_id, fields):
+    db.execute("UPDATE users SET ... WHERE id = %s", user_id)
+    cache.delete(f"user:{user_id}")        # invalidate, don't update-in-place</code></pre>
+    <p>
+      Only requested data ever gets cached (no wasted memory on things nobody reads), and the cache can
+      fail entirely without taking the system down — every read just falls through to the database. The
+      cost: every miss pays the full backing-store latency <em>plus</em> a cache write, and — as the
+      race-condition section below shows — the read-then-write isn't atomic, which opens a real
+      consistency hole.
+    </p>
+
+    <h3>Read-through</h3>
+    <p>
+      Same idea as cache-aside, but the cache library or a caching layer sits <em>between</em> the
+      application and the store and owns the miss-fill logic itself — the application only ever talks to
+      the cache. Functionally similar to cache-aside from the app's point of view; the difference is
+      architectural (where the fill logic lives), not behavioral.
+    </p>
+
+    <h3>Write-through</h3>
+    <p>
+      Every write goes to the cache <em>and</em> the backing store synchronously, as one logical
+      operation, before the write is acknowledged. The cache is never stale relative to the store because
+      it's updated in lockstep — but every write now pays cache-write latency on top of store-write
+      latency, and a write is only "done" once both succeed, which needs its own failure handling (what
+      if the cache write fails after the DB write commits?).
+    </p>
+
+    <h3>Write-behind (write-back)</h3>
+    <p>
+      The write lands in the cache immediately and is acknowledged right away; the write to the backing
+      store happens asynchronously afterward, batched or delayed. This is the fastest write path by far,
+      and it can absorb write bursts the backing store couldn't handle synchronously — but it introduces
+      a durability gap: if the cache node dies before the async write lands, that write is gone. Used
+      selectively, for data where a small durability window is acceptable in exchange for write
+      throughput (view counters, activity feeds) — rarely for anything resembling money.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Pattern</th><th>Read path</th><th>Write path</th><th>Best for</th><th>Main risk</th></tr></thead>
+        <tbody>
+          <tr><td>Cache-aside</td><td>App checks cache, falls back to store on miss</td><td>App writes store, then invalidates cache</td><td>General-purpose; the default choice</td><td>Read/write race on concurrent miss + write</td></tr>
+          <tr><td>Read-through</td><td>Cache library fills itself on miss</td><td>(paired with write-through, usually)</td><td>Same as cache-aside, cleaner app code</td><td>Same race, hidden behind an abstraction</td></tr>
+          <tr><td>Write-through</td><td>Cache always warm</td><td>Synchronous to cache + store</td><td>Read-heavy, write-light, correctness-sensitive</td><td>Extra write latency; dual-write failure handling</td></tr>
+          <tr><td>Write-behind</td><td>Cache always warm</td><td>Async, batched, to store</td><td>Very write-heavy, tolerant of a durability window</td><td>Data loss if cache dies before flush</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">✕</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>On cache-aside writes, prefer <strong>deleting</strong> the cache entry over updating it in
+        place. Updating the cache with the new value duplicates your write logic in two places that can
+        drift out of sync (what if the cache write encodes the value slightly differently than the DB
+        write, or a second concurrent writer interleaves?). Deleting is idempotent and simple: the next
+        read just repopulates from the source of truth. The one cost is an extra cache miss right after
+        a write — almost always worth it for the correctness it buys.</p>
+      </div>
+    </div>
+
+    <h2>TTLs and eviction: bounding how wrong the cache is allowed to be</h2>
+    <p>
+      A <span class="term">time-to-live (TTL)</span> is a ceiling on staleness: even if nothing ever
+      explicitly invalidates an entry, it disappears after a fixed duration and the next read repopulates
+      it. TTL choice is a direct trade-off:
+    </p>
+    <ul>
+      <li><strong>Short TTL</strong> → fresher data, but more cache misses, more backing-store load, and
+        less protection if invalidation logic has a bug (the blast radius of a missed invalidation is
+        capped at one TTL window).</li>
+      <li><strong>Long TTL</strong> → higher hit ratio, less backing-store load, but staler data for
+        longer, and a missed invalidation stays wrong for longer too.</li>
+    </ul>
+    <p>
+      Separately from TTL, every cache has finite memory, so it needs an <span class="term">eviction
+      policy</span> for what to remove when it's full, even before anything expires:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Policy</th><th>Evicts</th><th>Trade-off</th></tr></thead>
+        <tbody>
+          <tr><td>LRU (Least Recently Used)</td><td>The entry not accessed for the longest time</td><td>Good default — matches "recently used data tends to be used again" for most workloads</td></tr>
+          <tr><td>LFU (Least Frequently Used)</td><td>The entry accessed the fewest total times</td><td>Better for stable popularity distributions; slower to adapt when popularity shifts</td></tr>
+          <tr><td>FIFO</td><td>The oldest entry by insertion time, regardless of use</td><td>Cheapest to implement; ignores access patterns entirely — rarely the best choice</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Redis defaults to no eviction (writes fail once memory is full) unless you configure a
+      <code>maxmemory-policy</code> — in production this is almost always set to an LRU or LFU variant
+      (e.g. <code>allkeys-lru</code>) so the cache degrades gracefully under memory pressure instead of
+      refusing writes outright.
+    </p>
+
+    <h2>Invalidation: the actually hard part</h2>
+    <p>
+      Expiring by TTL is invalidation on a timer, blind to whether the underlying data actually changed.
+      The harder, more precise problem is invalidating <em>exactly when the data changes</em>, no sooner
+      and no later:
+    </p>
+    <ul>
+      <li><strong>Explicit invalidation on write</strong> — the cache-aside pattern above: the code path
+        that writes the database also deletes (or updates) the corresponding cache key. Precise, but only
+        as correct as your ability to find <em>every</em> code path that writes that data — a second
+        service, a batch job, or an admin script that writes the database directly and forgets the cache
+        exists is how stale reads sneak back in.</li>
+      <li><strong>Event-driven invalidation</strong> — a write publishes a change event (often via
+        change-data-capture off the database's write-ahead log, a preview of the upcoming <em>Messaging,
+        Queues &amp; Event-Driven Architecture</em> deep-dive) and any number of caches subscribe and
+        invalidate themselves. Decouples "who wrote the data" from "who needs to know it changed" —
+        useful when several services cache the same underlying data.</li>
+      <li><strong>Version / tag-based invalidation</strong> — instead of deleting individual keys, bump a
+        version number or tag associated with a group of related entries (e.g. <code>user:42:v3</code>);
+        old-versioned keys simply age out via TTL and are never read again because new reads ask for the
+        new version. Sidesteps having to enumerate every related key to delete.</li>
+    </ul>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Negative caching</span>
+      <div class="callout-body">
+        <p>Don't forget to cache <em>absence</em>. If a lookup for a nonexistent key hits the database
+        every time (a classic side effect of typos, scrapers, or a missing-row bug upstream), caching
+        the "not found" result for a short TTL stops the backing store from absorbing repeated queries
+        for something that will never exist. This is also the standard defense against a targeted
+        <span class="term">cache penetration</span> attack — deliberately requesting keys guaranteed to
+        miss, to bypass the cache and load the database directly.</p>
+      </div>
+    </div>
+
+    <h2>The read/write race in cache-aside</h2>
+    <p>
+      Cache-aside's read-fill step is not atomic with the database read it's based on, and that gap is a
+      real, exploitable window under concurrency. Classic sequence with two concurrent actors:
+    </p>
+    <ol>
+      <li>Request A reads the cache for <code>user:42</code> — miss.</li>
+      <li>Request A reads the database — gets the <em>old</em> value.</li>
+      <li>Request B updates the database with a <em>new</em> value, then deletes the cache key (which
+        isn't there yet, so the delete is a no-op).</li>
+      <li>Request A finishes and writes the <em>old</em> value into the cache.</li>
+    </ol>
+    <p>
+      Now the cache holds a stale value with no pending invalidation to fix it — it will sit there until
+      its TTL expires. This is precisely why a bounded TTL is a safety net, not an optional nicety, even
+      when you have "proper" invalidation: it guarantees this race resolves itself within one TTL window
+      instead of persisting indefinitely. The other common mitigation is a
+      <strong>delete-delay / double-delete</strong>: delete the cache key again a short delay (a few
+      hundred milliseconds) after the write, to catch exactly this race by cleaning up whatever a
+      straggling read might have written in the meantime.
+    </p>
+
+    <h2>Cache stampede (thundering herd)</h2>
+    <p>
+      A <span class="term">cache stampede</span> is what happens when a cache miss stops being a rare
+      event and becomes a <em>simultaneous</em> event across many requests — instead of one request
+      quietly repopulating the cache, dozens or thousands hit the backing store at once, for data that's
+      about to be identical once any one of them finishes. Two common triggers:
+    </p>
+    <ul>
+      <li><strong>Hot-key concurrent miss</strong> — a single popular key expires, and every concurrent
+        request for that key (which could be thousands, for something like a homepage feed or a viral
+        product page) independently sees a miss and independently queries the backing store — for what
+        will be the exact same result.</li>
+      <li><strong>Mass synchronized expiry</strong> — many different keys were all populated at the same
+        time with the same TTL (a cold cache after a deploy, or a nightly batch warm-up), so they all
+        expire at the same moment, producing a load spike across the whole key space rather than one key.</li>
+      </ul>
+    <p>Three mitigations, each aimed at a different half of the problem:</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Fix</th><th>How it works</th><th>Solves</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Locking / request coalescing (single-flight)</td>
+            <td>The first request that misses acquires a short-lived lock (or registers as "the one
+              fetching") and queries the backing store; every other concurrent request for the <em>same
+              key</em> waits and reuses that result instead of issuing its own query.</td>
+            <td>Hot-key concurrent miss — collapses N concurrent misses into 1 backing-store query.</td>
+          </tr>
+          <tr>
+            <td>Jittered TTL</td>
+            <td>Add a small random offset to each key's TTL (e.g. <code>base ± 20%</code>) so keys
+              populated at the same time don't expire at the same instant.</td>
+            <td>Mass synchronized expiry — spreads a single spike across a wider window.</td>
+          </tr>
+          <tr>
+            <td>Stale-while-revalidate / probabilistic early refresh</td>
+            <td>Serve the slightly-stale cached value immediately while asynchronously refreshing it in
+              the background (or refresh probabilistically <em>before</em> expiry, more likely the closer
+              the entry is to its TTL — the XFetch approach) instead of ever letting requests see a hard
+              miss.</td>
+            <td>Both — no request ever has to wait on a cold cache at all, at the cost of occasionally
+              serving data that's a few seconds stale.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>A stampede is a genuine "what breaks at 3 AM" scenario: a deploy rolls out, every app instance
+        restarts with an empty in-process cache (or a shared cache gets flushed), and the resulting
+        synchronized flood of backing-store queries can be enough to tip the database over — which then
+        makes every retry slower, which increases concurrent in-flight requests further, which makes it
+        worse. This is the same feedback loop the upcoming <em>Resilience Patterns</em> deep-dive covers
+        for retries in general; caching just gives it a very common entry point.</p>
+      </div>
+    </div>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — cache stampede simulator</div>
+      <p style="font-size: var(--fs-sm); color: var(--text-muted); margin: 0 0 var(--sp-4);">
+        40 cache keys are all populated at tick 0 (a cold-cache-after-deploy scenario). Each key gets
+        requested by several concurrent readers every tick. Watch what happens to backing-store load when
+        keys expire — then toggle the two mitigations and re-run.
+      </p>
+
+      <div class="sim-controls">
+        <div class="sim-control">
+          <label>Concurrent readers per key <span class="sim-value" id="readersVal">8</span></label>
+          <input type="range" id="readersSlider" min="1" max="20" value="8" />
+        </div>
+        <div class="sim-control">
+          <label>TTL (ticks) <span class="sim-value" id="ttlVal">6</span></label>
+          <input type="range" id="ttlSlider" min="3" max="12" value="6" />
+        </div>
+        <div class="sim-control">
+          <label>Backing-store capacity (queries/tick) <span class="sim-value" id="capVal">60</span></label>
+          <input type="range" id="capSlider" min="10" max="320" value="60" />
+        </div>
+      </div>
+
+      <div class="sim-toggles">
+        <label class="sim-toggle"><input type="checkbox" id="jitterToggle" /> Jittered TTL</label>
+        <label class="sim-toggle"><input type="checkbox" id="lockToggle" /> Request coalescing (locking)</label>
+      </div>
+
+      <div class="sim-actions">
+        <button class="btn" id="runSimBtn">Run simulation</button>
+        <button class="btn secondary" id="resetSimBtn">Reset</button>
+      </div>
+
+      <div class="sim-chart" id="simChart">
+        <div class="sim-capacity-line" id="simCapLine"><span class="sim-capacity-label" id="simCapLabel"></span></div>
+      </div>
+      <p class="sim-chart-caption">Backing-store queries per tick (dashed line = capacity; red bars = overloaded)</p>
+
+      <div class="sim-stats">
+        <div class="sim-stat"><span class="n" id="statTotal">–</span><span class="l">Total DB queries</span></div>
+        <div class="sim-stat" id="statPeakBox"><span class="n" id="statPeak">–</span><span class="l">Peak queries / tick</span></div>
+        <div class="sim-stat" id="statOverBox"><span class="n" id="statOver">–</span><span class="l">Overloaded ticks</span></div>
+        <div class="sim-stat"><span class="n" id="statHit">–</span><span class="l">Cache hit ratio</span></div>
+      </div>
+      <div class="sim-verdict" id="simVerdict" hidden></div>
+    </div>
+
+    <h2>Consistency hazards beyond staleness</h2>
+    <p>
+      Two more failure modes worth naming explicitly, because they're easy to overlook until they bite:
+    </p>
+    <ul>
+      <li><strong>Split-brain across cache and store during a partial failure.</strong> If the cache
+        write in a write-through pattern fails after the database write already committed, the two are
+        now out of sync with no automatic reconciliation — worth deciding up front whether that failure
+        mode should retry, alert, or fall back to deleting the cache key so the next read repopulates
+        from the (correct) database.</li>
+      <li><strong>Big keys and hot keys in a distributed cache.</strong> A single oversized cached value
+        (a multi-megabyte serialized object) can dominate network bandwidth to one Redis node and blow
+        past its response-time budget; a single overly popular key can concentrate all traffic on one
+        shard even when the rest of the cluster is idle, since consistent hashing (from the earlier
+        indexing deep-dive's cousin — full treatment in <em>Replication &amp; Partitioning</em>) places
+        one key on one node by design. Both are operational smells worth actively monitoring for, not
+        theoretical edge cases.</li>
+    </ul>
+
+    <h2>Redis in practice</h2>
+    <p>
+      Redis is the default distributed-cache choice in most production stacks, and it's worth knowing why:
+      it's an in-memory key-value store (see the earlier <em>NoSQL</em> deep-dive) with rich native data
+      structures beyond plain strings — hashes, sorted sets, lists, sets, and streams — which means it can
+      often serve as a cache <em>and</em> a lightweight materialized index at once (a sorted set as a live
+      leaderboard, a hash as a partial-object cache you can update one field at a time instead of
+      round-tripping the whole blob). It supports TTLs and eviction policies natively, and offers optional
+      persistence (RDB snapshots, an AOF write log) for the cases where losing the cache entirely — not
+      just having it cold — would be a real outage rather than a performance blip. In cluster mode, keys
+      are sharded across nodes by hash slot, which is where the hot-key problem above becomes concrete:
+      one popular key still lives on exactly one shard, cluster or not.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge: two very different "KV caches"</span>
+      <div class="callout-body">
+        <p>Worth disambiguating a name collision that trips up ML engineers specifically: the
+        <strong>KV cache</strong> in transformer inference (caching each token's attention key/value
+        projections so autoregressive decoding doesn't recompute them from scratch every step) shares a
+        name with, but is <em>not</em>, the key-value caching this page describes — it's a
+        per-request, in-memory data structure local to one inference pass, not a shared, persistent cache
+        across requests. The caching pattern that <em>does</em> map directly is
+        <strong>semantic response caching</strong> in front of an LLM API: cache-aside, keyed by a hash
+        (or embedding-similarity match) of the prompt, to skip a full model call for a repeated or
+        near-duplicate question. It inherits every hazard on this page — a prompt-template change or a
+        model version bump is exactly the "wrote the database directly and forgot the cache" invalidation
+        gap, and a viral prompt going cold at the same instant as thousands of similar concurrent
+        requests is exactly the hot-key stampede above, just with a much more expensive "backing store"
+        (a GPU inference call) behind it.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Caching lets one machine punch above its weight — but eventually one machine, cache or not, runs
+      out of headroom. The next deep-dive, <em>Scaling &amp; Load Balancing</em>, is where the roadmap
+      turns from "make one machine fast" to "add more machines" — starting from why statelessness (a
+      theme since <em>Anatomy of a Backend Service</em>) is the precondition that makes horizontal scaling
+      possible at all.
+    </p>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A service uses cache-aside and, on every write, <em>updates</em> the cache
+          entry in place (instead of deleting it) to "save a round trip." What's the main risk this
+          introduces?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">None — updating in place is strictly faster and equally correct.</button>
+          <button class="quiz-option" data-choice="b">The write logic now exists in two places (the database write and the cache update) that can drift out of sync under concurrent writes, whereas deleting is idempotent and always falls back to the source of truth on the next read.</button>
+          <button class="quiz-option" data-choice="c">Redis doesn't support updating existing keys, only deleting and recreating them.</button>
+        </div>
+        <p class="quiz-explain" hidden>Deleting is the safer default specifically because it has no way to encode the new value incorrectly — the next read simply repopulates from the database. Updating in place duplicates write logic and is exposed to the same read/write race described on this page.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. A popular product page's cache entry expires, and 4,000 concurrent requests
+          all miss at the same instant, each independently querying the database for identical data.
+          Which mitigation targets this specific failure mode?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Jittered TTL, because it spreads out when any key expires.</button>
+          <button class="quiz-option" data-choice="b">Write-behind caching, because it defers writes asynchronously.</button>
+          <button class="quiz-option" data-choice="c">Request coalescing (locking): the first miss queries the database and every other concurrent request for that same key waits and reuses the result, collapsing 4,000 queries into 1.</button>
+        </div>
+        <p class="quiz-explain" hidden>Jittered TTL solves *mass* expiry across many different keys populated at the same time — it doesn't help when many concurrent requests hit the *same* key at once. That's exactly what request coalescing / single-flight locking is for.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. Why is a bounded TTL still worth setting even on data that has "proper"
+          explicit invalidation on every write path?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Because the cache-aside read/write race (a stale read winning a race against a concurrent write's invalidation) can leave a stale value in the cache with no pending delete to fix it — TTL is the backstop that guarantees it self-heals within one window.</button>
+          <button class="quiz-option" data-choice="b">It isn't — TTLs are only useful for memory management, never for correctness.</button>
+          <button class="quiz-option" data-choice="c">Because Redis requires every key to have an expiry or it refuses to store it.</button>
+        </div>
+        <p class="quiz-explain" hidden>Explicit invalidation only covers write paths you remembered to wire up, and doesn't protect against the read/write race itself. A TTL is a correctness safety net, not just a memory-management knob — it bounds how long any missed or raced invalidation can persist.</p>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------- Cache stampede simulator ---------------- */
+      var NUM_KEYS = 40;
+      var TOTAL_TICKS = 30;
+      var TICK_MS = 140;
+
+      var readersSlider = document.getElementById("readersSlider");
+      var ttlSlider = document.getElementById("ttlSlider");
+      var capSlider = document.getElementById("capSlider");
+      var readersVal = document.getElementById("readersVal");
+      var ttlVal = document.getElementById("ttlVal");
+      var capVal = document.getElementById("capVal");
+      var jitterToggle = document.getElementById("jitterToggle");
+      var lockToggle = document.getElementById("lockToggle");
+      var runBtn = document.getElementById("runSimBtn");
+      var resetBtn = document.getElementById("resetSimBtn");
+      var chart = document.getElementById("simChart");
+      var capLine = document.getElementById("simCapLine");
+      var capLabel = document.getElementById("simCapLabel");
+      var statTotal = document.getElementById("statTotal");
+      var statPeak = document.getElementById("statPeak");
+      var statOver = document.getElementById("statOver");
+      var statHit = document.getElementById("statHit");
+      var statPeakBox = document.getElementById("statPeakBox");
+      var statOverBox = document.getElementById("statOverBox");
+      var verdict = document.getElementById("simVerdict");
+
+      var timer = null;
+      var bars = [];
+
+      function syncLabels() {
+        readersVal.textContent = readersSlider.value;
+        ttlVal.textContent = ttlSlider.value;
+        capVal.textContent = capSlider.value;
+      }
+      [readersSlider, ttlSlider, capSlider].forEach(function (s) {
+        s.addEventListener("input", syncLabels);
+      });
+      syncLabels();
+
+      function seededRandom(seed) {
+        var x = Math.sin(seed) * 10000;
+        return x - Math.floor(x);
+      }
+
+      function buildChart() {
+        chart.querySelectorAll(".sim-bar").forEach(function (b) { b.remove(); });
+        bars = [];
+        for (var i = 0; i < TOTAL_TICKS; i++) {
+          var bar = document.createElement("div");
+          bar.className = "sim-bar";
+          bar.style.height = "0%";
+          chart.appendChild(bar);
+          bars.push(bar);
+        }
+      }
+      buildChart();
+
+      function computeSeries() {
+        var readers = parseInt(readersSlider.value, 10);
+        var ttl = parseInt(ttlSlider.value, 10);
+        var capacity = parseInt(capSlider.value, 10);
+        var jitter = jitterToggle.checked;
+        var coalesce = lockToggle.checked;
+
+        var expiry = [];
+        for (var k = 0; k < NUM_KEYS; k++) {
+          var j = jitter ? Math.floor(seededRandom(k * 13.37 + 1) * ttl * 0.8) : 0;
+          expiry.push(ttl + j);
+        }
+
+        var series = [];
+        var totalRequests = NUM_KEYS * readers * TOTAL_TICKS;
+        var totalDbQueries = 0;
+
+        for (var t = 0; t < TOTAL_TICKS; t++) {
+          var dbQueries = 0;
+          for (var key = 0; key < NUM_KEYS; key++) {
+            if (t >= expiry[key]) {
+              dbQueries += coalesce ? 1 : readers;
+              var j2 = jitter ? Math.floor(seededRandom(key * 13.37 + t + 1) * ttl * 0.8) : 0;
+              expiry[key] = t + ttl + j2;
+            }
+          }
+          totalDbQueries += dbQueries;
+          series.push(dbQueries);
+        }
+
+        return { series: series, capacity: capacity, totalDbQueries: totalDbQueries, totalRequests: totalRequests };
+      }
+
+      function render(result) {
+        var maxVal = Math.max.apply(null, result.series.concat([result.capacity])) * 1.15;
+        var capPct = Math.min(100, (result.capacity / maxVal) * 100);
+        capLine.style.top = (100 - capPct) + "%";
+        capLabel.textContent = "capacity: " + result.capacity;
+
+        var peak = 0;
+        var overCount = 0;
+        result.series.forEach(function (val, i) {
+          var pct = Math.min(100, (val / maxVal) * 100);
+          bars[i].style.height = pct + "%";
+          var isOver = val > result.capacity;
+          bars[i].classList.toggle("over", isOver);
+          if (isOver) overCount++;
+          if (val > peak) peak = val;
+        });
+
+        statTotal.textContent = result.totalDbQueries.toLocaleString();
+        statPeak.textContent = peak.toLocaleString();
+        statOver.textContent = overCount;
+        var hitRatio = 1 - result.totalDbQueries / result.totalRequests;
+        statHit.textContent = Math.round(hitRatio * 1000) / 10 + "%";
+
+        statPeakBox.classList.toggle("warn", peak > result.capacity);
+        statOverBox.classList.toggle("warn", overCount > 0);
+
+        verdict.hidden = false;
+        if (overCount === 0) {
+          verdict.className = "sim-verdict good";
+          verdict.textContent = "No tick exceeded backing-store capacity — the current mitigations (or low enough load) are keeping the herd contained.";
+        } else if (overCount <= 2) {
+          verdict.className = "sim-verdict bad";
+          verdict.textContent = "Capacity was exceeded on " + overCount + " tick(s) — brief spikes, but recurring. Try enabling jittered TTL and/or request coalescing above and re-run.";
+        } else {
+          verdict.className = "sim-verdict bad";
+          verdict.textContent = "Sustained overload across " + overCount + " ticks — this is the thundering-herd failure mode: synchronized expiry (try Jittered TTL) and/or concurrent same-key misses (try Request coalescing) are overwhelming the backing store repeatedly.";
+        }
+      }
+
+      function animateRun() {
+        if (timer) { clearInterval(timer); timer = null; }
+        var result = computeSeries();
+        bars.forEach(function (b) { b.style.height = "0%"; b.classList.remove("over"); });
+        verdict.hidden = true;
+        var i = 0;
+        var maxVal = Math.max.apply(null, result.series.concat([result.capacity])) * 1.15;
+        var capPct = Math.min(100, (result.capacity / maxVal) * 100);
+        capLine.style.top = (100 - capPct) + "%";
+        capLabel.textContent = "capacity: " + result.capacity;
+
+        timer = setInterval(function () {
+          if (i >= result.series.length) {
+            clearInterval(timer);
+            timer = null;
+            render(result);
+            return;
+          }
+          var val = result.series[i];
+          var pct = Math.min(100, (val / maxVal) * 100);
+          bars[i].style.height = pct + "%";
+          if (val > result.capacity) bars[i].classList.add("over");
+          i++;
+        }, TICK_MS);
+      }
+
+      runBtn.addEventListener("click", animateRun);
+      resetBtn.addEventListener("click", function () {
+        if (timer) { clearInterval(timer); timer = null; }
+        bars.forEach(function (b) { b.style.height = "0%"; b.classList.remove("over"); });
+        capLine.style.top = "0%";
+        capLabel.textContent = "";
+        statTotal.textContent = "–";
+        statPeak.textContent = "–";
+        statOver.textContent = "–";
+        statHit.textContent = "–";
+        statPeakBox.classList.remove("warn");
+        statOverBox.classList.remove("warn");
+        verdict.hidden = true;
+      });
+
+      /* ---------------- Quiz ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
