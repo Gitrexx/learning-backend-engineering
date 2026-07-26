@@ -120,7 +120,7 @@
       "summary": "Cache-aside vs write-through, invalidation, TTLs, the stampede problem, and consistency hazards.",
       "prerequisites": ["anatomy-of-a-backend"],
       "file": "caching-strategies.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "scaling-and-load-balancing",
