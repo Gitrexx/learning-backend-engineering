@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scaling &amp; Load Balancing — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the load-balancer playground widget only. */
+    .lb-controls {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      margin-bottom: var(--sp-4);
+      align-items: end;
+    }
+    .lb-controls label {
+      display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em;
+    }
+    .lb-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .lb-controls select {
+      width: 100%;
+    }
+    .lb-actions { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-5); flex-wrap: wrap; }
+
+    .lb-backends {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      margin-bottom: var(--sp-5);
+    }
+    .lb-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4); position: relative;
+    }
+    .lb-card.lb-evicted { opacity: 0.55; border-style: dashed; }
+    .lb-card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+    .lb-card-head h4 { margin: 0; font-size: var(--fs-md); color: var(--text); font-family: var(--font-mono); }
+
+    .lb-badge {
+      display: inline-flex; align-items: center; gap: 0.4em;
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.05em; text-transform: uppercase;
+      padding: 0.2em 0.55em; border-radius: 999px; border: 1px solid var(--border-strong);
+      white-space: nowrap;
+    }
+    .lb-badge-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .lb-badge-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+    .lb-badge-danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+    .lb-badge-muted { color: var(--text-faint); }
+
+    .lb-capacity-row { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-3); font-size: var(--fs-sm); color: var(--text-muted); }
+    .lb-capacity-row input[type="range"] { flex: 1; }
+    .lb-capacity-val { font-family: var(--font-mono); color: var(--text); width: 1.4em; text-align: right; }
+
+    .lb-loadbar-track { height: 12px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; margin-bottom: var(--sp-2); }
+    .lb-loadbar-fill { height: 100%; background: var(--ok); transition: width 0.15s linear, background-color 0.2s; }
+
+    .lb-stats { font-size: var(--fs-sm); display: grid; gap: 0.25em; margin-bottom: var(--sp-3); }
+    .lb-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .lb-stat-label { color: var(--text-muted); }
+    .lb-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+
+    .lb-kill-btn {
+      width: 100%; font-size: var(--fs-sm); padding: 0.4em 0.8em;
+    }
+
+    .lb-share-wrap { margin-bottom: var(--sp-5); }
+    .lb-share-row { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: 0.4em; }
+    .lb-share-label { font-family: var(--font-mono); font-size: var(--fs-sm); width: 2.2em; color: var(--text-muted); }
+    .lb-share-track { flex: 1; height: 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+    .lb-share-fill { height: 100%; background: var(--blueprint); }
+    .lb-share-pct { width: 3.6em; text-align: right; font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text); }
+
+    .lb-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-4); min-height: 2.6em; }
+    .lb-summary { display: flex; gap: var(--sp-5); flex-wrap: wrap; font-size: var(--fs-sm); margin-bottom: var(--sp-4); }
+    .lb-summary > div span.lb-stat-val { font-size: var(--fs-md); }
+
+    @media (max-width: 560px) { .lb-controls { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Distributed Systems &amp; Scaling // 01</p>
+    <h1>Scaling &amp; Load Balancing</h1>
+
+    <p>
+      Everything in <a href="concurrency-and-io.html">Concurrency, Threads &amp; Async I/O</a> lived
+      inside <em>one process on one machine</em>: a fixed number of threads, one ρ = λ·S/N curve,
+      one point where the queue tips over. This page asks the question that follows naturally once
+      that ceiling is real: what do you do when one machine — however well-tuned — genuinely isn't
+      enough? The answer, almost always, is <em>more machines</em>. But "more machines" only works
+      if something in front of them decides which machine handles which request, and does so in a
+      way that keeps failing machines from taking the whole service down with them. That something
+      is a load balancer, and the decisions it makes are a direct, mechanical extension of the same
+      ρ math you already know — just with N now counted in servers instead of threads.
+    </p>
+
+    <h2>Vertical vs. horizontal scaling</h2>
+    <p>
+      There are exactly two ways to add capacity to a system, and they have very different ceilings
+      and failure characteristics.
+    </p>
+    <dl class="definition">
+      <dt>Vertical scaling (scale up)</dt>
+      <dd>Give the existing machine more resources — more CPU, more RAM, faster disks. Simple: no
+        architectural change, no new failure modes. But it has a hard ceiling (the biggest instance
+        your cloud provider sells), it doesn't help with availability (one machine is still one
+        machine — it goes down, you're down), and cost tends to grow <em>faster</em> than linearly
+        as you approach the top of an instance family.</dd>
+      <dt>Horizontal scaling (scale out)</dt>
+      <dd>Add more machines running the same service and spread the load across them. In principle
+        unbounded — need more capacity, add another box. It also buys availability for free: if one
+        of ten instances dies, you lose 10% of capacity, not 100% of the service. The cost is
+        architectural: now something has to route requests to the right instance, and the instances
+        have to agree on or externalize any state they'd otherwise have kept locally.</dd>
+    </dl>
+    <p>
+      Production systems do both — vertical scaling buys headroom cheaply up to a point, horizontal
+      scaling is what actually removes the ceiling — but the interesting engineering, and the rest
+      of this roadmap's Distributed Systems section, is almost entirely about the second kind.
+    </p>
+
+    <h2>Statelessness is what makes horizontal scaling possible</h2>
+    <p>
+      Imagine a service that stores each user's shopping cart in the memory of whichever process
+      handled their last request. The moment you run two instances, this breaks: a request that
+      lands on instance B has no idea what instance A put in the cart. Scaling out didn't just add
+      capacity — it silently deleted user data, non-deterministically, depending on which instance a
+      load balancer happened to pick.
+    </p>
+    <p>
+      A <span class="term">stateless</span> service is one where any instance can handle any request,
+      because nothing about the outcome depends on which instance previously talked to this client.
+      All the state that matters — session data, cart contents, in-progress workflow — lives
+      somewhere external and shared: a database, a distributed cache like Redis, a signed token the
+      client carries itself. The app tier becomes a fungible pool of identical workers; the hard
+      state-consistency problem is pushed down into the data layer, which is built (see
+      <a href="caching-strategies.html">Caching Strategies</a> and the upcoming Replication &amp;
+      Partitioning) to actually handle it.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Statelessness isn't a nice-to-have style preference — it's the precondition for
+        horizontal scaling to work at all. If any instance can serve any request interchangeably,
+        you can add or remove instances at will, kill an unhealthy one without losing anything a
+        user cares about, and let a simple algorithm pick among them. The moment a request's
+        correctness depends on <em>which</em> instance handles it, you've reintroduced a single
+        point of failure and made every scaling decision a data-consistency decision too.</p>
+      </div>
+    </div>
+    <p>
+      "Stateless" doesn't mean "no state exists" — it means no state lives <em>only</em> in one
+      process's memory. Sticky sessions (below) are the load-balancer-side patch for services that
+      haven't fully externalized their state; they work, but they're a workaround, not the goal.
+    </p>
+
+    <h2>What a load balancer actually does</h2>
+    <p>
+      A load balancer sits between clients and a pool of backend instances and, for every incoming
+      request, decides which backend handles it. That's the whole job description, but it implies
+      three separate responsibilities that are worth naming precisely:
+    </p>
+    <ul>
+      <li><b>Distribution</b> — pick a backend using some algorithm (below).</li>
+      <li><b>Health checking</b> — stop sending traffic to a backend that's down or degraded, and
+        resume once it recovers.</li>
+      <li><b>Termination point</b> — often also where TLS is terminated and where the "L4 vs L7"
+        distinction lives: an L4 (transport-layer) balancer routes TCP/UDP connections based on IP
+        and port without looking at the request itself; an L7 (application-layer) balancer reads
+        HTTP — path, headers, cookies — and can route <code>/api/*</code> to one pool and
+        <code>/static/*</code> to another, which is why almost every production HTTP load balancer
+        (nginx, Envoy, an ALB) operates at L7.</li>
+    </ul>
+
+    <h2>Load-balancing algorithms</h2>
+    <p>
+      "Which backend gets this request?" has a handful of standard answers, each with a different
+      trade-off between simplicity, fairness, and how much state the balancer has to track.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Algorithm</th><th>How it picks</th><th>Strength</th><th>Weakness</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Round robin</b></td>
+            <td>Cycle through backends in order, one request each</td>
+            <td>Trivial to implement, no per-backend state needed</td>
+            <td>Assumes every backend has identical capacity — hands a small box the same share as
+              a big one</td>
+          </tr>
+          <tr>
+            <td><b>Weighted round robin</b></td>
+            <td>Cycle through backends, but give each a share proportional to a configured weight
+              (usually its capacity)</td>
+            <td>Fixes round robin's capacity blindness with almost no extra cost</td>
+            <td>The weight is a static guess — doesn't react to a backend that's suddenly slow for
+              reasons unrelated to its rated capacity</td>
+          </tr>
+          <tr>
+            <td><b>Least connections</b></td>
+            <td>Send the request to whichever backend currently has the fewest in-flight requests</td>
+            <td>Self-correcting — automatically favors whichever backend is actually keeping up,
+              including under uneven request costs</td>
+            <td>Needs the balancer to track live connection counts per backend; can misjudge if
+              request cost varies wildly and cheap ones finish before load evens out</td>
+          </tr>
+          <tr>
+            <td><b>IP / session hash</b></td>
+            <td>Hash a key from the request (client IP, session cookie) to deterministically pick
+              the same backend every time for that key</td>
+            <td>Gives you "sticky" routing without a session table on the balancer</td>
+            <td>Uneven if keys aren't uniformly distributed; a <em>naive</em> <code>hash(key) mod
+              N</code> remaps almost every key when N changes — see the callout below</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Naive modulo hashing (<code>backend = hash(key) % N</code>) is a trap: add or remove one
+        backend and N changes, which changes the result of the modulo for almost every key — not
+        just the keys that needed to move. For a cache pool, that's a stampede of cache misses; for
+        sticky sessions, it logs everyone out at once. The fix is <span class="term">consistent
+        hashing</span>, which remaps only the ~1/N share of keys that actually need to move when a
+        node joins or leaves. That's genuinely a different topic with its own data structure (a hash
+        ring) — it's covered properly in <em>Replication &amp; Partitioning</em>, unlocked by this
+        page. For now, the takeaway is narrower: know that plain hash-mod-N routing has this failure
+        mode before you reach for it.</p>
+      </div>
+    </div>
+
+    <h2>Health checks: how a load balancer notices a backend is dead</h2>
+    <p>
+      A load balancer can't see inside a backend — it only knows what health checks tell it. There
+      are two flavors, and production systems use both:
+    </p>
+    <dl class="definition">
+      <dt>Active health checks</dt>
+      <dd>The balancer periodically calls a dedicated endpoint (often <code>/healthz</code>) on each
+        backend and expects a fast 200. Miss enough checks in a row and the backend is pulled from
+        rotation; pass enough in a row and it's added back. This is deliberately asymmetric — one
+        slow check shouldn't evict a healthy backend, and one lucky check shouldn't re-admit a
+        flapping one, so real systems require a streak in both directions (a debounce).</dd>
+      <dt>Passive health checks</dt>
+      <dd>The balancer watches real traffic: a backend that starts returning 5xxs or timing out on
+        actual requests gets marked down without waiting for the next scheduled probe. Faster to
+        react than active checks alone, at the cost of the first few real users hitting the dying
+        backend before it's evicted.</dd>
+      <dt>Liveness vs. readiness</dt>
+      <dd>A refinement worth knowing precisely (from the Kubernetes vocabulary, but the concept
+        predates it): <em>liveness</em> asks "is this process still running and not deadlocked" —
+        fail it and the orchestrator restarts the process. <em>Readiness</em> asks "is this instance
+        ready to take traffic right now" — fail it and the balancer stops routing to it, without
+        killing it. A backend that's alive but overloaded, or still warming a cache on startup,
+        should fail readiness without failing liveness.</dd>
+    </dl>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>There is always a window between a backend actually failing and the load balancer
+        noticing — the health-check interval plus the debounce streak. Requests routed to a dying
+        backend during that window fail or hang. This is exactly why <em>Resilience Patterns</em>
+        (a few pages ahead) layers client-side timeouts and retries on top of load balancing: health
+        checks reduce how often you hit a dead backend, they don't reduce it to zero, and a caller
+        that waits forever for a reply from a backend the health checker hasn't evicted yet is a
+        self-inflicted outage.</p>
+      </div>
+    </div>
+
+    <h2>Sticky sessions</h2>
+    <p>
+      If a service hasn't fully externalized its state, the load balancer can paper over it with
+      <span class="term">session affinity</span> ("sticky sessions"): route a given client's
+      requests to the same backend every time — usually via a cookie the balancer sets, or via IP
+      hashing above. It works, but it reintroduces exactly the coupling statelessness was designed
+      to remove: that one backend now matters more than the others for that client, scaling and
+      deploys have to account for draining sticky clients before removing a node, and an uneven
+      distribution of "sticky" clients can quietly create a hot spot no algorithm will rebalance
+      away. Treat sticky sessions as a stopgap for legacy state, not a design goal — the fix that
+      actually scales is moving the state to a shared store and letting any instance serve any
+      request.
+    </p>
+
+    <h2>Back-of-the-envelope: when do you actually need to scale out?</h2>
+    <p>
+      Before reaching for more machines, do the arithmetic. Recall ρ = λ·S/N from the concurrency
+      page: a single server handling requests that each take S = 20ms of CPU time, with N=8 worker
+      threads, saturates (ρ = 1) at λ = N/S = 8 / 0.02 = <b>400 req/s</b>. If your actual peak
+      traffic is 50 req/s, adding servers buys you nothing that tuning thread count or fixing a slow
+      query wouldn't buy more cheaply — the bottleneck isn't machine count. If peak traffic is
+      trending toward 4,000 req/s, no amount of per-request optimization gets one machine there;
+      that's a horizontal-scaling problem, and the question becomes how many machines (same formula,
+      solved for N: N ≥ λ·S/ρ_target, usually with ρ_target around 0.7 to leave headroom for bursts)
+      and how the balancer should pick among them. Knowing which regime you're in — before writing
+      any code — is the first move of the system-design method this roadmap builds toward.
+    </p>
+
+    <h2>Try it: load-balancer playground</h2>
+    <p>
+      A pool of backends with different capacities, a request stream, and a choice of algorithm.
+      Watch how <b>round robin</b> ignores capacity and overloads the smaller backend while others
+      idle; switch to <b>weighted round robin</b> or <b>least connections</b> and watch the load
+      even out. Then kill a backend mid-stream and watch the delay before the health checker evicts
+      it and traffic rebalances onto the survivors — and revive it to see the same delay in reverse.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Load-balancer playground</div>
+
+      <div class="lb-controls">
+        <div>
+          <label for="lbRate">Incoming request rate: <span class="val" id="lbRateVal">30</span> req/s</label>
+          <input type="range" id="lbRate" min="1" max="150" step="1" value="30" />
+        </div>
+        <div>
+          <label for="lbAlgo">Algorithm</label>
+          <select id="lbAlgo">
+            <option value="rr">Round robin</option>
+            <option value="wrr">Weighted round robin</option>
+            <option value="lc">Least connections</option>
+            <option value="hash">IP hash (naive mod N)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="lb-actions">
+        <button class="btn" id="lbRun" type="button">Pause</button>
+        <button class="btn secondary" id="lbReset" type="button">Reset</button>
+        <button class="btn secondary" id="lbAdd" type="button">+ Add backend</button>
+        <button class="btn secondary" id="lbRemove" type="button">− Remove backend</button>
+      </div>
+
+      <div class="lb-summary">
+        <div><span class="lb-stat-label">Served</span> <span class="lb-stat-val" id="lbServed">0</span></div>
+        <div><span class="lb-stat-label">Dropped (no capacity / no healthy backend)</span> <span class="lb-stat-val" id="lbDropped">0</span></div>
+        <div><span class="lb-stat-label">Healthy backends</span> <span class="lb-stat-val" id="lbHealthyCount">4/4</span></div>
+      </div>
+
+      <div class="lb-backends" id="lbBackends"></div>
+
+      <div class="lb-share-wrap" id="lbShareWrap">
+        <div class="widget-label" style="margin-bottom: var(--sp-3);">Request distribution — last ~4s</div>
+      </div>
+
+      <p class="lb-note" id="lbNote"></p>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>The playground models an idealized health check every ~2 simulated seconds, requiring two
+        consecutive failures to evict and two consecutive successes to re-admit — the debounce
+        described above, so a single missed beat doesn't yank a healthy backend out of rotation.
+        Real load balancers expose these as configurable <code>unhealthy_threshold</code> /
+        <code>healthy_threshold</code> settings; the defaults trade "detect fast" against "don't
+        flap."</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A fleet of model-serving replicas behind a load balancer is the exact same picture, with
+        one wrinkle: request cost is far less uniform than a typical CRUD endpoint. A prompt with
+        10 tokens and one with 4,000 tokens can differ in service time by 100x, which makes
+        round-robin's capacity-blindness bite much harder — two GPUs running round robin can end up
+        with one saturated and one idle purely from an unlucky sequence of long prompts. This is why
+        inference gateways (e.g. how vLLM- or Triton-fronting routers work) lean toward
+        least-connections-style or queue-depth-aware routing over simple round robin, and why
+        autoscaling a serving fleet usually keys off <em>queue depth or GPU utilization</em> rather
+        than request count — request count alone hides exactly the variance that causes the hot
+        spots.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A service holds each user's in-progress checkout state in the memory of
+          whichever instance handled their first request. What happens when you scale it from one
+          instance to three, with a plain round-robin load balancer and no sticky sessions?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nothing changes — round robin is stateless, so it doesn't affect application state.</button>
+          <button class="quiz-option" data-choice="b">Checkout state silently breaks for most users, because their next request has a 2-in-3 chance of landing on an instance that never saw their earlier requests.</button>
+          <button class="quiz-option" data-choice="c">The three instances automatically synchronize in-memory state with each other.</button>
+        </div>
+        <p class="quiz-explain" hidden>In-memory state that isn't externalized only survives if the same instance keeps serving that client. Round robin makes no such guarantee, so scaling out (without sticky sessions or externalized state) directly breaks correctness — this is why statelessness is a precondition for horizontal scaling, not a style choice.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. Three backends have capacities 5, 5, and 1 (requests they can handle
+          concurrently). Under plain round robin, why does the smallest backend become a hot spot
+          even though total traffic is well within the pool's combined capacity?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It doesn't — round robin always distributes load proportional to capacity.</button>
+          <button class="quiz-option" data-choice="b">The smallest backend is simply slower hardware, unrelated to the algorithm.</button>
+          <button class="quiz-option" data-choice="c">Round robin gives every backend an equal 1-in-3 share of requests regardless of capacity, so the backend with capacity 1 saturates (ρ near or above 1 for its share) long before the two backends with capacity 5 do.</button>
+        </div>
+        <p class="quiz-explain" hidden>Round robin has no concept of capacity — it just cycles. An equal share of traffic is a very unequal share of *load* when capacities differ. Weighted round robin or least connections both correct for this by accounting for capacity or actual in-flight load.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A backend crashes at t=0. The load balancer's active health check runs
+          every 2s and requires 2 consecutive failures to evict. Requests routed to that backend
+          between t=0 and eviction fail or hang. What does this imply about load balancing alone as
+          a reliability strategy?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Load balancing reduces exposure to a dead backend but doesn't eliminate it — there's always a detection-and-debounce window, so callers still need their own timeouts/retries to be safe.</button>
+          <button class="quiz-option" data-choice="b">It implies the health-check interval should always be set to 0 seconds to eliminate the window entirely.</button>
+          <button class="quiz-option" data-choice="c">It implies load balancing is not useful for reliability and should be replaced by retries alone.</button>
+        </div>
+        <p class="quiz-explain" hidden>Health checks are probabilistic-in-timing, not instantaneous — there's an inherent window between failure and eviction (interval × debounce streak). Load balancing meaningfully reduces how often clients hit a dead backend, but client-side timeouts and retries (Resilience Patterns) are what actually bound the damage during that window.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page is the hinge into the Distributed Systems landscape: it unlocks <em>Replication
+      &amp; Partitioning</em> (how the data those stateless instances all point to survives one
+      machine dying), <em>Messaging, Queues &amp; Event-Driven Architecture</em> (decoupling
+      producers and consumers instead of load-balancing synchronous calls), <em>Resilience
+      Patterns</em> (bounding the damage in the detection window this page's health-check note
+      flagged), and <em>Performance, Profiling &amp; Capacity Planning</em> (the back-of-the-envelope
+      math above, generalized to full capacity planning). Any of those are fair game next —
+      pick by what you're most curious about, or keep the default order.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var TICK_MS = 150;
+      var DT = 0.4;
+      var HEALTH_CHECK_INTERVAL_S = 2;
+      var HEALTH_STREAK_NEEDED = 2;
+      var QUEUE_CAP = 20;
+      var SHARE_WINDOW_S = 4;
+      var MAX_BACKENDS = 6;
+      var MIN_BACKENDS = 2;
+
+      var rateEl = document.getElementById("lbRate");
+      var rateVal = document.getElementById("lbRateVal");
+      var algoEl = document.getElementById("lbAlgo");
+      var runBtn = document.getElementById("lbRun");
+      var resetBtn = document.getElementById("lbReset");
+      var addBtn = document.getElementById("lbAdd");
+      var removeBtn = document.getElementById("lbRemove");
+      var servedEl = document.getElementById("lbServed");
+      var droppedEl = document.getElementById("lbDropped");
+      var healthyCountEl = document.getElementById("lbHealthyCount");
+      var backendsWrap = document.getElementById("lbBackends");
+      var shareWrap = document.getElementById("lbShareWrap");
+      var noteEl = document.getElementById("lbNote");
+
+      var running = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      var simTime = 0;
+      var sinceHealthCheck = 0;
+      var totalServed = 0;
+      var totalDropped = 0;
+      var rrPointer = 0;
+      var wrrState = {}; // id -> currentWeight, for smooth weighted round robin
+      var backends = [];
+      var nextId = 0;
+
+      function letterFor(id) { return String.fromCharCode(65 + id); }
+
+      function makeBackend(capacity) {
+        var id = nextId++;
+        return {
+          id: id,
+          label: letterFor(id),
+          capacity: capacity,
+          killed: false,      // user-simulated crash
+          evicted: false,     // load balancer has pulled it from rotation
+          failStreak: 0,
+          passStreak: 0,
+          inFlight: [],       // completion timestamps
+          queue: [],          // arrival timestamps waiting for a slot
+          served: 0,
+          recentServed: []    // timestamps, for rolling distribution share
+        };
+      }
+
+      function resetSim(count) {
+        simTime = 0;
+        sinceHealthCheck = 0;
+        totalServed = 0;
+        totalDropped = 0;
+        rrPointer = 0;
+        wrrState = {};
+        nextId = 0;
+        backends = [];
+        var caps = [3, 3, 3, 1, 5, 2];
+        for (var i = 0; i < count; i++) backends.push(makeBackend(caps[i % caps.length]));
+        buildCards();
+      }
+
+      function buildCards() {
+        backendsWrap.innerHTML = "";
+        backends.forEach(function (b) {
+          var card = document.createElement("div");
+          card.className = "lb-card";
+          card.id = "lbCard" + b.id;
+          card.innerHTML =
+            '<div class="lb-card-head"><h4>Backend ' + b.label + '</h4>' +
+            '<span class="lb-badge lb-badge-ok" id="lbHealth' + b.id + '">HEALTHY</span></div>' +
+            '<div class="lb-capacity-row"><span>capacity</span>' +
+            '<input type="range" min="1" max="10" step="1" value="' + b.capacity + '" id="lbCap' + b.id + '" />' +
+            '<span class="lb-capacity-val" id="lbCapVal' + b.id + '">' + b.capacity + '</span></div>' +
+            '<div class="lb-loadbar-track"><div class="lb-loadbar-fill" id="lbLoad' + b.id + '" style="width:0%"></div></div>' +
+            '<div class="lb-stats">' +
+            '<div><span class="lb-stat-label">active / capacity</span><span class="lb-stat-val" id="lbActive' + b.id + '">0/' + b.capacity + '</span></div>' +
+            '<div><span class="lb-stat-label">queued</span><span class="lb-stat-val" id="lbQueue' + b.id + '">0</span></div>' +
+            '<div><span class="lb-stat-label">served</span><span class="lb-stat-val" id="lbServedB' + b.id + '">0</span></div>' +
+            '</div>' +
+            '<button class="btn secondary lb-kill-btn" id="lbKill' + b.id + '" type="button">Kill</button>';
+          backendsWrap.appendChild(card);
+
+          document.getElementById("lbCap" + b.id).addEventListener("input", function (e) {
+            b.capacity = parseInt(e.target.value, 10);
+            document.getElementById("lbCapVal" + b.id).textContent = b.capacity;
+          });
+          document.getElementById("lbKill" + b.id).addEventListener("click", function () {
+            b.killed = !b.killed;
+            if (!b.killed) { b.failStreak = 0; } // recovery begins re-passing health checks
+            document.getElementById("lbKill" + b.id).textContent = b.killed ? "Revive" : "Kill";
+          });
+        });
+        buildShareRows();
+      }
+
+      function buildShareRows() {
+        var existing = shareWrap.querySelectorAll(".lb-share-row");
+        existing.forEach(function (el) { el.remove(); });
+        backends.forEach(function (b) {
+          var row = document.createElement("div");
+          row.className = "lb-share-row";
+          row.innerHTML =
+            '<span class="lb-share-label">' + b.label + '</span>' +
+            '<div class="lb-share-track"><div class="lb-share-fill" id="lbShareFill' + b.id + '" style="width:0%"></div></div>' +
+            '<span class="lb-share-pct" id="lbSharePct' + b.id + '">0%</span>';
+          shareWrap.appendChild(row);
+        });
+      }
+
+      function healthyBackends() {
+        return backends.filter(function (b) { return !b.evicted; });
+      }
+
+      function pickBackend(algo) {
+        var pool = healthyBackends();
+        if (!pool.length) return null;
+
+        if (algo === "rr") {
+          rrPointer = rrPointer % pool.length;
+          var chosen = pool[rrPointer];
+          rrPointer++;
+          return chosen;
+        }
+
+        if (algo === "wrr") {
+          var totalWeight = 0;
+          pool.forEach(function (b) {
+            if (wrrState[b.id] === undefined) wrrState[b.id] = 0;
+            wrrState[b.id] += b.capacity;
+            totalWeight += b.capacity;
+          });
+          var best = pool[0];
+          pool.forEach(function (b) { if (wrrState[b.id] > wrrState[best.id]) best = b; });
+          wrrState[best.id] -= totalWeight;
+          return best;
+        }
+
+        if (algo === "lc") {
+          var least = pool[0];
+          pool.forEach(function (b) {
+            if (b.inFlight.length < least.inFlight.length) least = b;
+          });
+          return least;
+        }
+
+        // naive hash: a synthetic client id mod current pool size
+        var clientId = Math.floor(Math.random() * 97);
+        return pool[clientId % pool.length];
+      }
+
+      function tickHealthChecks() {
+        backends.forEach(function (b) {
+          if (b.killed) {
+            b.passStreak = 0;
+            b.failStreak++;
+            if (!b.evicted && b.failStreak >= HEALTH_STREAK_NEEDED) {
+              b.evicted = true;
+              noteEl.textContent = "Health check: backend " + b.label + " failed " + HEALTH_STREAK_NEEDED +
+                " checks in a row and was evicted from rotation. Traffic is rebalancing onto the remaining backends.";
+            }
+          } else {
+            b.failStreak = 0;
+            if (b.evicted) {
+              b.passStreak++;
+              if (b.passStreak >= HEALTH_STREAK_NEEDED) {
+                b.evicted = false;
+                b.passStreak = 0;
+                noteEl.textContent = "Health check: backend " + b.label + " passed " + HEALTH_STREAK_NEEDED +
+                  " checks in a row and is back in rotation.";
+              }
+            }
+          }
+        });
+      }
+
+      function tick() {
+        if (!running) return;
+        simTime += DT;
+        sinceHealthCheck += DT;
+
+        if (sinceHealthCheck >= HEALTH_CHECK_INTERVAL_S) {
+          sinceHealthCheck = 0;
+          tickHealthChecks();
+        }
+
+        var rate = parseInt(rateEl.value, 10);
+        var algo = algoEl.value;
+        var arrivals = poissonSample(rate * DT);
+
+        for (var a = 0; a < arrivals; a++) {
+          var b = pickBackend(algo);
+          if (!b) { totalDropped++; continue; }
+          if (b.inFlight.length < b.capacity) {
+            var serviceS = Math.max(0.03, 0.12 + (Math.random() - 0.5) * 0.08);
+            b.inFlight.push(simTime + serviceS);
+          } else if (b.queue.length < QUEUE_CAP) {
+            b.queue.push(simTime);
+          } else {
+            totalDropped++;
+          }
+        }
+
+        backends.forEach(function (b) {
+          var stillFlight = [];
+          for (var i = 0; i < b.inFlight.length; i++) {
+            if (b.inFlight[i] <= simTime) {
+              b.served++;
+              totalServed++;
+              b.recentServed.push(simTime);
+            } else {
+              stillFlight.push(b.inFlight[i]);
+            }
+          }
+          b.inFlight = stillFlight;
+
+          while (b.inFlight.length < b.capacity && b.queue.length) {
+            b.queue.shift();
+            var serviceS2 = Math.max(0.03, 0.12 + (Math.random() - 0.5) * 0.08);
+            b.inFlight.push(simTime + serviceS2);
+          }
+
+          var cutoff = simTime - SHARE_WINDOW_S;
+          while (b.recentServed.length && b.recentServed[0] < cutoff) b.recentServed.shift();
+        });
+
+        render();
+      }
+
+      function poissonSample(lambda) {
+        if (lambda <= 0) return 0;
+        if (lambda > 30) {
+          var u = Math.random() || 1e-9, v = Math.random();
+          var g = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+          return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * g));
+        }
+        var L = Math.exp(-lambda), k = 0, p = 1;
+        do { k++; p *= Math.random(); } while (p > L);
+        return k - 1;
+      }
+
+      function setHealthBadge(b) {
+        var el = document.getElementById("lbHealth" + b.id);
+        var card = document.getElementById("lbCard" + b.id);
+        el.classList.remove("lb-badge-ok", "lb-badge-warn", "lb-badge-danger", "lb-badge-muted");
+        card.classList.remove("lb-evicted");
+        if (b.evicted) {
+          el.textContent = "EVICTED";
+          el.classList.add("lb-badge-danger");
+          card.classList.add("lb-evicted");
+        } else if (b.killed) {
+          el.textContent = "FAILING (" + b.failStreak + "/" + HEALTH_STREAK_NEEDED + ")";
+          el.classList.add("lb-badge-warn");
+        } else {
+          var ratio = b.capacity ? b.inFlight.length / b.capacity : 0;
+          if (ratio >= 1) { el.textContent = "OVERLOADED"; el.classList.add("lb-badge-danger"); }
+          else if (ratio >= 0.7) { el.textContent = "NEAR CAPACITY"; el.classList.add("lb-badge-warn"); }
+          else { el.textContent = "HEALTHY"; el.classList.add("lb-badge-ok"); }
+        }
+      }
+
+      function render() {
+        rateVal.textContent = rateEl.value;
+        servedEl.textContent = totalServed;
+        droppedEl.textContent = totalDropped;
+        var healthy = healthyBackends().length;
+        healthyCountEl.textContent = healthy + "/" + backends.length;
+
+        var totalRecent = 0;
+        backends.forEach(function (b) { totalRecent += b.recentServed.length; });
+
+        backends.forEach(function (b) {
+          var ratio = b.capacity ? Math.min(1, b.inFlight.length / b.capacity) : 0;
+          var fill = document.getElementById("lbLoad" + b.id);
+          if (fill) {
+            fill.style.width = (ratio * 100).toFixed(0) + "%";
+            fill.style.background = ratio >= 1 ? "var(--danger)" : ratio >= 0.7 ? "var(--warn)" : "var(--ok)";
+          }
+          var activeEl = document.getElementById("lbActive" + b.id);
+          if (activeEl) activeEl.textContent = b.inFlight.length + "/" + b.capacity;
+          var queueElB = document.getElementById("lbQueue" + b.id);
+          if (queueElB) queueElB.textContent = b.queue.length;
+          var servedElB = document.getElementById("lbServedB" + b.id);
+          if (servedElB) servedElB.textContent = b.served;
+          setHealthBadge(b);
+
+          var pct = totalRecent > 0 ? (b.recentServed.length / totalRecent) * 100 : 0;
+          var shareFill = document.getElementById("lbShareFill" + b.id);
+          var sharePct = document.getElementById("lbSharePct" + b.id);
+          if (shareFill) shareFill.style.width = pct.toFixed(0) + "%";
+          if (sharePct) sharePct.textContent = pct.toFixed(0) + "%";
+        });
+
+        if (!noteEl.textContent) {
+          noteEl.textContent = "Adjust capacities and switch algorithms to see how request distribution changes. Round robin ignores capacity; weighted round robin and least connections both account for it.";
+        }
+      }
+
+      rateEl.addEventListener("input", function () { rateVal.textContent = rateEl.value; });
+      algoEl.addEventListener("change", function () {
+        rrPointer = 0;
+        wrrState = {};
+        noteEl.textContent = "Switched to " + algoEl.options[algoEl.selectedIndex].text + ". Watch the distribution bars re-settle.";
+      });
+      runBtn.addEventListener("click", function () {
+        running = !running;
+        runBtn.textContent = running ? "Pause" : "Run";
+      });
+      resetBtn.addEventListener("click", function () {
+        var count = backends.length || 4;
+        resetSim(count);
+        noteEl.textContent = "";
+        render();
+      });
+      addBtn.addEventListener("click", function () {
+        if (backends.length >= MAX_BACKENDS) return;
+        var caps = [3, 3, 3, 1, 5, 2];
+        backends.push(makeBackend(caps[backends.length % caps.length]));
+        buildCards();
+        render();
+      });
+      removeBtn.addEventListener("click", function () {
+        if (backends.length <= MIN_BACKENDS) return;
+        backends.pop();
+        buildCards();
+        render();
+      });
+
+      resetSim(4);
+      render();
+      runBtn.textContent = running ? "Pause" : "Run";
+      setInterval(tick, TICK_MS);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
