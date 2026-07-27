@@ -130,7 +130,7 @@
       "summary": "Vertical vs horizontal, why statelessness enables scale-out, LB algorithms, and health checks.",
       "prerequisites": ["concurrency-and-io"],
       "file": "scaling-and-load-balancing.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "replication-and-partitioning",
