@@ -140,7 +140,7 @@
       "summary": "Leader/follower vs leaderless, replication lag, sharding, consistent hashing, and hot partitions.",
       "prerequisites": ["scaling-and-load-balancing", "transactions-and-isolation"],
       "file": "replication-and-partitioning.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "consistency-and-consensus",
