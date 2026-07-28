@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Replication &amp; Partitioning — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the consistent-hashing ring and the
+       replication-lag timeline widgets only. */
+
+    /* --- Ring widget --- */
+    .ring-layout { display: grid; gap: var(--sp-5); grid-template-columns: minmax(240px, 320px) 1fr; align-items: start; }
+    @media (max-width: 640px) { .ring-layout { grid-template-columns: 1fr; } }
+    .ring-svg-wrap { display: flex; justify-content: center; }
+    .ring-svg-wrap svg { width: 100%; max-width: 320px; height: auto; }
+    .ring-controls { display: grid; gap: var(--sp-4); }
+    .ring-controls label { display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em; }
+    .ring-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .ring-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+    .ring-mode-row { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+    .ring-mode-row .btn.active { filter: brightness(1); box-shadow: var(--ring); }
+    .ring-stats { font-size: var(--fs-sm); display: grid; gap: 0.3em; }
+    .ring-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .ring-stat-label { color: var(--text-muted); }
+    .ring-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .ring-legend { display: flex; flex-wrap: wrap; gap: var(--sp-3); font-size: var(--fs-sm); margin-top: var(--sp-3); }
+    .ring-legend-item { display: flex; align-items: center; gap: 0.4em; color: var(--text-muted); }
+    .ring-swatch { width: 0.8em; height: 0.8em; border-radius: 50%; display: inline-block; }
+    .ring-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-4); min-height: 2.6em; }
+    .ring-load-bars { display: grid; gap: 0.35em; margin-top: var(--sp-4); }
+    .ring-load-row { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-sm); }
+    .ring-load-label { width: 3.2em; font-family: var(--font-mono); color: var(--text-muted); }
+    .ring-load-track { flex: 1; height: 10px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+    .ring-load-fill { height: 100%; }
+    .ring-load-pct { width: 3.4em; text-align: right; font-family: var(--font-mono); color: var(--text); }
+
+    /* --- Replication lag widget --- */
+    .repl-nodes { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin-bottom: var(--sp-4); }
+    .repl-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); }
+    .repl-card.repl-leader { border-color: var(--blueprint); }
+    .repl-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--sp-3); }
+    .repl-card-head h4 { margin: 0; font-size: var(--fs-md); font-family: var(--font-mono); color: var(--text); }
+    .repl-value { font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 700; color: var(--accent-strong); margin-bottom: var(--sp-2); }
+    .repl-lag-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-3); }
+    .repl-lag-row input[type="range"] { flex: 1; }
+    .repl-lag-val { font-family: var(--font-mono); color: var(--text); width: 3.4em; text-align: right; }
+    .repl-read-btn { width: 100%; font-size: var(--fs-sm); }
+    .repl-status { margin-top: var(--sp-2); font-size: var(--fs-sm); font-family: var(--font-mono); min-height: 1.4em; }
+    .repl-status.fresh { color: var(--ok); }
+    .repl-status.stale { color: var(--danger); }
+    .repl-toggle-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-muted); margin: var(--sp-3) 0 var(--sp-4); }
+    .repl-log { font-family: var(--font-mono); font-size: var(--fs-sm); background: var(--surface-code); color: var(--text-on-code); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); max-height: 8.5em; overflow-y: auto; }
+    .repl-log div { padding: 0.15em 0; opacity: 0.92; }
+    .repl-log div:last-child { color: var(--accent-strong); opacity: 1; }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Distributed Systems &amp; Scaling // 02</p>
+    <h1>Replication &amp; Partitioning</h1>
+
+    <p>
+      <a href="scaling-and-load-balancing.html">Scaling &amp; Load Balancing</a> made the app tier
+      stateless and fungible — any instance can serve any request because all the state that
+      matters lives somewhere external. This page is about that "somewhere": the data layer, which
+      cannot just be duplicated blindly the way stateless app servers can. Data has to survive a
+      machine dying (<span class="term">replication</span>) and has to fit on more disk and serve
+      more throughput than one machine can provide (<span class="term">partitioning</span>, a.k.a.
+      sharding). Both are simple to state and genuinely hard to get right, because both create a
+      new category of bug that doesn't exist on a single machine: the copies, or the shards,
+      can disagree — even briefly, even by design — about what's true.
+    </p>
+
+    <h2>Why replicate at all</h2>
+    <p>
+      Replication means keeping the same data on multiple machines. Three distinct motivations,
+      and it matters which one you're solving for because they push toward different designs:
+    </p>
+    <ul>
+      <li><b>Availability</b> — if the only copy of a row lives on one disk, that disk dying is
+        data loss and downtime. N copies survive N−1 failures.</li>
+      <li><b>Read throughput</b> — one primary database has a ceiling on reads/sec. Replicas let
+        you spread read traffic across machines (this is <em>not</em> the same as sharding — every
+        replica holds the full dataset).</li>
+      <li><b>Locality / latency</b> — a replica near your users in another region answers reads in
+        single-digit milliseconds instead of crossing an ocean.</li>
+    </ul>
+    <p>
+      All three motivations share the same hard problem: once data exists in more than one place,
+      a write to one copy has to reach the others, and that propagation takes non-zero time. What
+      you do about that gap — who's allowed to write, how followers catch up, what a reader sees
+      in between — is the entire subject of this page.
+    </p>
+
+    <h2>Replication topologies</h2>
+    <p>
+      There are three structural answers to "who can accept a write," and they trade off write
+      availability against how hard conflicts are to reason about.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Topology</th><th>Who accepts writes</th><th>Strength</th><th>Weakness</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Single-leader</b></td>
+            <td>One designated leader; all writes go through it and are streamed to followers</td>
+            <td>No write conflicts — there's one order of truth. The default for Postgres, MySQL,
+              MongoDB replica sets.</td>
+            <td>The leader is a write bottleneck and, until failover completes, a single point of
+              failure for writes.</td>
+          </tr>
+          <tr>
+            <td><b>Multi-leader</b></td>
+            <td>Several nodes (often one per data center) each accept local writes and replicate
+              to the others</td>
+            <td>Writes survive a whole data center going dark; low local write latency</td>
+            <td>Two leaders can accept conflicting writes to the same row at the same time —
+              conflict <em>detection and resolution</em> becomes the application's problem</td>
+          </tr>
+          <tr>
+            <td><b>Leaderless</b></td>
+            <td>Any replica accepts a write; the client (or a coordinator) writes to several
+              replicas directly and reads from several, reconciling on read</td>
+            <td>No leader means no failover pause — the system degrades gracefully as nodes come
+              and go. Dynamo, Cassandra, Riak.</td>
+            <td>Consistency is a per-request choice (quorums, below) rather than a structural
+              guarantee; the client/driver carries real logic</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>Multi-leader replication looks like a free lunch — "just let every region write
+        locally" — until two customers in two regions update the same shopping cart within the
+        same second. Now you have two histories that both happened and disagree, and something has
+        to decide the outcome: last-write-wins (silently drops one customer's change), a merge
+        function (correct only if the data type supports it, e.g. a CRDT counter), or surfacing the
+        conflict to a human. There is no topology that makes this problem disappear — multi-leader
+        just moves it from "does this happen" to "how do I resolve it," which is why most teams
+        default to single-leader unless multi-region write availability is a hard requirement.</p>
+      </div>
+    </div>
+
+    <h2>Replication lag and the anomalies it causes</h2>
+    <p>
+      Even the simple case — single-leader, asynchronous replication — has a gap: the leader
+      acknowledges a write before every follower has applied it. That gap is
+      <span class="term">replication lag</span>, and a reader who hits a follower during it can
+      observe the past. Three specific anomalies, precisely defined, because interviewers ask for
+      exactly this vocabulary:
+    </p>
+    <dl class="definition">
+      <dt>Read-your-writes consistency</dt>
+      <dd>A guarantee that a client who just wrote a value will see that value on their very next
+        read — even if that read lands on a lagging replica. Violating it looks like: you post a
+        comment, refresh, and it's gone. The fix is routing: either read your own writes from the
+        leader for some window after writing, or read from whichever replica you just wrote
+        through, or stamp the write with a version and require the replica serving the read to be
+        at least that version ("read-after-write" via a monotonic cursor).</dd>
+      <dt>Monotonic reads</dt>
+      <dd>A guarantee that a client's reads never go <em>backward</em> in time, even across
+        multiple lagging replicas. Violating it looks like: you read a fresh comment from replica
+        A, refresh, get routed to replica B which hasn't caught up yet, and the comment is gone
+        again. The usual fix is <em>sticky routing</em> — pin a client to the same replica for the
+        duration of a session, so it only ever sees that one replica's timeline, which is
+        monotonic by construction.</dd>
+      <dt>Consistent prefix reads</dt>
+      <dd>A guarantee that if write A happened-before write B, no reader ever observes B without A
+        — you never see an answer before its question. This mostly bites in partitioned/sharded
+        systems where causally related writes land on different partitions that replicate
+        independently and can be observed out of order.</dd>
+    </dl>
+    <p>
+      All three are about <em>asynchronous</em> replication specifically. <b>Synchronous
+      replication</b> — the leader waits for one or more followers to confirm before acknowledging
+      the write — eliminates lag-based staleness entirely, at the direct cost of write latency
+      (now bounded by your slowest required follower) and write availability (that follower being
+      down blocks writes). Most production systems pick a middle ground: one synchronous follower
+      for durability, the rest asynchronous for read scaling — a trade-off you should be ready to
+      name explicitly, not something to treat as a fixed default.
+    </p>
+
+    <h2>Failover</h2>
+    <p>
+      When a single leader dies, something has to promote a follower to take its place. Getting
+      this wrong is one of the most common sources of real production data loss, so the mechanics
+      matter:
+    </p>
+    <ol>
+      <li><b>Detect</b> the leader is actually down (not just slow) — usually via missed
+        heartbeats to a coordination service (etcd, ZooKeeper) or the followers themselves.</li>
+      <li><b>Elect</b> a new leader — typically the follower with the most up-to-date replicated
+        log, decided via a consensus protocol (previewed here, covered properly in
+        <em>Consistency Models, CAP &amp; Consensus</em>).</li>
+      <li><b>Reconfigure</b> clients and the load balancer to send writes to the new leader.</li>
+    </ol>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution — split brain</span>
+      <div class="callout-body">
+        <p>If the old leader wasn't actually dead — just partitioned from the coordination
+        service by a network blip — it may still think it's the leader and keep accepting writes
+        while a new leader is elected elsewhere. Now two nodes both believe they're the leader and
+        both accept writes: <span class="term">split brain</span>. The standard defense is
+        <span class="term">fencing</span> — the new leader's epoch/term number is written
+        somewhere all clients and storage check, and anything presenting an old epoch is rejected,
+        including the old leader trying to write to shared storage. Failover that skips fencing
+        trades a short outage for a subtler, worse bug: two histories that both look authoritative.</p>
+      </div>
+    </div>
+    <p>
+      There's also a real trade-off in <em>how fast</em> to fail over. Failing over too eagerly on
+      a transient blip causes unnecessary leader churn and possible data loss (in-flight writes to
+      the old leader that hadn't replicated yet); waiting too long extends the write outage. Most
+      systems tune this with a timeout in the 10–30s range plus a required quorum of followers
+      agreeing the leader is unreachable — precisely to avoid one confused node triggering
+      failover on its own.
+    </p>
+
+    <h2>Partitioning: when replication isn't the axis you need</h2>
+    <p>
+      Replication gives every node the <em>same</em> full dataset — it solves durability and read
+      throughput, but does nothing for a dataset or write volume too large for one machine.
+      <span class="term">Partitioning</span> (sharding) splits the data itself across machines, so
+      each holds a subset. Production systems combine both: N partitions, each replicated M ways.
+      Two structural choices for how to split:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>How it splits</th><th>Strength</th><th>Weakness</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Range partitioning</b></td>
+            <td>Contiguous key ranges go to each partition (e.g. users A–F, G–M, ...)</td>
+            <td>Range scans stay on one partition — "give me all events from today" is fast</td>
+            <td>Sequential keys (timestamps, auto-increment IDs) concentrate all new writes on the
+              single partition holding the current tail — a moving hot spot</td>
+          </tr>
+          <tr>
+            <td><b>Hash partitioning</b></td>
+            <td>Hash the key, use the hash to pick a partition — spreads keys near-uniformly</td>
+            <td>Kills the sequential-write hot spot; even load without careful key design</td>
+            <td>A range scan now has to fan out to every partition and merge results — you traded
+              hot spots for scatter-gather</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — the hot partition</span>
+      <div class="callout-body">
+        <p>Partitioning assumes access is roughly uniform across keys. It usually isn't. A
+        celebrity account's posts, a viral product ID, "today" in a range-partitioned event log —
+        one key or one narrow range absorbs disproportionate traffic, and adding more partitions
+        doesn't help because the hot key still lives on exactly one of them. Fixes are all
+        application-aware: salt the hot key into several sub-keys and fan reads out across them,
+        cache the hot key aggressively (<a href="caching-strategies.html">Caching
+        Strategies</a>) so the partition layer rarely sees it, or move that one key to dedicated
+        capacity. There's no partitioning scheme that makes a skewed access pattern uniform for
+        free.</p>
+      </div>
+    </div>
+
+    <h2>Consistent hashing: partitioning that survives resizing</h2>
+    <p>
+      Naive hash partitioning — <code>partition = hash(key) % N</code> — has the exact failure
+      mode flagged in the load-balancing page's caution: change N by adding or removing one node,
+      and the modulo output changes for almost <em>every</em> key, not just the ones that needed
+      to move. For a load balancer that's an annoying stampede; for a sharded database it means
+      re-copying nearly the entire dataset every time you resize the cluster.
+    </p>
+    <p>
+      <span class="term">Consistent hashing</span> fixes this by hashing both keys <em>and</em>
+      nodes onto the same circular space (a "ring") and assigning each key to the next node found
+      walking clockwise. Adding a node only steals the keys between it and its clockwise neighbor
+      — roughly a 1/N share — and removing a node only affects the keys it was holding, which fall
+      through to its neighbor. Nobody else's assignment changes. Real implementations give each
+      physical node many <span class="term">virtual nodes</span> (dozens to hundreds of points on
+      the ring) rather than one, because a single point per node makes each node's share of the
+      ring lumpy — virtual nodes average that out into a much more even distribution, and also mean
+      a node's departure spreads its load across many neighbors instead of dumping it all on one.
+    </p>
+
+    <h2>Try it: consistent-hashing ring</h2>
+    <p>
+      A ring, a handful of keys, and a set of nodes with adjustable virtual-node count. Add or
+      remove a node and compare how many keys move under <b>consistent hashing</b> versus a
+      <b>naive mod-N</b> scheme applied to the same change — then turn virtual nodes down to 1 and
+      watch the per-node balance get lumpy.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Consistent-hashing ring</div>
+      <div class="ring-layout">
+        <div class="ring-svg-wrap">
+          <svg id="ringSvg" viewBox="0 0 300 300" role="img" aria-label="Consistent hashing ring diagram"></svg>
+        </div>
+        <div class="ring-controls">
+          <div class="ring-mode-row">
+            <button class="btn active" id="ringModeConsistent" type="button">Consistent hashing</button>
+            <button class="btn secondary" id="ringModeNaive" type="button">Naive mod-N</button>
+          </div>
+          <div>
+            <label for="ringVnodes">Virtual nodes per physical node: <span class="val" id="ringVnodesVal">12</span></label>
+            <input type="range" id="ringVnodes" min="1" max="40" step="1" value="12" />
+          </div>
+          <div class="ring-actions">
+            <button class="btn secondary" id="ringAdd" type="button">+ Add node</button>
+            <button class="btn secondary" id="ringRemove" type="button">− Remove node</button>
+            <button class="btn secondary" id="ringReset" type="button">Reset</button>
+          </div>
+          <div class="ring-stats">
+            <div><span class="ring-stat-label">Nodes</span><span class="ring-stat-val" id="ringNodeCount">4</span></div>
+            <div><span class="ring-stat-label">Keys tracked</span><span class="ring-stat-val" id="ringKeyCount">48</span></div>
+            <div><span class="ring-stat-label">Keys moved by last change</span><span class="ring-stat-val" id="ringMoved">—</span></div>
+          </div>
+          <div class="ring-legend" id="ringLegend"></div>
+        </div>
+      </div>
+      <div class="ring-load-bars" id="ringLoadBars"></div>
+      <p class="ring-note" id="ringNote">Add or remove a node and watch the "keys moved" stat. Switch to naive mod-N and repeat the same change — same scenario, far more churn.</p>
+    </div>
+
+    <h2>Try it: replication lag and stale reads</h2>
+    <p>
+      One leader, two followers with independently adjustable lag. Write a value, then read it
+      back from each node to see who's caught up and who's still stale — then turn on
+      read-your-writes routing and watch your own reads stop landing on a stale follower.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Replication lag simulator</div>
+      <div class="repl-nodes">
+        <div class="repl-card repl-leader">
+          <div class="repl-card-head"><h4>Leader</h4><span class="badge accent">writes here</span></div>
+          <div class="repl-value" id="replLeaderVal">v0</div>
+          <button class="btn secondary repl-read-btn" id="replReadLeader" type="button">Read from leader</button>
+          <div class="repl-status" id="replStatusLeader"></div>
+        </div>
+        <div class="repl-card">
+          <div class="repl-card-head"><h4>Follower A</h4></div>
+          <div class="repl-value" id="replFollowerAVal">v0</div>
+          <div class="repl-lag-row">lag <input type="range" id="replLagA" min="0" max="3000" step="100" value="300" /><span class="repl-lag-val" id="replLagAVal">300ms</span></div>
+          <button class="btn secondary repl-read-btn" id="replReadA" type="button">Read from follower A</button>
+          <div class="repl-status" id="replStatusA"></div>
+        </div>
+        <div class="repl-card">
+          <div class="repl-card-head"><h4>Follower B</h4></div>
+          <div class="repl-value" id="replFollowerBVal">v0</div>
+          <div class="repl-lag-row">lag <input type="range" id="replLagB" min="0" max="3000" step="100" value="1800" /><span class="repl-lag-val" id="replLagBVal">1800ms</span></div>
+          <button class="btn secondary repl-read-btn" id="replReadB" type="button">Read from follower B</button>
+          <div class="repl-status" id="replStatusB"></div>
+        </div>
+      </div>
+      <div class="ring-actions">
+        <button class="btn" id="replWrite" type="button">Write new value</button>
+        <button class="btn secondary" id="replReset" type="button">Reset</button>
+      </div>
+      <div class="repl-toggle-row">
+        <input type="checkbox" id="replRYW" />
+        <label for="replRYW">Read-your-writes routing: for 2s after my own write, force my reads to the leader</label>
+      </div>
+      <div class="repl-log" id="replLog"></div>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Try this sequence with read-your-writes <em>off</em>: write, then immediately read from
+        follower B (long lag) — stale. Then read from follower A (short lag) shortly after — it
+        may have caught up while B hadn't, and reading A after B looks like the value went
+        <em>backward and forward</em> depending on which node you happened to hit, i.e. exactly the
+        monotonic-reads violation described above if a single client bounced between them. Turn
+        read-your-writes on and repeat: your own post-write reads stop being routed to a lagging
+        follower at all.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A feature store has the exact same shape as this page. An online feature store (Redis,
+        DynamoDB) is typically written by a streaming or batch pipeline and read by the serving
+        path at request time — that's single-leader replication with the pipeline as the sole
+        writer. Replication lag here is <em>feature staleness</em>: a feature computed at t and
+        served at t+lag is exactly the read-your-writes problem, just renamed — "the model scored
+        against a feature that doesn't reflect the user's latest action yet" is the ML term for a
+        stale read. And a feature store keyed by user ID has the same hot-partition risk as any
+        other partitioned store: a small number of extremely active users can dominate a
+        partition's read/write volume unless the key space is spread deliberately (hashing,
+        salting) rather than left to fall wherever a natural ID happens to land.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A user updates their profile photo, and the page immediately re-fetches
+          the profile to show it — but the request lands on a replica that hasn't applied the write
+          yet, so the old photo flashes briefly. Which guarantee was violated?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Consistent prefix reads</button>
+          <button class="quiz-option" data-choice="b">Read-your-writes consistency</button>
+          <button class="quiz-option" data-choice="c">Monotonic reads</button>
+        </div>
+        <p class="quiz-explain" hidden>This is precisely read-your-writes: a client's own write should be visible on that same client's next read. The fix is routing that client's read to the leader (or to a replica known to be caught up to that write) for a short window, not a general consistency setting on the whole database.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. A cluster resizes from 4 to 5 nodes. Under naive <code>hash(key) % N</code>
+          partitioning, roughly what fraction of keys typically end up mapped to a different node
+          than before, compared to consistent hashing for the same resize?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Both schemes move about the same fraction — the difference is only in which specific keys move.</button>
+          <button class="quiz-option" data-choice="b">Naive mod-N moves fewer keys, because modulo arithmetic is more predictable.</button>
+          <button class="quiz-option" data-choice="c">Naive mod-N remaps the vast majority of keys (changing N changes almost every result of `% N`), while consistent hashing remaps only the ~1/N share that structurally has to move to the new node.</button>
+        </div>
+        <p class="quiz-explain" hidden>This is the whole reason consistent hashing exists: modulo partitioning is a function of N, so any change to N perturbs nearly every key's assignment, forcing a near-total data reshuffle. Consistent hashing only reassigns the ring segment adjacent to the node that joined or left.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A products table is range-partitioned by <code>created_at</code> so
+          recent-first queries stay on one partition. Ingestion suddenly hot-spots on a single
+          partition during a product launch. Why, and what's a fix that doesn't abandon range
+          partitioning's scan advantage entirely?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">All new writes have a `created_at` near "now," so they all land on the one partition holding the current time range; a common fix is prefixing/salting the key (e.g. a coarse random or bucketed prefix ahead of the timestamp) so writes spread across several partitions while queries still range-scan within a known set of buckets.</button>
+          <button class="quiz-option" data-choice="b">Range partitioning can't hot-spot by definition — the problem must be a broken load balancer in front of the database.</button>
+          <button class="quiz-option" data-choice="c">The fix is to switch every table to single-leader replication instead of partitioning.</button>
+        </div>
+        <p class="quiz-explain" hidden>Sequential/monotonic keys are the textbook range-partitioning hot spot: "now" always lives on one partition. Salting/bucketing the key spreads writes across partitions while a query can still target the small known set of buckets for a given time range, keeping most of the scan benefit.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page is a prerequisite for two directions: <em>Consistency Models, CAP &amp;
+      Consensus</em> (what quorums and leader election, previewed above, actually guarantee — and
+      what CAP says you must give up when a partition splits your replicas), and, once messaging is
+      covered too, the capstone's system-design method, which leans on replication and partitioning
+      choices in nearly every design prompt. If you'd rather branch elsewhere first,
+      <em>Messaging, Queues &amp; Event-Driven Architecture</em> and <em>Resilience Patterns</em>
+      are both unlocked already and don't depend on this page.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------------------------------------------------------
+         Consistent-hashing ring widget
+         ------------------------------------------------------------- */
+      var RING_SIZE = 3600; // hash space, in tenths of a degree
+      var KEY_COUNT = 48;
+      var NODE_COLORS = ["#0c8d7d", "#2a63d6", "#b26a00", "#6b3fd4", "#c8353c", "#1f9d51", "#7488a0"];
+
+      var ringSvg = document.getElementById("ringSvg");
+      var ringVnodes = document.getElementById("ringVnodes");
+      var ringVnodesVal = document.getElementById("ringVnodesVal");
+      var ringAdd = document.getElementById("ringAdd");
+      var ringRemove = document.getElementById("ringRemove");
+      var ringReset = document.getElementById("ringReset");
+      var ringModeConsistent = document.getElementById("ringModeConsistent");
+      var ringModeNaive = document.getElementById("ringModeNaive");
+      var ringNodeCount = document.getElementById("ringNodeCount");
+      var ringKeyCount = document.getElementById("ringKeyCount");
+      var ringMoved = document.getElementById("ringMoved");
+      var ringLegend = document.getElementById("ringLegend");
+      var ringLoadBars = document.getElementById("ringLoadBars");
+      var ringNote = document.getElementById("ringNote");
+
+      var ringMode = "consistent"; // or "naive"
+      var ringNodes = [];    // { id, label, colorIdx }
+      var ringKeys = [];     // { id, pos }
+      var ringNextId = 0;
+      var lastAssignment = null; // map key.id -> node.id, snapshot before a change
+
+      function mulberry32(seed) {
+        var a = seed >>> 0;
+        return function () {
+          a |= 0; a = (a + 0x6D2B79F5) | 0;
+          var t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      function makeNode() {
+        var id = ringNextId++;
+        return { id: id, label: "N" + (id + 1), colorIdx: id % NODE_COLORS.length };
+      }
+
+      function vnodePositions(node, count) {
+        var rand = mulberry32(node.id * 7919 + 13);
+        var positions = [];
+        for (var i = 0; i < count; i++) positions.push(Math.floor(rand() * RING_SIZE));
+        return positions;
+      }
+
+      function allVnodes() {
+        var vc = parseInt(ringVnodes.value, 10);
+        var list = [];
+        ringNodes.forEach(function (node) {
+          vnodePositions(node, vc).forEach(function (pos) {
+            list.push({ pos: pos, nodeId: node.id });
+          });
+        });
+        list.sort(function (a, b) { return a.pos - b.pos; });
+        return list;
+      }
+
+      function consistentAssign() {
+        var vnodes = allVnodes();
+        var assignment = {};
+        if (!vnodes.length) return assignment;
+        ringKeys.forEach(function (key) {
+          var found = null;
+          for (var i = 0; i < vnodes.length; i++) {
+            if (vnodes[i].pos >= key.pos) { found = vnodes[i]; break; }
+          }
+          if (!found) found = vnodes[0]; // wrap around
+          assignment[key.id] = found.nodeId;
+        });
+        return assignment;
+      }
+
+      function simpleHash(n) {
+        n = ((n << 13) ^ n) >>> 0;
+        return (n * (n * n * 15731 + 789221) + 1376312589) >>> 0;
+      }
+
+      function naiveAssign() {
+        var assignment = {};
+        if (!ringNodes.length) return assignment;
+        ringKeys.forEach(function (key) {
+          var idx = simpleHash(key.id) % ringNodes.length;
+          assignment[key.id] = ringNodes[idx].id;
+        });
+        return assignment;
+      }
+
+      function currentAssignment() {
+        return ringMode === "consistent" ? consistentAssign() : naiveAssign();
+      }
+
+      function polar(pos, r) {
+        var angle = (pos / RING_SIZE) * 2 * Math.PI - Math.PI / 2;
+        return { x: 150 + r * Math.cos(angle), y: 150 + r * Math.sin(angle) };
+      }
+
+      function colorFor(nodeId) {
+        var node = ringNodes.filter(function (n) { return n.id === nodeId; })[0];
+        return node ? NODE_COLORS[node.colorIdx] : "#7488a0";
+      }
+
+      function renderRing() {
+        var assignment = currentAssignment();
+        var vc = parseInt(ringVnodes.value, 10);
+        var svgParts = [];
+        svgParts.push('<circle cx="150" cy="150" r="120" fill="none" stroke="var(--border-strong)" stroke-width="2" />');
+
+        if (ringMode === "consistent") {
+          allVnodes().forEach(function (v) {
+            var p = polar(v.pos, 120);
+            svgParts.push('<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="3.5" fill="' + colorFor(v.nodeId) + '" />');
+          });
+        } else {
+          // naive mode: show N evenly spaced boundary markers just for orientation
+          ringNodes.forEach(function (node, i) {
+            var pos = Math.floor((i / Math.max(1, ringNodes.length)) * RING_SIZE);
+            var p = polar(pos, 120);
+            svgParts.push('<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="5" fill="' + colorFor(node.id) + '" stroke="var(--surface)" stroke-width="1.5" />');
+          });
+        }
+
+        ringKeys.forEach(function (key) {
+          var p = polar(key.pos, 96);
+          var nodeId = assignment[key.id];
+          svgParts.push('<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.4" fill="' + colorFor(nodeId) + '" fill-opacity="0.75" />');
+        });
+
+        ringSvg.innerHTML = svgParts.join("");
+
+        ringLegend.innerHTML = ringNodes.map(function (n) {
+          return '<span class="ring-legend-item"><span class="ring-swatch" style="background:' + NODE_COLORS[n.colorIdx] + '"></span>' + n.label + (ringMode === "consistent" ? " (" + vc + " vnodes)" : "") + '</span>';
+        }).join("");
+
+        ringNodeCount.textContent = ringNodes.length;
+        ringKeyCount.textContent = ringKeys.length;
+
+        var counts = {};
+        ringNodes.forEach(function (n) { counts[n.id] = 0; });
+        Object.keys(assignment).forEach(function (kid) { counts[assignment[kid]] = (counts[assignment[kid]] || 0) + 1; });
+        ringLoadBars.innerHTML = ringNodes.map(function (n) {
+          var pct = ringKeys.length ? ((counts[n.id] || 0) / ringKeys.length) * 100 : 0;
+          return '<div class="ring-load-row"><span class="ring-load-label">' + n.label + '</span>' +
+            '<div class="ring-load-track"><div class="ring-load-fill" style="width:' + pct.toFixed(0) + '%;background:' + NODE_COLORS[n.colorIdx] + '"></div></div>' +
+            '<span class="ring-load-pct">' + (counts[n.id] || 0) + ' (' + pct.toFixed(0) + '%)</span></div>';
+        }).join("");
+      }
+
+      function reportMoved(prevAssignment, label) {
+        if (!prevAssignment) { ringMoved.textContent = "—"; return; }
+        var next = currentAssignment();
+        var moved = 0;
+        ringKeys.forEach(function (key) {
+          if (prevAssignment[key.id] !== undefined && prevAssignment[key.id] !== next[key.id]) moved++;
+        });
+        var pct = ringKeys.length ? ((moved / ringKeys.length) * 100).toFixed(0) : 0;
+        ringMoved.textContent = moved + " / " + ringKeys.length + " (" + pct + "%)";
+        ringNote.textContent = label + ": " + moved + " of " + ringKeys.length + " keys (" + pct + "%) moved to a different node. " +
+          (ringMode === "consistent" ? "Only the keys adjacent to the changed node are affected." : "Almost every key's `hash % N` result changed, even though only one node changed.");
+      }
+
+      function resetRing(nodeCount) {
+        ringNextId = 0;
+        ringNodes = [];
+        for (var i = 0; i < nodeCount; i++) ringNodes.push(makeNode());
+        ringKeys = [];
+        var rand = mulberry32(4242);
+        for (var k = 0; k < KEY_COUNT; k++) ringKeys.push({ id: k, pos: Math.floor(rand() * RING_SIZE) });
+        lastAssignment = null;
+        ringMoved.textContent = "—";
+        ringNote.textContent = "Add or remove a node and watch the \"keys moved\" stat. Switch to naive mod-N and repeat the same change — same scenario, far more churn.";
+        renderRing();
+      }
+
+      ringVnodes.addEventListener("input", function () {
+        ringVnodesVal.textContent = ringVnodes.value;
+        renderRing();
+      });
+
+      ringAdd.addEventListener("click", function () {
+        if (ringNodes.length >= 7) return;
+        lastAssignment = currentAssignment();
+        ringNodes.push(makeNode());
+        renderRing();
+        reportMoved(lastAssignment, "Added " + ringNodes[ringNodes.length - 1].label);
+      });
+
+      ringRemove.addEventListener("click", function () {
+        if (ringNodes.length <= 2) return;
+        lastAssignment = currentAssignment();
+        var removed = ringNodes.pop();
+        renderRing();
+        reportMoved(lastAssignment, "Removed " + removed.label);
+      });
+
+      ringReset.addEventListener("click", function () { resetRing(4); });
+
+      ringModeConsistent.addEventListener("click", function () {
+        ringMode = "consistent";
+        ringModeConsistent.classList.add("active");
+        ringModeNaive.classList.remove("active");
+        lastAssignment = null;
+        ringMoved.textContent = "—";
+        renderRing();
+      });
+      ringModeNaive.addEventListener("click", function () {
+        ringMode = "naive";
+        ringModeNaive.classList.add("active");
+        ringModeConsistent.classList.remove("active");
+        lastAssignment = null;
+        ringMoved.textContent = "—";
+        renderRing();
+      });
+
+      resetRing(4);
+
+      /* ---------------------------------------------------------------
+         Replication lag widget
+         ------------------------------------------------------------- */
+      var replLeaderVal = document.getElementById("replLeaderVal");
+      var replFollowerAVal = document.getElementById("replFollowerAVal");
+      var replFollowerBVal = document.getElementById("replFollowerBVal");
+      var replLagA = document.getElementById("replLagA");
+      var replLagB = document.getElementById("replLagB");
+      var replLagAVal = document.getElementById("replLagAVal");
+      var replLagBVal = document.getElementById("replLagBVal");
+      var replWrite = document.getElementById("replWrite");
+      var replReset = document.getElementById("replReset");
+      var replReadLeader = document.getElementById("replReadLeader");
+      var replReadA = document.getElementById("replReadA");
+      var replReadB = document.getElementById("replReadB");
+      var replStatusLeader = document.getElementById("replStatusLeader");
+      var replStatusA = document.getElementById("replStatusA");
+      var replStatusB = document.getElementById("replStatusB");
+      var replRYW = document.getElementById("replRYW");
+      var replLog = document.getElementById("replLog");
+
+      var replVersion = 0;
+      var followerVersion = { A: 0, B: 0 };
+      var pendingTimers = { A: null, B: null };
+      var ownWriteUntil = 0;
+
+      function replLog_(msg) {
+        var div = document.createElement("div");
+        div.textContent = msg;
+        replLog.appendChild(div);
+        replLog.scrollTop = replLog.scrollHeight;
+      }
+
+      function updateLagLabels() {
+        replLagAVal.textContent = replLagA.value + "ms";
+        replLagBVal.textContent = replLagB.value + "ms";
+      }
+
+      function scheduleFollowerUpdate(key, lagMs, version) {
+        if (pendingTimers[key]) clearTimeout(pendingTimers[key]);
+        pendingTimers[key] = setTimeout(function () {
+          followerVersion[key] = version;
+          (key === "A" ? replFollowerAVal : replFollowerBVal).textContent = "v" + version;
+          replLog_("Follower " + key + " applied v" + version + " (after " + lagMs + "ms lag)");
+        }, lagMs);
+      }
+
+      replWrite.addEventListener("click", function () {
+        replVersion++;
+        replLeaderVal.textContent = "v" + replVersion;
+        replLog_("Write: leader committed v" + replVersion);
+        var lagA = parseInt(replLagA.value, 10);
+        var lagB = parseInt(replLagB.value, 10);
+        scheduleFollowerUpdate("A", lagA, replVersion);
+        scheduleFollowerUpdate("B", lagB, replVersion);
+        if (replRYW.checked) {
+          ownWriteUntil = Date.now() + 2000;
+          replLog_("Read-your-writes: my reads route to the leader until the window closes");
+        }
+      });
+
+      function doRead(node, displayEl, statusEl, currentVersion) {
+        var routedToLeader = false;
+        if (replRYW.checked && node !== "leader" && Date.now() < ownWriteUntil) {
+          routedToLeader = true;
+        }
+        var effectiveNode = routedToLeader ? "leader" : node;
+        var value = effectiveNode === "leader" ? replVersion : followerVersion[effectiveNode];
+        var isStale = value < replVersion;
+        statusEl.textContent = (routedToLeader ? "(routed to leader) " : "") +
+          "read v" + value + (isStale ? " — STALE (leader is at v" + replVersion + ")" : " — FRESH");
+        statusEl.className = "repl-status " + (isStale ? "stale" : "fresh");
+        replLog_("Read from " + (routedToLeader ? "leader (routed for " + node + ")" : node) + ": v" + value + (isStale ? " (stale)" : " (fresh)"));
+      }
+
+      replReadLeader.addEventListener("click", function () { doRead("leader", replLeaderVal, replStatusLeader); });
+      replReadA.addEventListener("click", function () { doRead("A", replFollowerAVal, replStatusA); });
+      replReadB.addEventListener("click", function () { doRead("B", replFollowerBVal, replStatusB); });
+
+      replLagA.addEventListener("input", updateLagLabels);
+      replLagB.addEventListener("input", updateLagLabels);
+
+      replReset.addEventListener("click", function () {
+        replVersion = 0;
+        followerVersion = { A: 0, B: 0 };
+        if (pendingTimers.A) clearTimeout(pendingTimers.A);
+        if (pendingTimers.B) clearTimeout(pendingTimers.B);
+        replLeaderVal.textContent = "v0";
+        replFollowerAVal.textContent = "v0";
+        replFollowerBVal.textContent = "v0";
+        replStatusLeader.textContent = "";
+        replStatusA.textContent = "";
+        replStatusB.textContent = "";
+        replStatusLeader.className = "repl-status";
+        replStatusA.className = "repl-status";
+        replStatusB.className = "repl-status";
+        replLog.innerHTML = "";
+        replLog_("Reset. Leader and both followers at v0.");
+      });
+
+      updateLagLabels();
+      replLog_("Ready. Write a value, then read from each node.");
+
+      /* ---------------------------------------------------------------
+         Quiz interactivity (shared pattern across deep-dives)
+         ------------------------------------------------------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
