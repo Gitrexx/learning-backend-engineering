@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Consistency Models, CAP &amp; Consensus — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the quorum tuner and the Raft-in-miniature
+       widgets only. */
+
+    /* --- Quorum tuner --- */
+    .q-layout { display: grid; gap: var(--sp-5); grid-template-columns: minmax(240px, 300px) 1fr; align-items: start; }
+    @media (max-width: 640px) { .q-layout { grid-template-columns: 1fr; } }
+    .q-controls { display: grid; gap: var(--sp-4); }
+    .q-controls label { display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em; }
+    .q-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .q-verdict { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border-radius: var(--radius); font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: 700; }
+    .q-verdict.safe { background: var(--ok-soft); color: var(--ok); }
+    .q-verdict.unsafe { background: var(--danger-soft); color: var(--danger); }
+    .q-nodes { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: var(--sp-3) 0; }
+    .q-node { width: 2.6em; height: 2.6em; border-radius: 50%; display: grid; place-items: center; font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: 700; border: 2px solid var(--border-strong); background: var(--surface-2); color: var(--text-muted); transition: background .15s, border-color .15s, color .15s; }
+    .q-node.written { border-color: var(--blueprint); background: var(--blueprint-soft); color: var(--blueprint); }
+    .q-node.read { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); }
+    .q-node.hit { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    .q-node.miss { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .q-result { font-size: var(--fs-sm); display: grid; gap: 0.3em; margin-top: var(--sp-4); }
+    .q-result > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .q-result-label { color: var(--text-muted); }
+    .q-result-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .q-bar-track { height: 12px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; margin-top: var(--sp-2); }
+    .q-bar-fill { height: 100%; background: var(--ok); transition: width .25s; }
+    .q-bar-fill.bad { background: var(--danger); }
+    .q-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-4); min-height: 2.6em; }
+
+    /* --- Raft-in-miniature --- */
+    .rf-layout { display: grid; gap: var(--sp-5); grid-template-columns: minmax(260px, 340px) 1fr; align-items: start; }
+    @media (max-width: 720px) { .rf-layout { grid-template-columns: 1fr; } }
+    .rf-svg-wrap { display: flex; justify-content: center; }
+    .rf-svg-wrap svg { width: 100%; max-width: 340px; height: auto; }
+    .rf-status { display: grid; gap: 0.3em; font-size: var(--fs-sm); margin-bottom: var(--sp-4); }
+    .rf-status > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .rf-status-label { color: var(--text-muted); }
+    .rf-status-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .rf-status-val.ok { color: var(--ok); }
+    .rf-status-val.bad { color: var(--danger); }
+    .rf-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+    .rf-hint { font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-4); }
+    .rf-legend { display: flex; flex-wrap: wrap; gap: var(--sp-3); font-size: var(--fs-sm); margin-bottom: var(--sp-4); }
+    .rf-legend-item { display: flex; align-items: center; gap: 0.4em; color: var(--text-muted); }
+    .rf-swatch { width: 0.8em; height: 0.8em; border-radius: 50%; display: inline-block; border: 2px solid var(--border-strong); }
+    .rf-swatch.leader { background: var(--accent); border-color: var(--accent); }
+    .rf-swatch.follower { background: var(--blueprint-soft); border-color: var(--blueprint); }
+    .rf-swatch.partitioned { background: var(--warn-soft); border-color: var(--warn); border-style: dashed; }
+    .rf-swatch.down { background: var(--surface-2); border-color: var(--border-strong); }
+    .rf-log { font-family: var(--font-mono); font-size: var(--fs-sm); background: var(--surface-code); color: var(--text-on-code); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); max-height: 9em; overflow-y: auto; }
+    .rf-log div { padding: 0.15em 0; opacity: 0.92; }
+    .rf-log div:last-child { color: var(--accent-strong); opacity: 1; }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Distributed Systems &amp; Scaling // 03</p>
+    <h1>Consistency Models, CAP &amp; Consensus</h1>
+
+    <p>
+      <a href="replication-and-partitioning.html">Replication &amp; Partitioning</a> established
+      that once data lives on more than one node, a write to one copy takes time to reach the
+      others, and a reader can land on a node that hasn't caught up yet. That page named three
+      specific staleness anomalies (read-your-writes, monotonic reads, consistent prefix reads)
+      as symptoms. This page is about the underlying question those symptoms are all instances
+      of: <b>what does a distributed system actually promise about what a reader sees</b>, how
+      much of that promise you can afford to keep once the network fails, and how a cluster of
+      independent machines manages to agree on anything — like who the leader even is — when
+      failures are the normal case, not the exception.
+    </p>
+
+    <h2>The consistency spectrum</h2>
+    <p>
+      "Consistency" gets used loosely; precisely, it's a spectrum of guarantees about the
+      <em>order</em> and <em>recency</em> of the values different clients are allowed to observe.
+      Stronger guarantees are easier to reason about and strictly more expensive to provide.
+    </p>
+    <dl class="definition">
+      <dt>Linearizability (strong consistency)</dt>
+      <dd>Every operation appears to take effect instantaneously at some single point between its
+        invocation and its response, and all clients agree on that single global order — as if
+        there were only one copy of the data and every operation touched it atomically in real
+        time. Once a write completes, <em>every</em> subsequent read, by any client, on any node,
+        must see it or something newer. This is the guarantee that matches naive intuition about
+        "a variable," which is exactly why its absence is what surprises people in distributed
+        systems.</dd>
+      <dt>Sequential consistency</dt>
+      <dd>All clients agree on <em>a</em> single global order of operations, and each client's own
+        operations appear in that order in the sequence it issued them — but that order doesn't
+        have to match real-time/wall-clock order across clients. Weaker than linearizability
+        (a stale-but-consistently-stale view is allowed) but still a single agreed-upon timeline
+        for the whole system, which is more than most real systems actually provide.</dd>
+      <dt>Causal consistency</dt>
+      <dd>Operations that are <em>causally related</em> — B read a value that A wrote, or B and A
+        were issued by the same client in sequence — are seen by everyone in that same order.
+        Operations with no causal relationship (concurrent, unrelated writes from different
+        clients) can be observed in different orders by different readers, and that's allowed.
+        This is the guarantee behind "you never see a reply before the comment it's replying to,"
+        the consistent-prefix-reads property from the replication page — it's a special case of
+        causal consistency, not a separate rule.</dd>
+      <dt>Eventual consistency</dt>
+      <dd>The only promise: if writes stop, all replicas <em>eventually</em> converge to the same
+        value. No promise about ordering, no promise about how long "eventually" takes, no promise
+        about what an in-flight reader sees. The weakest useful guarantee, and the cheapest —
+        it's what you get by default from asynchronous replication with no extra machinery.</dd>
+    </dl>
+    <p>
+      The read-your-writes and monotonic-reads guarantees from the replication page live
+      <em>inside</em> this spectrum too — they're <b>client-centric</b> guarantees: promises about
+      what one specific client sees across its own requests, weaker than causal consistency (they
+      say nothing about what a <em>different</em> client sees) but considerably stronger than raw
+      eventual consistency, and cheap to provide with sticky routing rather than requiring every
+      node to agree on a global order.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Model</th><th>What it costs</th><th>Typical home</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Linearizable</b></td>
+            <td>Every operation needs coordination with a quorum (or the leader) before it can
+              return — extra round trips on the critical path, and reduced availability during a
+              partition</td>
+            <td>A single-leader DB's primary; distributed locks; leader election; anything where
+              two clients disagreeing about "what happened" is a correctness bug (inventory
+              counts, payments)</td>
+          </tr>
+          <tr>
+            <td><b>Sequential / causal</b></td>
+            <td>Requires tracking causal metadata (version vectors, vector clocks, or a logical
+              sequence per client) but not a global lock on every operation</td>
+            <td>Collaborative editing, social feeds (replies must follow their parent), most
+              systems that want "sane" ordering without paying linearizability's full price</td>
+          </tr>
+          <tr>
+            <td><b>Eventual</b></td>
+            <td>Cheapest — async replication, no coordination — but the application must tolerate
+              (or reconcile) stale and out-of-order reads</td>
+            <td>DNS, CDN caches, shopping-cart replicas that reconcile on checkout, most
+              analytics/metrics pipelines</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>Consistency is not one setting for "the database" — it's a choice you make per
+        operation, and mature systems mix levels deliberately. A bank might read account balance
+        linearizably before approving a transfer, but serve the transaction history list eventually
+        consistent because a half-second-stale history is harmless. Ask "what does this specific
+        read need to be true?" before reaching for the strongest (and slowest) option everywhere.</p>
+      </div>
+    </div>
+
+    <h2>CAP, precisely</h2>
+    <p>
+      CAP is one of the most cited and most misquoted results in distributed systems. The
+      informal "pick two of three" framing is wrong; here's the version that actually holds:
+    </p>
+    <ul>
+      <li><b>Consistency (C)</b> — in CAP's original sense, this means <em>linearizability</em>:
+        every read sees the most recent write or an error.</li>
+      <li><b>Availability (A)</b> — every request to a non-failed node receives a (non-error)
+        response, without guarantee that it's the most recent write.</li>
+      <li><b>Partition tolerance (P)</b> — the system keeps operating despite the network dropping
+        or delaying an arbitrary number of messages between nodes.</li>
+    </ul>
+    <p>
+      The theorem: <b>if the network partitions, you must choose between C and A</b> for that
+      operation — you cannot have both. It is not a menu where you pick two; P isn't optional
+      because networks <em>do</em> partition (that's the first fallacy of distributed computing,
+      previewed on <a href="networking-for-backend.html">Networking &amp; Protocols</a>), so the
+      real choice every system with more than one node makes, whether its designers state it or
+      not, is: <em>when a partition happens, does this operation refuse to answer (favor C) or
+      answer with possibly-stale data (favor A)?</em>
+    </p>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>"We chose AP" as a blanket description of a whole database is a category error CAP
+        gets blamed for. CAP is a statement about behavior <em>during a partition</em>, and often
+        <em>per operation</em> — a system can serve linearizable reads on one key path and
+        eventually-consistent reads on another. Worse, most outages aren't a clean network split;
+        they're a slow node, a GC pause, an overloaded link — CAP doesn't even have a category for
+        "technically reachable but too slow to matter," which is why PACELC, next, is the more
+        useful mental model for day-to-day design.</p>
+      </div>
+    </div>
+    <p>
+      <span class="term">PACELC</span> extends CAP with the case CAP is silent about: normal
+      operation, no partition. It says: <b>if Partitioned, trade off Availability vs Consistency;
+      Else (no partition), trade off Latency vs Consistency.</b> Even when the network is fine,
+      a linearizable read still has to talk to a quorum or the leader before answering — that's
+      latency you pay whether or not a partition ever happens, and it's the trade-off you're
+      actually tuning most of the time in production, not the rarer partition case.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>System</th><th>Under partition</th><th>PACELC (normal operation)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>etcd / ZooKeeper</b></td>
+            <td>CP — the minority side stops serving writes (and often reads) rather than risk
+              disagreement</td>
+            <td>PC/EC — pays consensus latency even with no partition, in exchange for
+              linearizable reads</td>
+          </tr>
+          <tr>
+            <td><b>Single-leader RDBMS (Postgres, MySQL) reading from a replica</b></td>
+            <td>AP for reads from followers — they keep answering with whatever they have</td>
+            <td>PA/EL — followers favor low read latency over freshness even when nothing is
+              partitioned</td>
+          </tr>
+          <tr>
+            <td><b>Cassandra / DynamoDB (tunable, default quorum)</b></td>
+            <td>AP by default — configurable per request via quorum settings (below)</td>
+            <td>PA/EL by default; can be pushed toward PC/EC by requiring larger quorums</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Quorums: R + W &gt; N</h2>
+    <p>
+      Leaderless and tunable-consistency systems (Dynamo, Cassandra, Riak) don't hardwire a single
+      answer to the CAP trade-off — they expose it as a per-request knob using three numbers:
+      <code>N</code> (how many replicas hold the data), <code>W</code> (how many must acknowledge
+      a write before it's considered successful), and <code>R</code> (how many must respond to a
+      read before it's returned to the client). The load-bearing rule:
+    </p>
+    <blockquote>If <b>R + W &gt; N</b>, every possible read quorum and every possible write quorum
+      share at least one node in common — so any read is guaranteed to overlap the most recent
+      successful write and see it (or a newer one).</blockquote>
+    <p>
+      This is the same pigeonhole argument as a majority vote: if a value was written to more than
+      half the replicas, any other majority-sized group you sample must include at least one node
+      that has it. R + W &gt; N is the general form — it doesn't require either R or W alone to be
+      a majority, only their <em>sum</em> to exceed N. <code>W = N, R = 1</code> satisfies it
+      (write everywhere, read anywhere is guaranteed fresh, but a single down replica blocks every
+      write). <code>W = 1, R = N</code> also satisfies it (opposite trade-off). The common middle
+      ground, <code>R = W = (N/2 + 1)</code>, balances read and write latency/availability evenly.
+    </p>
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note — sloppy quorums and hinted handoff</span>
+      <div class="callout-body">
+        <p>A strict quorum blocks a write if fewer than W of the <em>designated</em> N replicas
+        are reachable, even if plenty of other healthy nodes exist elsewhere in the cluster. A
+        <span class="term">sloppy quorum</span> relaxes this: if a designated replica is down, the
+        write goes to a different, temporarily-standing-in node instead, which forwards ("hands
+        off") the write once the rightful replica recovers. This buys write availability during a
+        partition at a real cost — R + W &gt; N no longer guarantees overlap, because the write
+        might have landed somewhere a normal read quorum never looks. It's an explicit AP choice,
+        not a free upgrade.</p>
+      </div>
+    </div>
+
+    <h2>Try it: quorum tuner</h2>
+    <p>
+      Set <code>N</code>, <code>W</code>, and <code>R</code>. A write picks W random nodes to
+      hold the new value; a read then samples R random nodes and checks whether any of them has
+      it. Run a batch of simulated reads and watch the guarantee become real (100% fresh) or fail
+      probabilistically, exactly matching whether R + W &gt; N holds.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Quorum tuner</div>
+      <div class="q-layout">
+        <div class="q-controls">
+          <div>
+            <label for="qN">N — total replicas: <span class="val" id="qNVal">5</span></label>
+            <input type="range" id="qN" min="3" max="9" step="1" value="5" />
+          </div>
+          <div>
+            <label for="qW">W — write quorum: <span class="val" id="qWVal">2</span></label>
+            <input type="range" id="qW" min="1" max="9" step="1" value="2" />
+          </div>
+          <div>
+            <label for="qR">R — read quorum: <span class="val" id="qRVal">2</span></label>
+            <input type="range" id="qR" min="1" max="9" step="1" value="2" />
+          </div>
+          <div class="q-verdict" id="qVerdict">R + W = 4, N = 5 — NOT guaranteed fresh</div>
+          <div class="q-actions">
+            <button class="btn" id="qWrite" type="button">Write a new value</button>
+            <button class="btn secondary" id="qRead" type="button">Read once</button>
+            <button class="btn secondary" id="qSimulate" type="button">Simulate 300 reads</button>
+          </div>
+        </div>
+        <div>
+          <div class="q-nodes" id="qNodes"></div>
+          <div class="q-result">
+            <div><span class="q-result-label">Nodes holding latest write</span><span class="q-result-val" id="qWrittenCount">0 / 5</span></div>
+            <div><span class="q-result-label">Last read saw</span><span class="q-result-val" id="qLastRead">—</span></div>
+            <div><span class="q-result-label">Freshness across 300 reads</span><span class="q-result-val" id="qFreshPct">—</span></div>
+          </div>
+          <div class="q-bar-track"><div class="q-bar-fill" id="qFreshBar" style="width:0%"></div></div>
+          <p class="q-note" id="qNote">Write a value, then read once — watch which nodes get highlighted. Then run the 300-read simulation to see the guarantee (or its absence) show up as a percentage.</p>
+        </div>
+      </div>
+    </div>
+
+    <h2>Consensus: getting machines to agree</h2>
+    <p>
+      Quorums answer "did enough replicas see this write." <span class="term">Consensus</span>
+      answers a harder question: how do a set of nodes agree on a single, ordered sequence of
+      values — a replicated log — when nodes can crash, restart, and messages can be delayed or
+      lost, without ever disagreeing about what was decided? This is the machinery underneath
+      leader election (who's allowed to be "the" leader after a failover), distributed locks, and
+      configuration changes that must be seen identically by everyone.
+    </p>
+    <p>
+      <span class="term">Raft</span> is the consensus protocol most production systems reach for
+      today (etcd, Consul, CockroachDB, TiKV) — designed explicitly to be more understandable than
+      its predecessor, <b>Paxos</b>, while providing the same safety guarantees. Its model, in
+      four ideas:
+    </p>
+    <dl class="definition">
+      <dt>Terms</dt>
+      <dd>Time is divided into numbered terms, each with at most one leader. A term is Raft's
+        logical clock — every message carries a term number, and any node seeing a higher term
+        than its own immediately recognizes its own information (and any leader it thought it
+        had) as stale.</dd>
+      <dt>Leader election</dt>
+      <dd>Every follower runs a randomized election timeout; if it hears no heartbeat from a
+        leader before the timeout fires, it becomes a candidate, increments the term, and requests
+        votes from every other node. A node grants at most one vote per term, and only to a
+        candidate whose log is at least as up to date as its own (the safety check that prevents
+        electing a leader who'd overwrite already-committed data). A candidate that wins votes
+        from a <b>majority</b> of all nodes becomes leader for that term. Randomized timeouts
+        exist specifically so two nodes rarely time out simultaneously and split the vote.</dd>
+      <dt>Log replication</dt>
+      <dd>Clients only talk to the leader. The leader appends each write to its own log, then
+        sends it to followers via AppendEntries RPCs. An entry is <b>committed</b> — safe to apply
+        and safe to acknowledge to the client — only once a <em>majority</em> of nodes (leader
+        included) have durably stored it. This is the exact same R+W&gt;N pigeonhole logic as
+        quorums above, specialized to "the write quorum is a majority and the leader always reads
+        its own up-to-date log," which is what makes a newly elected leader's log provably contain
+        every previously committed entry.</dd>
+      <dt>Safety under partition</dt>
+      <dd>If the cluster splits, only the side with a majority of nodes can elect a leader or
+        commit new entries — the minority side may still have a node that <em>believes</em> it's
+        leader (from before the split), but it can no longer reach a majority, so it can accept
+        writes into its own log yet can never commit them. This is consensus choosing C over A
+        during a partition, deliberately: it is safer for the minority side to stop making
+        progress than to let two leaders in two terms disagree about the log.</dd>
+    </dl>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Consensus and quorum-based replication look similar (both need a majority) but answer
+        different questions. A Dynamo-style quorum store lets any node accept a write and
+        reconciles divergent histories after the fact (eventual consistency, AP). Raft never lets
+        two nodes disagree about the committed log in the first place — it trades availability
+        during a partition (the minority literally cannot commit anything) for the guarantee that
+        "committed" only ever means one thing. That's why systems that need a single source of
+        truth about cluster membership or configuration (etcd storing Kubernetes state, ZooKeeper
+        electing a Kafka controller) use consensus, not a Dynamo-style store — the cost of two
+        disagreeing "truths" there is much higher than the cost of a brief unavailability.</p>
+      </div>
+    </div>
+
+    <h2>Try it: Raft-in-miniature</h2>
+    <p>
+      A 5-node cluster (majority = 3). Click a node to cycle it through
+      <b>up → partitioned → down → up</b>. Run an election, send client writes, and watch what it
+      takes for an entry to actually <em>commit</em> — then partition the cluster 2-vs-3 and watch
+      the minority side get stuck.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Raft-in-miniature</div>
+      <div class="rf-layout">
+        <div>
+          <div class="rf-svg-wrap">
+            <svg id="rfSvg" viewBox="0 0 300 300" role="img" aria-label="Five-node Raft cluster diagram"></svg>
+          </div>
+          <div class="rf-legend">
+            <span class="rf-legend-item"><span class="rf-swatch leader"></span>Leader</span>
+            <span class="rf-legend-item"><span class="rf-swatch follower"></span>Follower</span>
+            <span class="rf-legend-item"><span class="rf-swatch partitioned"></span>Partitioned</span>
+            <span class="rf-legend-item"><span class="rf-swatch down"></span>Down</span>
+          </div>
+          <p class="rf-hint">Click any node to cycle its status.</p>
+        </div>
+        <div>
+          <div class="rf-status">
+            <div><span class="rf-status-label">Term</span><span class="rf-status-val" id="rfTerm">0</span></div>
+            <div><span class="rf-status-label">Leader</span><span class="rf-status-val" id="rfLeader">none</span></div>
+            <div><span class="rf-status-label">Reachable nodes</span><span class="rf-status-val" id="rfReachable">5 / 5</span></div>
+            <div><span class="rf-status-label">Quorum available?</span><span class="rf-status-val" id="rfQuorum">yes</span></div>
+            <div><span class="rf-status-label">Committed log entries</span><span class="rf-status-val" id="rfCommitted">0</span></div>
+          </div>
+          <div class="rf-actions">
+            <button class="btn" id="rfElect" type="button">Run election</button>
+            <button class="btn secondary" id="rfWrite" type="button">Client write</button>
+            <button class="btn secondary" id="rfHeal" type="button">Heal all partitions</button>
+            <button class="btn secondary" id="rfReset" type="button">Reset</button>
+          </div>
+          <div class="rf-log" id="rfLog"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Distributed training coordination is a consensus problem wearing an ML costume: a
+        parameter-server or all-reduce job needs every worker to agree on which node is the
+        current coordinator/rank-0 and which gradient step is the latest committed one — lose that
+        agreement (a coordinator dies mid-step and two workers disagree about whether step N
+        landed) and you get silently corrupted training, not just a slow epoch, which is why
+        production training orchestrators lean on the same primitives (etcd, ZooKeeper) as backend
+        systems rather than inventing their own. Feature stores map onto the CAP choice directly
+        too: an online store serving features at inference time usually chooses <b>AP</b> — serve
+        a slightly stale feature rather than time out the request, because a marginally-stale
+        feature degrades a prediction; an offline store used to generate training labels from
+        point-in-time-correct data needs something closer to <b>CP</b>, because training on a
+        feature value that silently changed after the fact is the textbook definition of
+        train/serve skew.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A social app guarantees that a reply is never shown before the
+          comment it replies to, but is fine with two unrelated comments posted at the same moment
+          showing up in different orders to different viewers. Which consistency model is this?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Linearizability — every client must see every write in the same real-time order.</button>
+          <button class="quiz-option" data-choice="b">Eventual consistency — no ordering guarantee at all, just eventual convergence.</button>
+          <button class="quiz-option" data-choice="c">Causal consistency — operations with a happens-before relationship (the reply depends on the comment) are ordered consistently for everyone; unrelated (concurrent) operations are not constrained.</button>
+        </div>
+        <p class="quiz-explain" hidden>This is causal consistency by definition: order is preserved only along causal chains (B read/depends on A), while concurrent, causally unrelated writes may be observed in different orders by different clients — which is exactly what's described and is considerably cheaper to provide than linearizability.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. During a network partition, a distributed key-value store keeps
+          answering read and write requests on both sides of the split, accepting the risk that
+          the two sides may now hold different values for the same key. What CAP choice did it
+          make, and what does PACELC say about its behavior when there's no partition?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It chose C during the partition; PACELC doesn't apply once the partition heals.</button>
+          <button class="quiz-option" data-choice="b">It chose A during the partition (favoring availability over a single consistent answer); PACELC says it likely also favors low Latency over strong Consistency during normal operation, since a store built to prioritize availability under failure rarely pays extra coordination latency when nothing is failing.</button>
+          <button class="quiz-option" data-choice="c">CAP and PACELC both only describe throughput, not consistency, so neither applies here.</button>
+        </div>
+        <p class="quiz-explain" hidden>Answering on both sides of a split with possibly divergent values is the textbook AP choice. PACELC's "Else" branch describes normal-operation behavior separately from the partition case — a system engineered to stay available under a partition is almost always also engineered to minimize latency (not wait on cross-node coordination) when there's no partition, i.e. PA/EL.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A 7-node Raft cluster splits into a 4-node side and a 3-node side.
+          What happens on each side?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The 4-node side has a majority (4 of 7) and can elect a leader and commit new entries; the 3-node side cannot reach a majority, so even if a node there believes it's still leader, it can accept writes into its own log but can never commit them until the partition heals.</button>
+          <button class="quiz-option" data-choice="b">Both sides independently elect their own leader and keep committing writes, to be reconciled later when the partition heals.</button>
+          <button class="quiz-option" data-choice="c">Neither side can do anything at all until the partition heals, since Raft requires all 7 nodes to be reachable.</button>
+        </div>
+        <p class="quiz-explain" hidden>Raft only requires a majority (4 of 7 here), not all nodes — that's exactly the point of majority quorums. The larger side keeps making progress; the smaller side is structurally unable to reach a majority, so it cannot commit, which is Raft choosing consistency over availability for the minority rather than risking two leaders disagreeing about the log.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page unlocks <em>Distributed Transactions, Sagas &amp; Idempotency</em> — once you've
+      also covered <em>Messaging, Queues &amp; Event-Driven Architecture</em>, since achieving
+      anything transaction-like across services leans on both consensus-adjacent reasoning and
+      reliable messaging. If you'd rather branch elsewhere first, <em>Resilience Patterns</em> and
+      <em>Observability</em> are both unlocked already and don't depend on this page.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      function mulberry32(seed) {
+        var a = seed >>> 0;
+        return function () {
+          a |= 0; a = (a + 0x6D2B79F5) | 0;
+          var t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      /* ---------------------------------------------------------------
+         Quorum tuner widget
+         ------------------------------------------------------------- */
+      var qN = document.getElementById("qN");
+      var qW = document.getElementById("qW");
+      var qR = document.getElementById("qR");
+      var qNVal = document.getElementById("qNVal");
+      var qWVal = document.getElementById("qWVal");
+      var qRVal = document.getElementById("qRVal");
+      var qVerdict = document.getElementById("qVerdict");
+      var qNodes = document.getElementById("qNodes");
+      var qWrite = document.getElementById("qWrite");
+      var qRead = document.getElementById("qRead");
+      var qSimulate = document.getElementById("qSimulate");
+      var qWrittenCount = document.getElementById("qWrittenCount");
+      var qLastRead = document.getElementById("qLastRead");
+      var qFreshPct = document.getElementById("qFreshPct");
+      var qFreshBar = document.getElementById("qFreshBar");
+      var qNote = document.getElementById("qNote");
+
+      var qRand = mulberry32(9001);
+      var writtenSet = [];
+
+      function clampQuorums() {
+        var n = parseInt(qN.value, 10);
+        if (parseInt(qW.value, 10) > n) qW.value = n;
+        if (parseInt(qR.value, 10) > n) qR.value = n;
+        qW.max = n; qR.max = n;
+      }
+
+      function sampleDistinct(n, k, rand) {
+        var pool = [];
+        for (var i = 0; i < n; i++) pool.push(i);
+        for (var j = pool.length - 1; j > 0; j--) {
+          var idx = Math.floor(rand() * (j + 1));
+          var tmp = pool[j]; pool[j] = pool[idx]; pool[idx] = tmp;
+        }
+        return pool.slice(0, k).sort(function (a, b) { return a - b; });
+      }
+
+      function renderQNodes(readSet, hitOrMiss) {
+        var n = parseInt(qN.value, 10);
+        var html = "";
+        for (var i = 0; i < n; i++) {
+          var classes = "q-node";
+          if (writtenSet.indexOf(i) !== -1) classes += " written";
+          if (readSet && readSet.indexOf(i) !== -1) {
+            classes += " read";
+            classes += hitOrMiss ? " hit" : "";
+          }
+          html += '<div class="' + classes + '" title="Node ' + (i + 1) + '">N' + (i + 1) + "</div>";
+        }
+        qNodes.innerHTML = html;
+      }
+
+      function updateVerdict() {
+        var n = parseInt(qN.value, 10);
+        var w = parseInt(qW.value, 10);
+        var r = parseInt(qR.value, 10);
+        var safe = (r + w) > n;
+        qVerdict.textContent = "R + W = " + (r + w) + ", N = " + n + " — " + (safe ? "guaranteed fresh" : "NOT guaranteed fresh");
+        qVerdict.className = "q-verdict " + (safe ? "safe" : "unsafe");
+        return safe;
+      }
+
+      function doQWrite() {
+        var n = parseInt(qN.value, 10);
+        var w = parseInt(qW.value, 10);
+        writtenSet = sampleDistinct(n, w, qRand);
+        qWrittenCount.textContent = writtenSet.length + " / " + n;
+        qLastRead.textContent = "—";
+        qFreshPct.textContent = "—";
+        qFreshBar.style.width = "0%";
+        qFreshBar.className = "q-bar-fill";
+        renderQNodes(null, false);
+        qNote.textContent = "Wrote the latest value to " + w + " of " + n + " nodes (highlighted blue). Now read.";
+      }
+
+      function doQRead() {
+        if (!writtenSet.length) { doQWrite(); }
+        var n = parseInt(qN.value, 10);
+        var r = parseInt(qR.value, 10);
+        var readSet = sampleDistinct(n, r, qRand);
+        var hit = readSet.some(function (idx) { return writtenSet.indexOf(idx) !== -1; });
+        renderQNodes(readSet, hit);
+        qLastRead.textContent = hit ? "latest value (fresh)" : "stale value";
+        qNote.textContent = "Sampled " + r + " random node(s) for the read: " + (hit
+          ? "at least one held the latest write — fresh."
+          : "none of them held the latest write — this reader sees a stale value, even though the write already \"succeeded.\"");
+      }
+
+      function doQSimulate() {
+        if (!writtenSet.length) doQWrite();
+        var n = parseInt(qN.value, 10);
+        var r = parseInt(qR.value, 10);
+        var trials = 300;
+        var fresh = 0;
+        for (var t = 0; t < trials; t++) {
+          var readSet = sampleDistinct(n, r, qRand);
+          if (readSet.some(function (idx) { return writtenSet.indexOf(idx) !== -1; })) fresh++;
+        }
+        var pct = ((fresh / trials) * 100).toFixed(1);
+        qFreshPct.textContent = pct + "%";
+        qFreshBar.style.width = pct + "%";
+        qFreshBar.className = "q-bar-fill" + (pct < 99.5 ? " bad" : "");
+        var safe = updateVerdict();
+        qNote.textContent = "Across " + trials + " independently sampled reads: " + pct + "% saw the latest write. " +
+          (safe
+            ? "R + W > N holds, so this should read ~100% — every possible read quorum structurally overlaps the write quorum."
+            : "R + W ≤ N, so freshness is probabilistic, not guaranteed — some read quorums simply miss every node that has the latest value.");
+      }
+
+      qN.addEventListener("input", function () {
+        qNVal.textContent = qN.value;
+        clampQuorums();
+        qWVal.textContent = qW.value;
+        qRVal.textContent = qR.value;
+        updateVerdict();
+        writtenSet = [];
+        qWrittenCount.textContent = "0 / " + qN.value;
+        renderQNodes(null, false);
+      });
+      qW.addEventListener("input", function () { qWVal.textContent = qW.value; updateVerdict(); });
+      qR.addEventListener("input", function () { qRVal.textContent = qR.value; updateVerdict(); });
+
+      qWrite.addEventListener("click", doQWrite);
+      qRead.addEventListener("click", doQRead);
+      qSimulate.addEventListener("click", doQSimulate);
+
+      clampQuorums();
+      updateVerdict();
+      renderQNodes(null, false);
+
+      /* ---------------------------------------------------------------
+         Raft-in-miniature widget
+         ------------------------------------------------------------- */
+      var RF_N = 5;
+      var RF_MAJORITY = 3;
+
+      var rfSvg = document.getElementById("rfSvg");
+      var rfTerm = document.getElementById("rfTerm");
+      var rfLeader = document.getElementById("rfLeader");
+      var rfReachable = document.getElementById("rfReachable");
+      var rfQuorum = document.getElementById("rfQuorum");
+      var rfCommitted = document.getElementById("rfCommitted");
+      var rfElect = document.getElementById("rfElect");
+      var rfWrite = document.getElementById("rfWrite");
+      var rfHeal = document.getElementById("rfHeal");
+      var rfReset = document.getElementById("rfReset");
+      var rfLog = document.getElementById("rfLog");
+
+      var rfNodes = [];  // { id, status: 'up'|'partitioned'|'down', role: 'leader'|'follower', log: [{term, committed}] }
+      var rfTermVal = 0;
+      var rfLeaderId = null;
+
+      function rfLog_(msg) {
+        var div = document.createElement("div");
+        div.textContent = msg;
+        rfLog.appendChild(div);
+        rfLog.scrollTop = rfLog.scrollHeight;
+      }
+
+      function rfInit() {
+        rfNodes = [];
+        for (var i = 0; i < RF_N; i++) {
+          rfNodes.push({ id: i, status: "up", role: "follower", log: [] });
+        }
+        rfTermVal = 0;
+        rfLeaderId = null;
+      }
+
+      function reachableIds() {
+        return rfNodes.filter(function (n) { return n.status === "up"; }).map(function (n) { return n.id; });
+      }
+
+      function commitIndexFor(node) {
+        var c = 0;
+        for (var i = 0; i < node.log.length; i++) if (node.log[i].committed) c++;
+        return c;
+      }
+
+      function polar(angleDeg, r) {
+        var angle = (angleDeg * Math.PI) / 180 - Math.PI / 2;
+        return { x: 150 + r * Math.cos(angle), y: 150 + r * Math.sin(angle) };
+      }
+
+      function renderRaft() {
+        var reachable = reachableIds();
+        var svgParts = [];
+        svgParts.push('<circle cx="150" cy="150" r="105" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 4" />');
+
+        rfNodes.forEach(function (node) {
+          var angle = (360 / RF_N) * node.id;
+          var p = polar(angle, 105);
+          var fill, stroke, dash = "";
+          if (node.status === "down") { fill = "var(--surface-2)"; stroke = "var(--border-strong)"; }
+          else if (node.status === "partitioned") { fill = "var(--warn-soft)"; stroke = "var(--warn)"; dash = 'stroke-dasharray="4 3"'; }
+          else if (node.role === "leader") { fill = "var(--accent)"; stroke = "var(--accent-strong)"; }
+          else { fill = "var(--blueprint-soft)"; stroke = "var(--blueprint)"; }
+
+          svgParts.push('<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="26" fill="' + fill + '" stroke="' + stroke + '" stroke-width="2.5" ' + dash +
+            ' data-node="' + node.id + '" style="cursor:pointer" />');
+          svgParts.push('<text x="' + p.x.toFixed(1) + '" y="' + (p.y - 2).toFixed(1) + '" text-anchor="middle" font-family="var(--font-mono)" font-size="12" font-weight="700" fill="var(--text)" style="pointer-events:none">N' + (node.id + 1) + '</text>');
+          var commitCount = commitIndexFor(node);
+          var subLabel = node.status === "down" ? "down" : node.status === "partitioned" ? "cut off" : (commitCount + "/" + node.log.length);
+          svgParts.push('<text x="' + p.x.toFixed(1) + '" y="' + (p.y + 12).toFixed(1) + '" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--text-muted)" style="pointer-events:none">' + subLabel + '</text>');
+          if (node.role === "leader" && node.status === "up") {
+            svgParts.push('<text x="' + p.x.toFixed(1) + '" y="' + (p.y - 34).toFixed(1) + '" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--accent-strong)" font-weight="700" style="pointer-events:none">LEADER</text>');
+          }
+        });
+
+        rfSvg.innerHTML = svgParts.join("");
+        rfSvg.querySelectorAll("circle[data-node]").forEach(function (el) {
+          el.addEventListener("click", function () {
+            var id = parseInt(el.getAttribute("data-node"), 10);
+            cycleNodeStatus(id);
+          });
+        });
+
+        rfTerm.textContent = rfTermVal;
+        rfLeader.textContent = (rfLeaderId !== null && rfNodes[rfLeaderId].status === "up" && rfNodes[rfLeaderId].role === "leader")
+          ? "N" + (rfLeaderId + 1) : "none";
+        rfReachable.textContent = reachable.length + " / " + RF_N;
+        var hasQuorum = reachable.length >= RF_MAJORITY;
+        rfQuorum.textContent = hasQuorum ? "yes" : "no";
+        rfQuorum.className = "rf-status-val " + (hasQuorum ? "ok" : "bad");
+        var leaderCommitted = rfLeaderId !== null ? commitIndexFor(rfNodes[rfLeaderId]) : 0;
+        rfCommitted.textContent = leaderCommitted;
+      }
+
+      function cycleNodeStatus(id) {
+        var node = rfNodes[id];
+        if (node.status === "up") node.status = "partitioned";
+        else if (node.status === "partitioned") node.status = "down";
+        else node.status = "up";
+
+        if (node.status !== "up" && node.role === "leader") {
+          node.role = "follower";
+          if (rfLeaderId === id) {
+            rfLog_("N" + (id + 1) + " (" + (node.status === "down" ? "crashed" : "partitioned") + ") can no longer act as leader — cluster has no leader until a new election.");
+            rfLeaderId = null;
+          }
+        } else if (node.status === "up") {
+          rfLog_("N" + (id + 1) + " is back up.");
+          if (rfLeaderId !== null && rfNodes[rfLeaderId].status === "up" && rfNodes[rfLeaderId].role === "leader") {
+            var leaderLog = rfNodes[rfLeaderId].log;
+            var before = node.log.length;
+            node.log = leaderLog.map(function (e) { return { term: e.term, committed: e.committed }; });
+            if (node.log.length !== before) {
+              rfLog_("Leader N" + (rfLeaderId + 1) + " replicated its log to the reconnected N" + (id + 1) + " (" + node.log.length + " entries).");
+            }
+          }
+        } else {
+          rfLog_("N" + (id + 1) + " is now " + node.status + ".");
+        }
+        renderRaft();
+      }
+
+      function runElection() {
+        var reachable = reachableIds();
+        if (reachable.length < RF_MAJORITY) {
+          rfLog_("Election attempted: only " + reachable.length + "/" + RF_N + " nodes reachable — no majority (" + RF_MAJORITY + " needed). No leader can be elected.");
+          renderRaft();
+          return;
+        }
+        rfTermVal++;
+        var candidateId = reachable[0];
+        rfNodes.forEach(function (n) { if (n.status === "up") n.role = "follower"; });
+        rfNodes[candidateId].role = "leader";
+        rfLeaderId = candidateId;
+        rfLog_("N" + (candidateId + 1) + " starts an election for term " + rfTermVal + ", collects votes from " + reachable.length + "/" + RF_N + " reachable nodes (majority) and becomes leader.");
+        renderRaft();
+      }
+
+      function clientWrite() {
+        if (rfLeaderId === null || rfNodes[rfLeaderId].status !== "up" || rfNodes[rfLeaderId].role !== "leader") {
+          rfLog_("Client write rejected — no leader currently available. Run an election first.");
+          return;
+        }
+        var leader = rfNodes[rfLeaderId];
+        var entry = { term: rfTermVal, committed: false };
+        leader.log.push(entry);
+        var acks = 1; // leader acks its own entry
+        rfNodes.forEach(function (n) {
+          if (n.id !== leader.id && n.status === "up") {
+            n.log.push({ term: entry.term, committed: false });
+            acks++;
+          }
+        });
+        var committed = acks >= RF_MAJORITY;
+        if (committed) {
+          rfNodes.forEach(function (n) {
+            if (n.status === "up" && n.log.length) n.log[n.log.length - 1].committed = true;
+          });
+          rfLog_("Client write appended (term " + entry.term + ") and acknowledged by " + acks + "/" + RF_N + " — majority reached, entry COMMITTED.");
+        } else {
+          rfLog_("Client write appended (term " + entry.term + ") but only acknowledged by " + acks + "/" + RF_N + " (need " + RF_MAJORITY + ") — entry stays UNCOMMITTED until enough nodes are reachable.");
+        }
+        renderRaft();
+      }
+
+      function healAll() {
+        var changed = false;
+        rfNodes.forEach(function (n) {
+          if (n.status !== "up") { n.status = "up"; changed = true; }
+        });
+        if (changed && rfLeaderId !== null && rfNodes[rfLeaderId].role === "leader") {
+          var leaderLog = rfNodes[rfLeaderId].log;
+          rfNodes.forEach(function (n) {
+            if (n.id !== rfLeaderId) n.log = leaderLog.map(function (e) { return { term: e.term, committed: e.committed }; });
+          });
+        }
+        rfLog_("All partitions healed — every node is reachable again.");
+        renderRaft();
+      }
+
+      function resetRaft() {
+        rfInit();
+        rfLog.innerHTML = "";
+        rfLog_("Reset. 5 nodes, all up, no leader. Run an election to begin.");
+        renderRaft();
+      }
+
+      rfElect.addEventListener("click", runElection);
+      rfWrite.addEventListener("click", clientWrite);
+      rfHeal.addEventListener("click", healAll);
+      rfReset.addEventListener("click", resetRaft);
+
+      resetRaft();
+
+      /* ---------------------------------------------------------------
+         Quiz interactivity (shared pattern across deep-dives)
+         ------------------------------------------------------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
