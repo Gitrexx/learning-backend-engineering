@@ -150,7 +150,7 @@
       "summary": "The consistency spectrum, what CAP/PACELC really say, quorums, and Raft-style consensus.",
       "prerequisites": ["replication-and-partitioning"],
       "file": "consistency-and-consensus.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "messaging-and-event-driven",
