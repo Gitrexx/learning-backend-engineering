@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Messaging, Queues &amp; Event-Driven Architecture — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the message-flow simulator widget only. */
+    .msg-toggle-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-4); }
+    .msg-lanes { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: var(--sp-4); }
+    .msg-lane { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); }
+    .msg-lane-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-3); font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text); }
+    .msg-queue { display: flex; flex-wrap: wrap; gap: 0.35em; min-height: 2.4em; padding: var(--sp-2); background: var(--surface-2); border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); margin-bottom: var(--sp-3); }
+    .msg-chip { font-family: var(--font-mono); font-size: var(--fs-eyebrow); font-weight: 700; color: #04120f; padding: 0.25em 0.55em; border-radius: 999px; white-space: nowrap; }
+    .msg-queue-empty { font-size: var(--fs-sm); color: var(--text-faint); font-style: italic; }
+    .msg-consumer-box { border-top: 1px dashed var(--border); padding-top: var(--sp-3); display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; }
+    .msg-consumer-id { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text); }
+    .msg-consumer-state { font-family: var(--font-mono); font-size: var(--fs-eyebrow); padding: 0.2em 0.55em; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .msg-consumer-state.idle { background: var(--surface-2); color: var(--text-faint); border: 1px solid var(--border); }
+    .msg-consumer-state.processing { background: var(--blueprint-soft); color: var(--blueprint); border: 1px solid transparent; }
+    .msg-consumer-state.crashed { background: var(--danger-soft); color: var(--danger); border: 1px solid transparent; }
+    .msg-crash-btn { font-size: var(--fs-eyebrow); padding: 0.35em 0.7em; }
+    .msg-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+    .msg-stats { display: grid; gap: var(--sp-2) var(--sp-5); grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); font-size: var(--fs-sm); margin-bottom: var(--sp-4); }
+    .msg-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-2) var(--sp-3); }
+    .msg-stat-label { color: var(--text-muted); }
+    .msg-stat-val { font-family: var(--font-mono); font-weight: 700; color: var(--text); }
+    .msg-stat-val.warn { color: var(--danger); }
+    .msg-log { font-family: var(--font-mono); font-size: var(--fs-sm); background: var(--surface-code); color: var(--text-on-code); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); max-height: 10em; overflow-y: auto; }
+    .msg-log div { padding: 0.15em 0; opacity: 0.92; }
+    .msg-log div:last-child { color: var(--accent-strong); opacity: 1; }
+    .msg-log div.dup { color: var(--warn); }
+    .msg-log div.dedup { color: var(--ok); }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Distributed Systems &amp; Scaling // 04</p>
+    <h1>Messaging, Queues &amp; Event-Driven Architecture</h1>
+
+    <p>
+      Everything so far in this section — <a href="scaling-and-load-balancing.html">scaling</a>,
+      <a href="replication-and-partitioning.html">replication and partitioning</a>,
+      <a href="consistency-and-consensus.html">consensus</a> — assumed services talk to each
+      other <em>synchronously</em>: A calls B, blocks, and waits for a reply. That model is easy
+      to reason about and gets you surprisingly far, but it wires every caller's uptime to every
+      callee's uptime, chains latency additively, and turns a burst of traffic at the front door
+      into a burst of pressure on everything behind it. <span class="term">Messaging</span> breaks
+      that wire: a producer hands work to a broker and moves on; a consumer picks it up whenever
+      it's ready. This page is about the machinery that makes that handoff safe — queues vs logs,
+      delivery guarantees, ordering, and the two problems every real system built this way has to
+      solve: messages that arrive twice, and writes that need to update a database <em>and</em>
+      publish an event as if it were one atomic thing.
+    </p>
+
+    <h2>Why decouple at all</h2>
+    <p>
+      Picture an order-placed request that, synchronously, has to charge a card, reserve
+      inventory, email a receipt, and update a recommendation model's training log before it can
+      return <code>200 OK</code>. Every one of those four steps is now on the critical path of
+      the user's click: if the email service is slow, the checkout is slow; if the
+      recommendation logger is down, checkout is <em>down</em>, for a concern the user never
+      asked about. Messaging inverts this: the order service does the one thing that must be
+      synchronous — charge the card — and publishes an <code>OrderPlaced</code> event for
+      everything else. Email, recommendations, and inventory each consume that event on their own
+      schedule, at their own pace, and a slow or down consumer no longer touches the user's
+      response time.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Decoupling here is temporal, not just structural. A synchronous call couples two
+        services in <em>time</em> — both must be up and responsive at the same instant. A queue
+        or log sits between them and absorbs that mismatch: the producer can run far ahead of a
+        slow consumer (the broker just holds a backlog), and a consumer that's down for
+        maintenance simply catches up when it returns. This is the same trade you make everywhere
+        in backend design — <a href="caching-strategies.html">caching</a> trades staleness for
+        speed; messaging trades immediacy for resilience. The event will be handled
+        <em>eventually</em>, not necessarily <em>now</em>, and that's the whole point.</p>
+      </div>
+    </div>
+    <p>
+      The cost is real, though: you've traded a stack trace for a distributed system. A bug in
+      synchronous code fails loudly, in place. A bug in an async consumer fails quietly, minutes
+      or hours later, in a different service, and debugging it means correlating a producer's log
+      with a consumer's log across a broker you may not fully control. Reach for messaging when
+      the work is genuinely deferrable (a receipt email can wait 200ms; a card charge cannot) or
+      when you need to fan one event out to several independent consumers — not as a default
+      architecture style.
+    </p>
+
+    <h2>Queues vs. logs: two mental models</h2>
+    <p>
+      "Message broker" covers two genuinely different designs, and conflating them is where a lot
+      of confusion starts. Think RabbitMQ (a queue) against Kafka (a log) as the two archetypes:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>Queue (RabbitMQ / SQS)</th><th>Log (Kafka / Pulsar)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Storage model</b></td>
+            <td>A message is removed once acknowledged. The broker's job is routing and
+              delivery, not history.</td>
+            <td>Messages are appended to an immutable, ordered log and retained for a
+              configured window (time or size) regardless of who's read them.</td>
+          </tr>
+          <tr>
+            <td><b>Who tracks position</b></td>
+            <td>The broker — it knows what's unacked and redelivers on failure.</td>
+            <td>The consumer — it tracks its own <span class="term">offset</span> (read
+              position) into the log. The broker just serves whatever's asked for.</td>
+          </tr>
+          <tr>
+            <td><b>Multiple consumers of the same message</b></td>
+            <td>Competing consumers: one queue, each message goes to exactly one consumer
+              (unless you fan out via separate queues bound to an exchange).</td>
+            <td>Natural: any number of independent consumer groups can each read the whole
+              log at their own offset. Adding a new consumer type never affects existing ones.</td>
+          </tr>
+          <tr>
+            <td><b>Replay</b></td>
+            <td>Not really — once acked and gone, it's gone (unless you've built your own
+              archive).</td>
+            <td>First-class — rewind a consumer group's offset and reprocess history. This is
+              how you backfill a new service or rebuild a corrupted read model.</td>
+          </tr>
+          <tr>
+            <td><b>Routing flexibility</b></td>
+            <td>Rich: exchanges support direct, topic (pattern), and fanout routing to many
+              queues — a "smart broker."</td>
+            <td>Simple: producers write to named topics, consumers choose what to read — a
+              "dumb broker, smart consumer" design that trades routing flexibility for
+              throughput and replay.</td>
+          </tr>
+          <tr>
+            <td><b>Sweet spot</b></td>
+            <td>Task queues, work distribution, RPC-style request/reply, complex routing
+              between many small services.</td>
+            <td>Event streaming, event sourcing, feeding multiple independent consumers
+              (analytics, search indexing, caches) off one firehose of truth.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Neither model is strictly better — they answer different questions. "Do this task
+        exactly once, somewhere" is a queue question. "Let anyone who cares replay the history of
+        what happened" is a log question. A lot of real systems use both: Kafka as the durable
+        backbone of record, with a task queue (SQS, Sidekiq/Redis) downstream for
+        "retry this one job with backoff" semantics that a log doesn't naturally provide.</p>
+      </div>
+    </div>
+
+    <h2>Topics, partitions &amp; consumer groups</h2>
+    <p>
+      Take the log model further, since it's the one that scales past a single machine the same
+      way <a href="replication-and-partitioning.html">partitioning</a> scaled a database. A
+      <span class="term">topic</span> is a named stream (e.g. <code>orders</code>); it's split
+      into <span class="term">partitions</span>, each an independent append-only log with its own
+      offset sequence, spread across brokers exactly the way a sharded database spreads rows
+      across nodes. A producer picks a <span class="term">partition key</span> (often an entity
+      ID like <code>order_id</code> or <code>user_id</code>); the broker hashes it to a partition,
+      so every event for the same key always lands in the same partition, in the order it was
+      produced.
+    </p>
+    <p>
+      Consumers read as a <span class="term">consumer group</span>: the broker assigns each
+      partition to exactly one consumer within the group, so the group as a whole parallelizes
+      reads across partitions while guaranteeing only one consumer processes any given partition
+      at a time. This is the mechanism, and it has a hard consequence worth internalizing before
+      you provision a topic:
+    </p>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — partition count is your parallelism ceiling</span>
+      <div class="callout-body">
+        <p>A consumer group can have at most as many <em>active</em> consumers as the topic has
+        partitions — the (N+1)th consumer sits idle with nothing assigned. A 6-partition topic
+        caps you at 6-way parallel consumption no matter how many consumer instances you deploy.
+        Under-provisioning partitions is the single most common Kafka scaling mistake, and
+        re-partitioning later is disruptive: it changes which partition a key hashes to, which
+        breaks the per-key ordering guarantee across the transition. Size partition count for
+        your target peak parallelism up front, the same way you'd think about shard count for a
+        database you don't want to re-shard under load.</p>
+      </div>
+    </div>
+
+    <h2>Delivery semantics</h2>
+    <p>
+      "Will the consumer definitely get the message?" has three precise answers, and interviewers
+      expect you to know which one any given design actually provides — and why the strongest-
+      sounding one is a trap.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Guarantee</th><th>Mechanism</th><th>Failure mode</th><th>When it's fine</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>At-most-once</b></td>
+            <td>Consumer acks (or the broker considers it delivered) <em>before</em>
+              processing — e.g. fire-and-forget UDP-style delivery, or ack-on-receive.</td>
+            <td>A crash between ack and finishing the work silently drops the message. No
+              retries, ever.</td>
+            <td>Metrics/telemetry pings, best-effort logging — losing one occasionally is
+              cheaper than the complexity of guaranteeing it isn't lost.</td>
+          </tr>
+          <tr>
+            <td><b>At-least-once</b></td>
+            <td>Consumer processes <em>then</em> acks. If it crashes, times out, or the ack is
+              lost in transit, the broker redelivers because it never saw confirmation.</td>
+            <td>The same message can be — and eventually will be — processed more than once.</td>
+            <td>The default for almost everything, <em>provided</em> the consumer is made
+              idempotent (below). This is the guarantee real brokers actually give you.</td>
+          </tr>
+          <tr>
+            <td><b>Exactly-once</b></td>
+            <td>Would require the message delivery and the side effect of processing it to
+              commit as a single atomic step across two separate systems (broker and
+              consumer's data store).</td>
+            <td>Impossible in general, for the same reason two-phase commit across independent
+              systems is expensive and fragile — network partitions and crashes at the wrong
+              instant defeat any protocol you design. What vendors call "exactly-once" is a
+              specific, narrower guarantee (see below).</td>
+            <td>Never assume it from broker configuration alone — assume at-least-once and
+              build for it.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">The exactly-once you can actually get</span>
+      <div class="callout-body">
+        <p>What Kafka calls "exactly-once semantics" (EOS) is real but scoped: it guarantees a
+        consume-transform-produce pipeline that reads from Kafka and writes back to Kafka commits
+        both atomically, so a crash mid-pipeline doesn't duplicate the output topic. It does
+        <em>not</em> extend to an arbitrary external side effect — charging a card, writing to
+        Postgres, calling a third-party API — because that system isn't part of the broker's
+        transaction. The general, portable answer to "exactly-once" is always the same recipe:
+        <b>at-least-once delivery + an idempotent consumer</b>, which is effectively-once from the
+        outside even though the message may physically arrive more than once. That's the pattern
+        this page builds toward.</p>
+      </div>
+    </div>
+
+    <h2>Ordering guarantees</h2>
+    <p>
+      A partitioned log only orders <em>within</em> a partition — messages produced with the same
+      key, on the same partition, are delivered to that partition's consumer in production order.
+      Across partitions there is no ordering guarantee at all: an event for order #1 on partition
+      0 and an event for order #2 on partition 1 can be consumed in either order, or concurrently.
+      This is exactly the trade-off from the partitioning page, restated for streams: partition by
+      a key that keeps causally related events together (all events for one order go to one
+      partition), and accept that unrelated entities are unordered relative to each other — because
+      forcing global order across partitions would mean funneling all writes through one
+      partition, which defeats the reason you partitioned in the first place.
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Picking the wrong partition key breaks ordering in ways that are easy to miss in
+        testing and painful in production. Partitioning <code>OrderEvents</code> by
+        <code>event_type</code> instead of <code>order_id</code>, for instance, sends
+        <code>OrderCreated</code> and <code>OrderShipped</code> for the <em>same</em> order to
+        different partitions with no guarantee <code>Created</code> is consumed before
+        <code>Shipped</code> — a shipping consumer can see "ship order #42" before "order #42
+        exists." Partition by the entity whose event order actually matters, not by a field that
+        happens to be convenient to filter on.</p>
+      </div>
+    </div>
+
+    <h2>Try it: message flow simulator</h2>
+    <p>
+      Below is a 3-partition topic with one consumer group (one consumer per partition, the
+      canonical 1:1 case). Produce a few messages, then crash a consumer while it's processing
+      one. In this simulator the crash always lands in the single most realistic and dangerous
+      window: the work has already finished — the effect has happened — but the process dies
+      before the acknowledgment reaches the broker. The broker only knows "no ack," so once the
+      visibility timeout passes it redelivers the message as if nothing happened. Watch what that
+      does to the effect with idempotency off vs. on.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Message flow simulator</div>
+      <div class="msg-toggle-row">
+        <input type="checkbox" id="msgIdem" />
+        <label for="msgIdem">Idempotent consumer: dedup by message ID before applying the effect (e.g. "charge card")</label>
+      </div>
+      <div class="msg-lanes" id="msgLanes"></div>
+      <div class="msg-actions">
+        <button class="btn" id="msgProduce" type="button">Produce message (next key, round-robin)</button>
+        <button class="btn secondary" id="msgReset" type="button">Reset</button>
+      </div>
+      <div class="msg-stats" id="msgStats"></div>
+      <div class="msg-log" id="msgLog"></div>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Try this sequence</span>
+      <div class="callout-body">
+        <p>Produce 2–3 messages, then hit "crash mid-processing" on a consumer that's actively
+        processing one. With idempotency <em>off</em>, watch "effect applied" climb higher than
+        the number of distinct messages — the redelivered copy re-ran the side effect. Reset, turn
+        idempotency <em>on</em>, and repeat the exact same crash: the redelivered copy is
+        recognized by its message ID and absorbed as a duplicate — "effect applied" now tracks
+        distinct messages exactly, no matter how many times the broker redelivers.</p>
+      </div>
+    </div>
+
+    <h2>Idempotent consumers</h2>
+    <p>
+      Since at-least-once is the honest guarantee any real broker gives you, the consumer has to
+      be safe to run twice on the same message. A few concrete techniques, roughly cheapest to
+      most general:
+    </p>
+    <ul>
+      <li><b>Natural idempotency</b> — design the side effect so repeating it is harmless.
+        <code>UPDATE accounts SET balance = 500</code> is naturally idempotent (an absolute set);
+        <code>UPDATE accounts SET balance = balance - 50</code> is not (a relative delta). Prefer
+        the former whenever the domain allows it.</li>
+      <li><b>Upsert on a unique key</b> — if the effect is "write a row," make the message ID (or
+        a natural key like <code>order_id</code>) the row's primary key and use
+        <code>INSERT ... ON CONFLICT DO NOTHING/UPDATE</code>. A duplicate insert becomes a no-op
+        at the database's constraint layer, no application logic required.</li>
+      <li><b>A dedup table or cache</b> — when the effect is a call to something that can't be
+        made naturally idempotent (charge a card via a third-party API), record processed message
+        IDs (with a retention window) and check-then-skip before acting. This is the same idea as
+        the <a href="rest-api-design.html">idempotency keys</a> covered for client-facing APIs,
+        applied on the consumer side instead.</li>
+    </ul>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>The check-then-act dedup table has its own race: two redelivered copies processed
+        concurrently by two consumer threads can both pass the "not yet processed" check before
+        either writes the marker. Make the marker write itself the atomic gate — a unique
+        constraint on <code>message_id</code> that the second concurrent writer fails against —
+        rather than a separate read-then-write check, the same read-modify-write hazard that shows
+        up under any concurrent access to shared state.</p>
+      </div>
+    </div>
+
+    <h2>Dead-letter queues</h2>
+    <p>
+      At-least-once redelivery assumes the consumer will eventually succeed. Some messages never
+      will — malformed payloads, a foreign key that doesn't exist, a bug that throws on this one
+      specific input every time. Left alone, that "poison message" gets redelivered forever,
+      wedging the partition behind it (remember: one consumer, in order, per partition — it can't
+      skip ahead) or burning through retries endlessly. A <span class="term">dead-letter
+      queue</span> (DLQ) is the standard escape valve: after N failed attempts, the consumer stops
+      retrying and routes the message to a separate queue/topic for inspection, instead of
+      blocking everything behind it.
+    </p>
+    <div class="definition">
+      <dl>
+        <dt>What a good DLQ setup includes</dt>
+        <dd>A bounded retry count with exponential backoff (not immediate infinite retries — see
+          the retry-storm hazard covered generally in the Reliability section); the DLQ message
+          tagged with the original topic, the failure reason, and attempt count, so someone
+          debugging it doesn't have to reconstruct context from scratch; an alert on DLQ depth,
+          since a silent DLQ is just a slower way to lose data unnoticed; and a <em>replay</em>
+          path — once the bug is fixed, re-publish DLQ messages back to the original topic rather
+          than hand-processing them.</dd>
+      </dl>
+    </div>
+
+    <h2>The dual-write problem and the transactional outbox</h2>
+    <p>
+      Here's the failure mode that trips up teams who otherwise have messaging right: a service
+      handles a request by writing to its own database <em>and</em> publishing an event about
+      that write — two separate systems, two separate writes, no shared transaction between them.
+    </p>
+    <pre><code>BEGIN;
+INSERT INTO orders (id, status) VALUES ('o1', 'placed');
+COMMIT;
+-- process crashes right here —
+publish("OrderPlaced", {order_id: 'o1'});   -- never runs</code></pre>
+    <p>
+      The database commit succeeded — the order genuinely exists — but the event that was
+      supposed to tell inventory, billing, and email about it never left the building. Nothing
+      downstream ever hears about an order that, as far as the database is concerned, is real.
+      Reversing the order (publish first, write second) just relocates the same bug: now a
+      consumer can react to an event for an order that a crash prevented from ever being
+      committed. There is no ordering of two independent writes to two independent systems that
+      makes this atomic by construction.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">The transactional outbox pattern</span>
+      <div class="callout-body">
+        <p>Don't write to two systems — write to <em>one</em>. Add an <code>outbox</code> table to
+        the same database as the business write, and insert the event into it in the
+        <em>same local transaction</em> as the order row:</p>
+        <pre><code>BEGIN;
+INSERT INTO orders (id, status) VALUES ('o1', 'placed');
+INSERT INTO outbox (id, topic, payload, published)
+  VALUES ('e1', 'OrderPlaced', '{"order_id":"o1"}', false);
+COMMIT;</code></pre>
+        <p>Now the order and the fact-that-an-event-is-owed commit or roll back together — a
+        single-database transaction, nothing distributed about it. A separate relay process (a
+        poller, or <span class="term">CDC</span> — change data capture — tailing the database's
+        write-ahead log, e.g. Debezium reading Postgres's WAL) reads unpublished outbox rows,
+        publishes them to the real broker, and marks them published. If the relay crashes after
+        publishing but before marking the row done, it republishes on restart — that's just
+        at-least-once delivery again, which the idempotent-consumer pattern above already
+        handles. The dual-write problem is fully converted into a problem you already know how to
+        solve.</p>
+      </div>
+    </div>
+    <p>
+      This is also the mechanism that underlies <span class="term">event sourcing</span> and CDC-
+      driven architectures more broadly: instead of an application explicitly publishing events,
+      every row change is captured off the database's own commit log and turned into a stream —
+      the database becomes the single source of truth, and the event stream is a faithful,
+      ordered derivative of it rather than a second, independently-written copy that can drift out
+      of sync.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Feature and training pipelines are event-driven architecture with a different label.
+        A stream of user-activity events feeding a real-time feature computation job (Flink,
+        Kafka Streams) is exactly the topic/partition/consumer-group model above — partitioned by
+        user ID so a user's events stay ordered, consumed by a job that must be idempotent because
+        the stream processor <em>will</em> reprocess events after a restart. "Exactly-once feature
+        computation" is not free for the same reason exactly-once messaging isn't: what these
+        frameworks actually guarantee is at-least-once processing plus transactional, idempotent
+        writes to the output (a feature store row keyed by entity ID, upserted — natural
+        idempotency, straight from the list above). And training-serving skew is very often a
+        dual-write bug in disguise: a feature computed and written to the online store isn't also
+        reliably logged to the offline training-data store, so the two drift apart — the outbox
+        pattern (write once, derive the rest) is a direct fix, and it's why mature feature-store
+        designs write once to a log and derive both the online and offline views from it rather
+        than writing each separately.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A topic has 4 partitions, keyed by <code>user_id</code>. A consumer
+          group scales from 2 to 6 consumer instances. What happens?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Throughput keeps increasing linearly — more consumers always means more parallelism.</button>
+          <button class="quiz-option" data-choice="b">The extra consumers cause a rebalance that reorders events across all partitions.</button>
+          <button class="quiz-option" data-choice="c">Only 4 consumers can ever be active at once (one per partition); the other 2 sit idle with nothing assigned until a partition frees up or the topic is repartitioned.</button>
+        </div>
+        <p class="quiz-explain" hidden>Partition count is a hard ceiling on a consumer group's parallelism, because each partition is assigned to exactly one consumer at a time. Scaling consumers past the partition count buys nothing — the fix is provisioning enough partitions up front for your target peak parallelism.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. A payment consumer charges a customer's card, then acknowledges the
+          message. The process crashes after the charge succeeds but before the ack is sent. What
+          does the broker do under at-least-once delivery, and what should the consumer already
+          have in place?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The broker detects the charge succeeded and skips redelivery automatically — that's what "at-least-once" means.</button>
+          <button class="quiz-option" data-choice="b">The broker redelivers the message, since it never received an ack — so the consumer must be idempotent (e.g. dedup by a payment/message ID) or the customer gets charged twice.</button>
+          <button class="quiz-option" data-choice="c">This scenario is only possible under at-most-once delivery, not at-least-once.</button>
+        </div>
+        <p class="quiz-explain" hidden>At-least-once means the broker's only signal that work is done is the ack — no ack, no matter why, means redelivery. That's precisely why "process, then ack" side effects that aren't idempotent (charging a card via delta rather than an idempotency-keyed request) are a real production bug waiting to happen.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A service writes a row to Postgres and then calls
+          <code>publish()</code> to notify a Kafka topic. The process crashes between the two
+          calls. What's the standard fix, and why doesn't simply retrying the publish call on
+          crash-recovery solve it?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The transactional outbox pattern: write the event into an outbox table in the same local transaction as the business write, then have a separate relay (poller or CDC) publish from the outbox — retrying "the publish call" alone doesn't help because after a crash the process has no reliable memory of which writes still owed an event.</button>
+          <button class="quiz-option" data-choice="b">Switch the database write and the publish call to run in parallel threads so neither blocks the other.</button>
+          <button class="quiz-option" data-choice="c">Nothing to fix — Kafka's exactly-once semantics already cover writes to any external database automatically.</button>
+        </div>
+        <p class="quiz-explain" hidden>The core issue is that "retry the publish" requires the process to know a publish is still owed, which a crash can wipe out along with everything else in memory. The outbox table makes "an event is owed" a durable fact committed atomically with the business write, so a separate relay can always find and deliver it — no in-memory state to lose. Kafka's EOS covers Kafka-to-Kafka pipelines, not arbitrary external databases.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Messaging is a prerequisite for two later stops: the section's next page pairs it with
+      consensus to tackle distributed transactions and sagas — what "commit across services"
+      means once 2PC is off the table and compensating actions take over — and the capstone's
+      system-design method leans on queues/logs in nearly every real design prompt. If you'd
+      rather branch elsewhere first, <em>Resilience Patterns</em> and <em>Observability</em> in
+      the Reliability section are both unlocked already and don't depend on this page.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------------------------------------------------------
+         Message flow simulator
+         ------------------------------------------------------------- */
+      var PARTITION_COUNT = 3;
+      var PARTITION_COLORS = ["#0c8d7d", "#2a63d6", "#6b3fd4"];
+      var KEYS = ["order-A", "order-B", "order-C", "order-D", "order-E", "order-F"];
+      var PROCESS_MS = 1400;
+      var REDELIVERY_MS = 1000;
+
+      function simpleHash(str) {
+        var h = 0;
+        for (var i = 0; i < str.length; i++) { h = ((h << 5) - h + str.charCodeAt(i)) | 0; }
+        return Math.abs(h);
+      }
+      function partitionFor(key) { return simpleHash(key) % PARTITION_COUNT; }
+
+      var msgLanes = document.getElementById("msgLanes");
+      var msgProduce = document.getElementById("msgProduce");
+      var msgReset = document.getElementById("msgReset");
+      var msgIdem = document.getElementById("msgIdem");
+      var msgStats = document.getElementById("msgStats");
+      var msgLog = document.getElementById("msgLog");
+
+      var partitions;       // [{ queue: [msg,...] }]
+      var consumers;        // [{ state: 'idle'|'processing'|'crashed', msg: null, timer: null }]
+      var seq, keyIdx;
+      var processedIds;     // Set of message ids that have already had their effect applied
+      var stats;
+
+      function logLine(text, cls) {
+        var div = document.createElement("div");
+        if (cls) div.className = cls;
+        div.textContent = text;
+        msgLog.appendChild(div);
+        msgLog.scrollTop = msgLog.scrollHeight;
+      }
+
+      function resetSim() {
+        partitions = [];
+        for (var p = 0; p < PARTITION_COUNT; p++) partitions.push({ queue: [] });
+        consumers = [];
+        for (var c = 0; c < PARTITION_COUNT; c++) {
+          if (consumers[c] && consumers[c].timer) clearTimeout(consumers[c].timer);
+          consumers.push({ state: "idle", msg: null, timer: null });
+        }
+        seq = 0;
+        keyIdx = 0;
+        processedIds = {};
+        stats = { produced: 0, effectApplied: 0, duplicatesAbsorbed: 0, redeliveries: 0 };
+        msgLog.innerHTML = "";
+        logLine("Ready. Produce a message, then try crashing a consumer mid-processing.");
+        render();
+      }
+
+      function tryStart(pIdx) {
+        var consumer = consumers[pIdx];
+        var partition = partitions[pIdx];
+        if (consumer.state !== "idle" || partition.queue.length === 0) return;
+        var msg = partition.queue.shift();
+        consumer.state = "processing";
+        consumer.msg = msg;
+        render();
+        logLine("Consumer " + pIdx + " picked up " + msg.key + " (id " + msg.id + ", attempt " + msg.attempt + ")");
+        consumer.timer = setTimeout(function () { finishProcessing(pIdx); }, PROCESS_MS);
+      }
+
+      // Applies the message's side effect (or dedups it), exactly once per call site.
+      // Called both when a consumer finishes normally AND when it crashes — a crash in
+      // this simulator models the realistic failure window: the work is done and the
+      // effect has happened, but the crash lands before the ack reaches the broker, so
+      // the broker redelivers as if nothing happened.
+      function applyEffect(pIdx, msg, crashedBeforeAck) {
+        var isDup = !!processedIds[msg.id];
+        if (msgIdem.checked && isDup) {
+          stats.duplicatesAbsorbed++;
+          logLine("Consumer " + pIdx + ": " + msg.key + " (id " + msg.id + ") recognized as already processed — effect NOT re-applied (dedup)", "dedup");
+        } else {
+          stats.effectApplied++;
+          processedIds[msg.id] = true;
+          if (isDup) {
+            logLine("Consumer " + pIdx + ": " + msg.key + " (id " + msg.id + ") re-processed — effect applied AGAIN (duplicate side effect!)", "dup");
+          } else if (crashedBeforeAck) {
+            logLine("Consumer " + pIdx + ": " + msg.key + " (id " + msg.id + ") — effect applied, but crashed before the ack reached the broker", "dup");
+          } else {
+            logLine("Consumer " + pIdx + ": " + msg.key + " (id " + msg.id + ") processed — effect applied, acked");
+          }
+        }
+      }
+
+      function finishProcessing(pIdx) {
+        var consumer = consumers[pIdx];
+        var msg = consumer.msg;
+        applyEffect(pIdx, msg, false);
+        consumer.state = "idle";
+        consumer.msg = null;
+        consumer.timer = null;
+        render();
+        tryStart(pIdx);
+      }
+
+      function crash(pIdx) {
+        var consumer = consumers[pIdx];
+        if (consumer.state !== "processing") return;
+        clearTimeout(consumer.timer);
+        var msg = consumer.msg;
+        consumer.state = "crashed";
+        consumer.msg = null;
+        consumer.timer = null;
+        render();
+        logLine("Consumer " + pIdx + " CRASHED — no ack sent for " + msg.key + " (id " + msg.id + ")");
+        applyEffect(pIdx, msg, true);
+        setTimeout(function () {
+          msg.attempt++;
+          stats.redeliveries++;
+          partitions[pIdx].queue.unshift(msg);
+          consumers[pIdx].state = "idle";
+          logLine("Visibility timeout elapsed — broker never saw an ack, redelivers " + msg.key + " (id " + msg.id + ") to partition " + pIdx);
+          render();
+          tryStart(pIdx);
+        }, REDELIVERY_MS);
+      }
+
+      function produce() {
+        var key = KEYS[keyIdx % KEYS.length];
+        keyIdx++;
+        var pIdx = partitionFor(key);
+        seq++;
+        var msg = { id: "m" + seq, key: key, partition: pIdx, attempt: 1 };
+        partitions[pIdx].queue.push(msg);
+        stats.produced++;
+        logLine("Produced " + key + " (id " + msg.id + ") → partition " + pIdx);
+        render();
+        tryStart(pIdx);
+      }
+
+      function render() {
+        msgLanes.innerHTML = partitions.map(function (partition, pIdx) {
+          var color = PARTITION_COLORS[pIdx];
+          var chips = partition.queue.map(function (m) {
+            return '<span class="msg-chip" style="background:' + color + '">' + m.key + (m.attempt > 1 ? " ×" + m.attempt : "") + '</span>';
+          }).join("");
+          var consumer = consumers[pIdx];
+          var stateLabel = consumer.state === "processing"
+            ? "processing " + consumer.msg.key + (consumer.msg.attempt > 1 ? " (redelivered)" : "")
+            : consumer.state;
+          return (
+            '<div class="msg-lane">' +
+              '<div class="msg-lane-head"><span>Partition P' + pIdx + '</span><span class="badge accent">owner: C' + pIdx + '</span></div>' +
+              '<div class="msg-queue">' + (chips || '<span class="msg-queue-empty">empty</span>') + '</div>' +
+              '<div class="msg-consumer-box">' +
+                '<span class="msg-consumer-id">Consumer ' + pIdx + '</span>' +
+                '<span class="msg-consumer-state ' + consumer.state + '">' + stateLabel + '</span>' +
+                '<button class="btn secondary msg-crash-btn" data-consumer="' + pIdx + '" type="button"' + (consumer.state !== "processing" ? " disabled" : "") + '>Crash mid-processing</button>' +
+              '</div>' +
+            '</div>'
+          );
+        }).join("");
+
+        msgLanes.querySelectorAll(".msg-crash-btn").forEach(function (btn) {
+          btn.addEventListener("click", function () { crash(parseInt(btn.dataset.consumer, 10)); });
+        });
+
+        var warn = stats.effectApplied > stats.produced;
+        msgStats.innerHTML =
+          '<div><span class="msg-stat-label">Messages produced</span><span class="msg-stat-val">' + stats.produced + '</span></div>' +
+          '<div><span class="msg-stat-label">Redeliveries</span><span class="msg-stat-val">' + stats.redeliveries + '</span></div>' +
+          '<div><span class="msg-stat-label">Effect applied</span><span class="msg-stat-val' + (warn ? ' warn' : '') + '">' + stats.effectApplied + (warn ? ' (> produced!)' : '') + '</span></div>' +
+          '<div><span class="msg-stat-label">Duplicates absorbed (dedup)</span><span class="msg-stat-val">' + stats.duplicatesAbsorbed + '</span></div>';
+      }
+
+      msgProduce.addEventListener("click", produce);
+      msgReset.addEventListener("click", resetSim);
+
+      resetSim();
+
+      /* ---------------------------------------------------------------
+         Quiz interactivity (shared pattern across deep-dives)
+         ------------------------------------------------------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -160,7 +160,7 @@
       "summary": "Queues vs logs, delivery semantics, ordering, idempotent consumers, DLQs, and the outbox pattern.",
       "prerequisites": ["scaling-and-load-balancing"],
       "file": "messaging-and-event-driven.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "distributed-transactions-sagas",
