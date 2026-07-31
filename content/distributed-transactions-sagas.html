@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed Transactions, Sagas &amp; Idempotency — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the saga stepper widget only. */
+    .saga-toggle-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-4); }
+    .saga-steps { display: grid; gap: var(--sp-3); grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: var(--sp-4); }
+    .saga-step { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); text-align: center; position: relative; }
+    .saga-step-name { font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: 700; color: var(--text); margin-bottom: var(--sp-2); }
+    .saga-step-state { display: inline-block; font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.06em; text-transform: uppercase; padding: 0.22em 0.6em; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--text-faint); background: var(--surface-2); }
+    .saga-step-state.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .saga-step-state.failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+    .saga-step-state.compensating, .saga-step-state.compensated { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+    .saga-step-state.active { color: var(--blueprint); border-color: color-mix(in srgb, var(--blueprint) 45%, transparent); background: var(--blueprint-soft); }
+    .saga-arrow { display: none; }
+    .saga-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+    .saga-mode-row { display: flex; gap: var(--sp-5); flex-wrap: wrap; align-items: center; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: var(--sp-4); }
+    .saga-mode-row label { display: flex; align-items: center; gap: var(--sp-2); }
+    .saga-log { font-family: var(--font-mono); font-size: var(--fs-sm); background: var(--surface-code); color: var(--text-on-code); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); max-height: 12em; overflow-y: auto; }
+    .saga-log div { padding: 0.15em 0; opacity: 0.92; }
+    .saga-log div:last-child { color: var(--accent-strong); opacity: 1; }
+    .saga-log div.warn { color: var(--warn); }
+    .saga-log div.danger { color: var(--danger); }
+    .saga-final { font-size: var(--fs-sm); margin-top: var(--sp-3); padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); }
+    .saga-final.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+    .saga-final.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Distributed Systems &amp; Scaling // 05</p>
+    <h1>Distributed Transactions, Sagas &amp; Idempotency</h1>
+
+    <p>
+      A single Postgres transaction gives you something remarkable: a set of writes that either
+      <em>all</em> happen or <em>none</em> do, even if the process crashes mid-way, covered in
+      full in <a href="transactions-and-isolation.html">Transactions, ACID &amp; Isolation
+      Levels</a>. The moment those writes span two services — an order service, a payment service,
+      an inventory service, each with its own database — that guarantee is gone, and nothing you
+      can buy or configure brings it back for free. This page is about the gap between "I want
+      this to be atomic" and "atomic across a network is a different, much harder problem," and
+      the two ways production systems actually close it: pay for stronger coordination up front
+      (two-phase commit), or accept it's not truly atomic and design so that's survivable (sagas).
+      It's also the question senior backend interviews reach for almost every time system design
+      touches more than one service: <em>"how do you handle a distributed transaction without
+      2PC?"</em>
+    </p>
+
+    <h2>Why cross-service ACID doesn't exist for free</h2>
+    <p>
+      Say checkout needs to: deduct inventory, charge a card, and create a shipment record — each
+      owned by a different service with its own database, the way <a
+      href="scaling-and-load-balancing.html">horizontal scaling</a> and service ownership push you
+      to split things. A naive implementation calls each service in turn:
+    </p>
+    <pre><code>reserve_inventory(order)   // service A commits
+charge_card(order)         // service B commits
+create_shipment(order)     // service C crashes before this call</code></pre>
+    <p>
+      Inventory is reserved, the card is charged, and the process died before shipment was ever
+      created. There's no rollback button — the two prior commits are already durable, in two
+      other databases you don't control from here. This is exactly the <a
+      href="messaging-and-event-driven.html">dual-write problem</a> from the messaging page,
+      generalized from "one database + one broker" to "N independently-committing services." Each
+      individual step is ACID; the sequence of them is not, because nothing wraps all N commits in
+      a single all-or-nothing unit.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Every technique on this page is really answering one question: <em>who decides, and
+        when, that a multi-step operation spanning independent systems is "done"?</em> A local
+        transaction answers it with a single log record the database writes atomically. Once you
+        cross a network boundary, that single point of truth doesn't exist — so you either
+        simulate one with a coordinator that a majority of participants trust (2PC), or you give
+        up on a single moment of truth entirely and make every intermediate state a valid,
+        recoverable state of the world (sagas). There's no third option that's actually free.</p>
+      </div>
+    </div>
+
+    <h2>Two-phase commit: the classic answer, and its cost</h2>
+    <p>
+      <span class="term">Two-phase commit</span> (2PC) is the textbook way to make a distributed
+      transaction atomic. A coordinator asks every participant to prepare, and only tells everyone
+      to commit once <em>all</em> have said yes:
+    </p>
+    <div class="definition">
+      <dl>
+        <dt>Phase 1 — Prepare (vote)</dt>
+        <dd>The coordinator asks every participant "can you commit?" Each participant does
+          whatever work is needed to guarantee it <em>can</em> commit on request — validates
+          constraints, acquires locks, writes its intended change to a durable log — then replies
+          <b>yes</b> (prepared) or <b>no</b>. Critically, a participant that votes yes must be
+          able to commit later no matter what happens to it in between (crash, restart) — that's
+          the guarantee the whole protocol rests on.</dd>
+        <dt>Phase 2 — Commit (decide)</dt>
+        <dd>If <em>every</em> participant voted yes, the coordinator logs the decision and tells
+          everyone to commit for real. If even one voted no (or timed out), the coordinator tells
+          everyone to abort, and each participant rolls back the work it provisionally did in
+          phase 1.</dd>
+      </dl>
+    </div>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — the blocking problem</span>
+      <div class="callout-body">
+        <p>A participant that has voted <b>yes</b> is now obligated to hold its locks and wait —
+        it cannot unilaterally commit or abort, because it doesn't know what the other
+        participants voted. If the coordinator crashes after collecting votes but before
+        broadcasting the decision, every prepared participant is stuck holding locks
+        <em>indefinitely</em>, blocking any other transaction that touches the same rows, until
+        the coordinator recovers and tells them what happened. This is 2PC's defining weakness:
+        it turns a coordinator outage into a cluster-wide locking incident, which is precisely
+        the kind of "one slow/down dependency takes everything else down with it" failure mode
+        that the rest of this roadmap tries to design away from.</p>
+      </div>
+    </div>
+    <p>
+      2PC also assumes every participant speaks the protocol and stays reachable for the duration
+      — fine inside one database's internal transaction manager, or across a small number of
+      systems you tightly control (some XA-compliant deployments still do this), but it doesn't
+      compose well with services owned by other teams, third-party APIs you don't control the
+      internals of, or a network with real, un-bounded latency. That combination — blocking
+      failure mode, poor fit for service boundaries, and every participant paying a latency and
+      availability tax on every transaction — is why 2PC has largely fallen out of favor for
+      inter-service transactions in modern backends, even though it's still exactly correct where
+      it's used (many single-database engines use a 2PC-like protocol internally across their own
+      replicas/shards, where the "coordinator" is trusted infrastructure, not another team's
+      service).
+    </p>
+
+    <h2>The saga pattern</h2>
+    <p>
+      A <span class="term">saga</span> gives up on true atomicity and replaces it with something
+      weaker but achievable: break the operation into a sequence of local transactions, each in
+      its own service, and define a <span class="term">compensating action</span> for each step
+      that can undo its effect if a later step fails. Nothing is ever locked waiting on a remote
+      decision — every step commits for real, immediately, in its own service. If step 4 of 6
+      fails, the saga runs compensations for steps 3, 2, and 1 in reverse, so the system ends up
+      in a consistent state again — just not the same path it would take if everything succeeded.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th></th><th>Two-phase commit</th><th>Saga</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>Isolation</b></td>
+            <td>True — nothing is externally visible until the final commit.</td>
+            <td>None between steps — each local transaction commits and is immediately visible.
+              Other requests can observe an order as "paid" before "shipped" exists.</td>
+          </tr>
+          <tr>
+            <td><b>Failure recovery</b></td>
+            <td>Automatic rollback via the protocol; but the coordinator can leave participants
+              blocked holding locks.</td>
+            <td>Compensating actions you must design and write yourself, per step — there's no
+              generic "undo."</td>
+          </tr>
+          <tr>
+            <td><b>Availability</b></td>
+            <td>Lower — every participant must stay reachable and hold locks for the duration of
+              the round trip.</td>
+            <td>Higher — each step is a normal, fast local transaction; no cross-service locks
+              held at all.</td>
+          </tr>
+          <tr>
+            <td><b>Reversibility</b></td>
+            <td>Rollback undoes a provisional change that was never externally visible.</td>
+            <td>Compensation reverses an already-committed, possibly already-observed effect —
+              some effects (an email sent, an SMS) can't truly be undone, only apologized for.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution — sagas are not isolated</span>
+      <div class="callout-body">
+        <p>The loss of isolation is the trade-off people underestimate. Between "inventory
+        reserved" and "payment charged," another process reading the order sees an intermediate,
+        possibly-doomed state. If that saga later fails and compensates, anyone who acted on the
+        intermediate state (sent a "your order is confirmed!" push notification, let a second
+        customer see the item as available again mid-reservation) has to live with having reacted
+        to something that got undone. Real saga implementations often need their own countermeasures
+        for this — e.g. a "pending" status that downstream consumers know not to treat as final —
+        which is extra design surface 2PC's isolation would have hidden for you.</p>
+      </div>
+    </div>
+
+    <h3>Orchestration vs. choreography</h3>
+    <p>
+      There are two ways to wire up which service decides what happens next:
+    </p>
+    <div class="definition">
+      <dl>
+        <dt>Orchestration</dt>
+        <dd>A dedicated orchestrator (or the initiating service) explicitly calls each
+          participant in sequence and tells it what to do — including which compensations to
+          trigger on failure. The saga's logic lives in one place, as an explicit state machine,
+          which makes it easy to see the whole flow, add steps, and reason about "what happens if
+          step 3 fails" by reading one file. The cost is a central component that every
+          participant now depends on, and that component needs its own durability (if the
+          orchestrator crashes mid-saga, it must resume from where it left off, not restart from
+          scratch or forget the saga entirely).</dd>
+        <dt>Choreography</dt>
+        <dd>There is no central coordinator — each service reacts to events from the others
+          (exactly the <a href="messaging-and-event-driven.html">event-driven architecture</a>
+          machinery: topics, consumers, at-least-once delivery). <code>OrderCreated</code>
+          triggers inventory to reserve stock and emit <code>InventoryReserved</code>, which
+          triggers payment to charge and emit <code>PaymentCharged</code>, and so on; a failure
+          emits a <code>*Failed</code> event that upstream services listen for to run their own
+          compensation. This avoids a single dependency everyone calls through, but the overall
+          flow is now implicit, scattered across services' event handlers — nobody's code shows
+          you the whole saga, and debugging "why did this order get stuck half-compensated"
+          means reconstructing the story from logs across N services.</dd>
+      </dl>
+    </div>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>Choreography scales better organizationally for a handful of steps with genuinely
+        independent participants, but it degrades fast as steps grow — a 6-step saga in pure
+        choreography is 6 services each holding a fragment of a state machine nobody can see
+        whole. Most teams that start choreographed converge on orchestration once a saga passes
+        roughly 4-5 steps or gains a step that needs to know "how far did we get" (e.g. a timeout
+        that should trigger compensation) — which is really just re-deriving the case for an
+        explicit state machine over an implicit, distributed one, the same lesson that shows up
+        anywhere business logic threatens to become implicit (stored procedures, deeply nested
+        event chains, magic ORM callbacks).</p>
+      </div>
+    </div>
+
+    <h2>Try it: saga stepper</h2>
+    <p>
+      Below is an order saga with three steps — reserve inventory, charge card, arrange shipping —
+      each with a compensating action. Choose whether a failure hits, and where, then step through
+      the saga and watch the difference between a saga that compensates properly and one that
+      doesn't.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Saga stepper: order fulfillment</div>
+      <div class="saga-mode-row">
+        <label><input type="radio" name="sagaFail" id="sagaFailNone" value="none" checked /> No failure — all steps succeed</label>
+        <label><input type="radio" name="sagaFail" id="sagaFailShip" value="ship" /> Shipping fails (step 3)</label>
+        <label><input type="checkbox" id="sagaNoCompensate" /> Naive mode: skip compensation on failure</label>
+      </div>
+      <div class="saga-steps" id="sagaSteps"></div>
+      <div class="saga-actions">
+        <button class="btn" id="sagaStep" type="button">Step forward</button>
+        <button class="btn secondary" id="sagaReset" type="button">Reset</button>
+      </div>
+      <div class="saga-log" id="sagaLog"></div>
+      <div class="saga-final" id="sagaFinal" hidden></div>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Try this sequence</span>
+      <div class="callout-body">
+        <p>Run it once with "no failure" to see the happy path: three local commits, no
+        cross-service locks, done. Then pick "shipping fails" and step through with naive mode
+        <em>off</em> — watch inventory and payment get compensated in reverse order, leaving the
+        system consistent. Finally, tick "naive mode" and replay the same failure: the saga stops
+        cold at the failed step with inventory reserved and the card charged, and nothing ever
+        undoes either — the exact inconsistent, half-done state compensation exists to prevent.</p>
+      </div>
+    </div>
+
+    <h2>Idempotency: what makes retries and compensation safe</h2>
+    <p>
+      Sagas (and 2PC recovery, and message redelivery) all depend on being able to retry a step
+      without fear — a network timeout doesn't tell you whether the request landed, so the only
+      safe move is often "try again," and trying again must not double-charge a card or
+      double-reserve stock. This is the same <span class="term">idempotency</span> concept from
+      <a href="messaging-and-event-driven.html">idempotent consumers</a> and from <a
+      href="rest-api-design.html">idempotency keys on REST APIs</a>, and it's the load-bearing
+      property underneath every technique on this page:
+    </p>
+    <ul>
+      <li><b>Idempotency keys</b> — the caller generates a unique key per logical operation
+        (e.g. <code>charge:order-42</code>) and sends it with every attempt, including retries.
+        The receiving service records which keys it has already completed and, on a repeat,
+        returns the original result instead of re-executing — the same request replayed twice
+        produces one effect.</li>
+      <li><b>Compensating actions must themselves be idempotent</b> — a compensation can also be
+        retried (the service issuing it can crash and retry too), so "release the reservation"
+        must be safe to call twice, e.g. by checking current state before acting, or by making the
+        release an absolute set rather than a relative decrement.</li>
+      <li><b>Effectively-once, not exactly-once</b> — as with messaging, there's no free exactly-
+        once here either. The honest, achievable target is <b>at-least-once execution + an
+        idempotent operation</b>, which behaves like exactly-once from the outside even though the
+        underlying call may physically happen more than once.</li>
+      <li><b>Semantic vs. compensating undo</b> — some actions have no meaningful compensation at
+        all (an email already read, an SMS already delivered). Design the saga so irreversible
+        side effects happen <em>last</em>, after every step that's still cheaply compensable has
+        succeeded — a card charge (reversible via refund) should generally precede "send
+        confirmation email" (not reversible), not the other way around.</li>
+    </ul>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — compensation without idempotency is a new bug, not a fix</span>
+      <div class="callout-body">
+        <p>A team that adds compensation logic but forgets it needs the same idempotency
+        discipline as the forward steps just relocates the bug: now a retried compensation
+        double-refunds a card, or a redelivered "release inventory" message releases stock that a
+        different saga already re-reserved in the meantime. Compensation is still a distributed
+        operation subject to at-least-once delivery — it doesn't get to skip the rules the forward
+        path had to follow.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>A training pipeline that has to update a feature store, kick off a training job, and
+        register a new model version is a saga whether or not anyone calls it that. If model
+        registration fails after the feature store was already updated and a costly training run
+        already completed, you don't want to silently leave a half-updated feature store or an
+        orphaned training run burning GPU-hours for nothing — you want an explicit compensating
+        step (roll back the feature-store version, tag the training run as abandoned) the same
+        way an order saga rolls back inventory. And "resume this pipeline from where it crashed"
+        only works safely if each stage is idempotent — re-running a training job that already
+        completed and registered a model, because a retry fired after a timeout, is the training-
+        pipeline version of double-charging a card. The orchestration-vs-choreography choice maps
+        directly too: an explicit DAG orchestrator (Airflow, Argo, a custom state machine) is the
+        "orchestration" saga; a chain of pipeline stages each triggered by the previous stage's
+        completion event is "choreography," with the exact same trade-off — visibility and
+        central control vs. loose coupling that gets hard to debug once the DAG grows.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A coordinator running two-phase commit collects "yes" votes from all
+          three participants, then crashes before sending the commit decision. What happens to the
+          participants, and why is this 2PC's defining weakness?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Each participant independently times out and commits on its own, since all three voted yes.</button>
+          <button class="quiz-option" data-choice="b">Each participant is stuck holding its prepared locks indefinitely, since a participant that voted yes cannot unilaterally decide to commit or abort — it must wait for the coordinator's decision, which is why a coordinator outage becomes a blocking, cluster-wide locking incident.</button>
+          <button class="quiz-option" data-choice="c">Each participant automatically aborts, since no decision was received within one round trip.</button>
+        </div>
+        <p class="quiz-explain" hidden>A participant that has voted "yes" has given up the right to decide unilaterally — it must be ready to commit on request no matter what, which means it can't safely guess abort either (the coordinator might have decided commit). That forces it to block, holding locks, until the coordinator recovers and tells it the decision — the exact failure mode that makes 2PC a poor fit across independently-owned services.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. In a saga, step 4 of 5 fails after steps 1-3 already committed
+          locally. What is the correct response, and what property must each compensating action
+          have?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nothing — sagas don't support rollback, so the system is simply left in whatever state it reached.</button>
+          <button class="quiz-option" data-choice="b">Retry step 4 forever until it eventually succeeds, since compensations are only for permanent failures.</button>
+          <button class="quiz-option" data-choice="c">Run compensating actions for steps 3, 2, and 1 in reverse order to undo their already-committed effects; each compensation must itself be idempotent, since it can be retried or redelivered just like any other distributed operation.</button>
+        </div>
+        <p class="quiz-explain" hidden>A saga's whole point is that local commits along the way are real and visible, so a later failure has to be undone explicitly via compensating actions run in reverse — and because compensation is itself just another distributed call subject to retries and at-least-once delivery, it needs the same idempotency discipline as the forward path, or a retried compensation can cause a new bug (e.g. double-refunding).</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A 6-step order saga is implemented via choreography: each service
+          reacts to the previous service's event and emits its own. The team wants to add a
+          timeout that triggers compensation if the saga stalls partway through. What's the
+          practical difficulty this reveals, and what's the common fix?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">No single component knows "how far did this particular saga get," since that state is implicitly scattered across each service's event handlers — teams typically converge on an explicit orchestrator (a visible state machine) once a saga needs this kind of cross-step awareness or grows past a handful of steps.</button>
+          <button class="quiz-option" data-choice="b">Choreography is strictly incompatible with timeouts and cannot be fixed without switching to two-phase commit.</button>
+          <button class="quiz-option" data-choice="c">The fix is to add more event types until every possible stall condition has its own dedicated event, which resolves the issue without any architectural change.</button>
+        </div>
+        <p class="quiz-explain" hidden>Choreography's implicit, distributed state is exactly what makes "has this saga stalled, and where" hard to answer — no service holds the whole picture. That's the classic pressure that pushes teams from choreography to orchestration as saga complexity grows: an explicit state machine can track progress and own timeout/compensation logic in one visible place, at the cost of a central dependency.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This closes out the Distributed Systems &amp; Scaling section. From here, the Reliability
+      section (<em>Resilience Patterns</em>, <em>Observability</em>, <em>Performance &amp; Capacity
+      Planning</em>, <em>Deployment &amp; CI/CD</em>) is fully unlocked and covers what "production-
+      ready" means operationally; <em>Resilience Patterns</em> in particular builds directly on the
+      retries-and-idempotency reasoning from this page. The capstone's <em>System Design Method</em>
+      draws on sagas whenever a design prompt spans more than one service or data store.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------------------------------------------------------
+         Saga stepper
+         ------------------------------------------------------------- */
+      var STEPS = [
+        { name: "Reserve inventory", compensation: "Release inventory" },
+        { name: "Charge card", compensation: "Refund card" },
+        { name: "Arrange shipping", compensation: "Cancel shipment" }
+      ];
+
+      var sagaSteps = document.getElementById("sagaSteps");
+      var sagaStepBtn = document.getElementById("sagaStep");
+      var sagaResetBtn = document.getElementById("sagaReset");
+      var sagaLog = document.getElementById("sagaLog");
+      var sagaFinal = document.getElementById("sagaFinal");
+      var sagaNoCompensate = document.getElementById("sagaNoCompensate");
+
+      var state; // { steps: [{state}], phase: 'forward'|'compensating'|'done', cursor }
+
+      function failMode() {
+        var el = document.querySelector('input[name="sagaFail"]:checked');
+        return el ? el.value : "none";
+      }
+
+      function logLine(text, cls) {
+        var div = document.createElement("div");
+        if (cls) div.className = cls;
+        div.textContent = text;
+        sagaLog.appendChild(div);
+        sagaLog.scrollTop = sagaLog.scrollHeight;
+      }
+
+      function resetSaga() {
+        state = {
+          steps: STEPS.map(function () { return { state: "pending" }; }),
+          phase: "forward",
+          cursor: 0,
+          compCursor: STEPS.length - 1
+        };
+        sagaLog.innerHTML = "";
+        sagaFinal.hidden = true;
+        logLine("Ready. Pick a failure mode, then step forward through the saga.");
+        render();
+      }
+
+      function stepForward() {
+        if (state.phase === "done") return;
+
+        if (state.phase === "forward") {
+          var i = state.cursor;
+          if (i >= STEPS.length) {
+            state.phase = "done";
+            logLine("All steps committed successfully. Saga complete.");
+            sagaFinal.hidden = false;
+            sagaFinal.className = "saga-final good";
+            sagaFinal.textContent = "Final state: consistent — inventory reserved, card charged, shipment arranged.";
+            render();
+            return;
+          }
+          var shouldFail = failMode() === "ship" && i === 2;
+          if (shouldFail) {
+            state.steps[i].state = "failed";
+            logLine("Step \"" + STEPS[i].name + "\" FAILED.", "danger");
+            if (sagaNoCompensate.checked) {
+              state.phase = "done";
+              logLine("Naive mode: no compensation triggered. Saga stops here.", "warn");
+              sagaFinal.hidden = false;
+              sagaFinal.className = "saga-final bad";
+              sagaFinal.textContent = "Final state: INCONSISTENT — inventory still reserved, card still charged, no shipment, and nothing undoes either.";
+            } else {
+              state.phase = "compensating";
+              state.compCursor = i - 1;
+              logLine("Beginning compensation, in reverse order.", "warn");
+            }
+            render();
+            return;
+          }
+          state.steps[i].state = "done";
+          logLine("Step \"" + STEPS[i].name + "\" committed locally.");
+          state.cursor++;
+          render();
+          return;
+        }
+
+        if (state.phase === "compensating") {
+          var c = state.compCursor;
+          if (c < 0) {
+            state.phase = "done";
+            logLine("Compensation complete. System returned to a consistent state.");
+            sagaFinal.hidden = false;
+            sagaFinal.className = "saga-final good";
+            sagaFinal.textContent = "Final state: consistent — every completed step was compensated; no partial effects remain.";
+            render();
+            return;
+          }
+          state.steps[c].state = "compensated";
+          logLine("Compensating: \"" + STEPS[c].compensation + "\" for step \"" + STEPS[c].name + "\".", "warn");
+          state.compCursor--;
+          render();
+          return;
+        }
+      }
+
+      function render() {
+        sagaSteps.innerHTML = state.steps.map(function (s, i) {
+          var label = s.state;
+          if (state.phase === "forward" && i === state.cursor && s.state === "pending") label = "active";
+          return (
+            '<div class="saga-step">' +
+              '<div class="saga-step-name">' + (i + 1) + ". " + STEPS[i].name + '</div>' +
+              '<span class="saga-step-state ' + label + '">' + label + '</span>' +
+            '</div>'
+          );
+        }).join("");
+        sagaStepBtn.disabled = state.phase === "done";
+      }
+
+      sagaStepBtn.addEventListener("click", stepForward);
+      sagaResetBtn.addEventListener("click", resetSaga);
+      document.querySelectorAll('input[name="sagaFail"]').forEach(function (el) {
+        el.addEventListener("change", resetSaga);
+      });
+      sagaNoCompensate.addEventListener("change", resetSaga);
+
+      resetSaga();
+
+      /* ---------------------------------------------------------------
+         Quiz interactivity (shared pattern across deep-dives)
+         ------------------------------------------------------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -170,7 +170,7 @@
       "summary": "Why cross-service ACID is costly, 2PC vs sagas, compensating actions, and effective exactly-once.",
       "prerequisites": ["consistency-and-consensus", "messaging-and-event-driven"],
       "file": "distributed-transactions-sagas.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "resilience-patterns",
