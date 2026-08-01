@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resilience Patterns — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the failure-injection dashboard widget only. */
+    .rp-controls {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      margin-bottom: var(--sp-4);
+      align-items: end;
+    }
+    .rp-controls label { display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em; }
+    .rp-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .rp-controls select { width: 100%; }
+    .rp-toggles {
+      display: grid; gap: var(--sp-3);
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-bottom: var(--sp-5);
+    }
+    .rp-toggle {
+      display: flex; align-items: center; gap: var(--sp-2);
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-3) var(--sp-4); cursor: pointer; user-select: none;
+    }
+    .rp-toggle input { accent-color: var(--accent); width: 1.1em; height: 1.1em; }
+    .rp-toggle .rp-toggle-label { font-weight: 600; font-size: var(--fs-sm); }
+    .rp-toggle .rp-toggle-sub { display: block; font-weight: 400; color: var(--text-faint); font-size: 0.78rem; }
+    .rp-actions { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-5); flex-wrap: wrap; }
+
+    .rp-lanes { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-bottom: var(--sp-5); }
+    .rp-lane { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); }
+    .rp-lane-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--sp-3); }
+    .rp-lane-head h4 { margin: 0; font-size: var(--fs-md); font-family: var(--font-mono); }
+    .rp-stats { font-size: var(--fs-sm); display: grid; gap: 0.3em; }
+    .rp-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .rp-stat-label { color: var(--text-muted); }
+    .rp-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .rp-stat-val.rp-bad { color: var(--danger); }
+    .rp-stat-val.rp-warn { color: var(--warn); }
+    .rp-stat-val.rp-good { color: var(--ok); }
+
+    .rp-pool-track { height: 14px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; margin: var(--sp-2) 0 var(--sp-3); display: flex; }
+    .rp-pool-seg { height: 100%; }
+    .rp-pool-seg.checkout { background: var(--blueprint); }
+    .rp-pool-seg.profile { background: var(--accent); }
+    .rp-pool-seg.idle { background: transparent; }
+    .rp-pool-legend { display: flex; gap: var(--sp-4); font-size: 0.78rem; color: var(--text-faint); margin-bottom: var(--sp-3); }
+    .rp-pool-legend span::before { content: ""; display: inline-block; width: 0.7em; height: 0.7em; border-radius: 3px; margin-right: 0.4em; vertical-align: -1px; }
+    .rp-pool-legend .lg-checkout::before { background: var(--blueprint); }
+    .rp-pool-legend .lg-profile::before { background: var(--accent); }
+
+    .rp-breaker-badge {
+      display: inline-flex; align-items: center; gap: 0.4em;
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+      letter-spacing: 0.05em; text-transform: uppercase;
+      padding: 0.22em 0.6em; border-radius: 999px; border: 1px solid var(--border-strong);
+    }
+    .rp-breaker-closed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .rp-breaker-open { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+    .rp-breaker-half { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+
+    .rp-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-2); min-height: 2.6em; }
+    @media (max-width: 560px) { .rp-controls { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Reliability &amp; Operating in Production // 01</p>
+    <h1>Resilience Patterns</h1>
+
+    <p>
+      <a href="scaling-and-load-balancing.html">Scaling &amp; Load Balancing</a> ended on an
+      uncomfortable fact: a load balancer's health check always has a detection window, and
+      requests routed to a dying backend during that window fail or hang. That's not a flaw in
+      health checking — it's a structural limit of any mechanism that reacts to failure instead
+      of bounding it. This page is about the other half of the story: what the <em>caller</em>
+      does so that a failing dependency — a slow database, a flaky third-party API, one bad
+      instance the load balancer hasn't evicted yet — costs it a bounded amount of pain instead
+      of an unbounded amount. Every pattern here is really one idea applied at different scopes:
+      <b>fail fast, contain the damage, and don't make things worse for the failing dependency
+      or for the parts of your system that don't depend on it.</b>
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Resilience patterns don't make dependencies more reliable — nothing you do in your
+        service fixes someone else's outage. What they do is convert a dependency's failure from
+        <em>your</em> outage into a <em>contained, bounded, visible</em> degradation of your own
+        service. That reframing — "I cannot prevent downstream failure, only bound my exposure to
+        it" — is the mental model this whole page builds from.</p>
+      </div>
+    </div>
+
+    <h2>Timeouts: the one number every network call must have</h2>
+    <p>
+      <a href="networking-for-backend.html">Networking &amp; Protocols</a> called "the network is
+      not reliable" the first fallacy of distributed computing. Its direct consequence is this: a
+      network call without a timeout doesn't fail — it <em>hangs</em>, for as long as the OS-level
+      TCP timeout takes to give up, which can be minutes. In <a
+      href="concurrency-and-io.html">Concurrency, Threads &amp; Async I/O</a> you saw why that's
+      lethal in a thread-per-request pool: a worker blocked waiting on a hung call is a worker
+      that can't serve anything else, and enough hung calls exhaust the pool — new requests queue,
+      then time out themselves, and a slow *dependency* becomes a *total* outage of a service that
+      doesn't even need that dependency for most of its traffic.
+    </p>
+    <p>
+      The fix sounds trivial and is: every network call gets an explicit timeout, chosen to be
+      just above the dependency's real p99 latency, not "whatever the client library defaults to"
+      (often: none). Two refinements matter in practice:
+    </p>
+    <ul>
+      <li><b>Timeout budgets compose.</b> If service A calls B which calls C, A's total timeout has
+        to be larger than B's, which has to be larger than C's — otherwise A gives up and retries
+        while B is still legitimately waiting on C, doubling load on a struggling C for no benefit.
+        A deadline passed down the call chain (a remaining-time header, `context.Context` in Go, a
+        gRPC deadline) is the disciplined version: each hop computes its own timeout as "time
+        budget left," not a fixed constant.</li>
+      <li><b>Connect timeout ≠ read/request timeout.</b> Failing to establish a TCP connection
+        (dependency is down) should fail fast — a couple hundred milliseconds. Waiting for a
+        response after the connection is open can legitimately take longer for some endpoints.
+        Conflating the two either makes you too slow to notice a dead host or too quick to abandon
+        a slow-but-alive one.</li>
+    </ul>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>A timeout that's too tight is its own failure mode: it fires on requests that would
+        have succeeded a moment later, turning "slow" into "failed" and — if paired with retries —
+        multiplying load on a dependency that was actually fine, just briefly at the tail of its
+        latency distribution. Set timeouts from measured p99 (or p99.9) latency, not a round
+        number picked by feel; <em>Performance, Profiling &amp; Capacity Planning</em>, later in
+        this section, is where "what's the real tail" gets measured properly.</p>
+      </div>
+    </div>
+
+    <h2>Retries: turning permanent failures into transient ones — carefully</h2>
+    <p>
+      Plenty of failures are transient: a packet drops, a server briefly GCs, a load-balancer
+      health check hasn't caught up yet. Retrying is often the right response — but a retry is a
+      second request, and the naive version, retry-immediately-forever, is one of the most common
+      ways backend engineers accidentally cause the outage they were trying to survive.
+    </p>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — the retry storm</span>
+      <div class="callout-body">
+        <p>Picture a downstream service that's degraded — succeeding, but slowly, at maybe 60% of
+        normal throughput. Every caller times out, retries immediately, and now the downstream is
+        receiving <em>the original load plus a wave of retries</em> — which pushes it further past
+        its capacity, causing more timeouts, causing more retries. This is a <span
+        class="term">retry storm</span> (a specific, self-reinforcing case of the thundering-herd
+        problem you also saw in <a href="caching-strategies.html">Caching Strategies</a>'s cache
+        stampede): the caller's own recovery attempt is the thing that keeps the downstream down.
+        Retries without restraint don't add resilience — they add a positive feedback loop.</p>
+      </div>
+    </div>
+    <p>
+      Three disciplines turn a dangerous retry into a safe one:
+    </p>
+    <dl class="definition">
+      <dt>Exponential backoff</dt>
+      <dd>Wait longer between each successive retry — typically <code>base × 2^attempt</code>
+        (100ms, 200ms, 400ms, 800ms…), capped at some maximum. This spreads retries out in time
+        instead of hammering the downstream at the exact moment it's struggling most.</dd>
+      <dt>Jitter</dt>
+      <dd>Backoff alone still synchronizes callers: if a thousand clients all failed at the same
+        instant (say, the downstream just came back from an outage), pure exponential backoff has
+        all thousand retry at the same moments — 100ms later, 200ms later, in lockstep. Adding
+        randomness (<em>jitter</em>) to each wait — e.g. a random value in <code>[0, backoff]</code>
+        — desynchronizes them, spreading the retry wave out instead of concentrating it into
+        further synchronized spikes. "Full jitter" (retry after a uniformly random delay up to
+        the exponential cap) is the AWS-popularized default for good reason: it has the lowest
+        worst-case load on the downstream of the common strategies.</dd>
+      <dt>A retry budget (cap the total, not just per-request)</dt>
+      <dd>Bound both the number of attempts per request (2–3 is typical — more rarely helps and
+        multiplies tail latency) <em>and</em> the fraction of a service's total outbound traffic
+        that's allowed to be retries (e.g. "retries may not exceed 10% of requests in any 10s
+        window"). The per-request cap bounds one client's damage; the budget bounds the fleet's
+        aggregate damage, which is what actually prevents a storm at scale.</dd>
+    </dl>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — retries need idempotency</span>
+      <div class="callout-body">
+        <p>A retry means "maybe send this request again," which is only safe if sending it twice
+        has the same effect as sending it once. <a href="rest-api-design.html">Designing Clean
+        REST APIs</a> covered exactly this: a non-idempotent <code>POST /payments</code> retried
+        blindly can double-charge a customer, because the first attempt may have actually
+        succeeded server-side and only the <em>response</em> was lost to the timeout. Safe retries
+        require either a naturally idempotent operation (a <code>PUT</code> that sets absolute
+        state) or an <span class="term">idempotency key</span> — a client-generated ID the server
+        deduplicates on, so a retried request with the same key is recognized and returns the
+        original result instead of repeating the side effect. This is the same mechanism <em>
+        Distributed Transactions, Sagas &amp; Idempotency</em> uses to get "effective exactly-once"
+        out of at-least-once delivery — it's not a coincidence; retries are the local, single-hop
+        version of the same problem messaging systems solve at the fleet scale.</p>
+      </div>
+    </div>
+
+    <h2>Circuit breakers: stop calling what's already broken</h2>
+    <p>
+      Timeouts bound how long you wait for a single call; retries decide whether to try again.
+      Neither one asks the more useful question when a dependency has been failing for a while:
+      <em>should we even try?</em> A <span class="term">circuit breaker</span> tracks a dependency's
+      recent success/failure rate and, once it crosses a threshold, stops sending it traffic
+      entirely for a cooldown period — failing every call immediately, without waiting for a
+      timeout, without consuming a worker or a connection. It's named for the electrical breaker
+      it mimics: trip it once the current (failures) gets dangerous, and nothing downstream draws
+      power until it's reset.
+    </p>
+    <p>The state machine is three states, and it's worth knowing the transitions precisely — this
+      is a favorite "explain it precisely" interview probe:</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>State</th><th>Behavior</th><th>Transitions on</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>Closed</b> (normal)</td>
+            <td>Calls pass through to the dependency; failures are counted</td>
+            <td>Failure rate (or consecutive failures) crosses a threshold → <b>Open</b></td>
+          </tr>
+          <tr>
+            <td><b>Open</b> (tripped)</td>
+            <td>Calls fail immediately — no network call is made at all</td>
+            <td>Cooldown timer expires → <b>Half-open</b></td>
+          </tr>
+          <tr>
+            <td><b>Half-open</b> (probing)</td>
+            <td>A small number of trial calls are allowed through to test recovery</td>
+            <td>Trials succeed → <b>Closed</b>; trials fail → back to <b>Open</b> (cooldown restarts)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The payoff is symmetric: the caller stops paying the (often multi-second) timeout cost for
+      calls that were going to fail anyway, freeing its own worker pool for requests that don't
+      need the broken dependency; and the struggling dependency stops receiving load it can't
+      handle, which is often exactly what it needs to actually recover. A circuit breaker is, in
+      effect, an <em>automatic, self-tuning</em> version of the load-shedding decision below,
+      scoped to one dependency.
+    </p>
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>Circuit breakers are usually scoped <em>per dependency, per instance</em> (sometimes
+        per downstream host) — a breaker for "calls to the recommendations service" trips
+        independently of one for "calls to the payments service," so one bad dependency doesn't
+        silence calls to a healthy one. Libraries like resilience4j, Polly, or a service mesh's
+        built-in breaker (Envoy/Istio outlier detection) implement this bookkeeping so you don't
+        hand-roll the failure-counting logic yourself.</p>
+      </div>
+    </div>
+
+    <h2>Bulkheads: containing the blast radius</h2>
+    <p>
+      Named after a ship's watertight compartments: a hull breach in one compartment floods that
+      compartment, not the whole ship, because bulkheads physically wall them off. Applied to a
+      backend service, a <span class="term">bulkhead</span> means partitioning shared resources —
+      most commonly a worker/thread pool or a connection pool — so that one dependency's failure
+      can exhaust only <em>its own</em> partition, not the resources every other endpoint also
+      needs.
+    </p>
+    <p>
+      Without a bulkhead, a single shared pool means the scenario <a
+      href="concurrency-and-io.html">Concurrency, Threads &amp; Async I/O</a> and <a
+      href="anatomy-of-a-backend.html">Anatomy of a Backend Service</a> both flagged as cascading
+      failure: a slow call to Dependency X ties up workers that Endpoint Y — which has nothing to
+      do with X — also needed, and Y goes down purely from resource starvation, with X's outage as
+      the root cause. Reserve a fixed slice of the pool (or a fixed-size connection pool) for calls
+      to X, sized to X's realistic worst case, and Y's requests can never be starved by X no matter
+      how badly X fails.
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Bulkheads trade throughput for isolation: a reserved pool sized for X's worst case sits
+        partly idle most of the time, capacity that a fully shared pool could have lent to Y during
+        X's quiet periods. That's the price of the guarantee — decide it's worth paying for
+        dependencies whose failure would otherwise take down unrelated functionality, and skip it
+        for low-stakes calls where a shared pool's efficiency matters more than isolation.</p>
+      </div>
+    </div>
+
+    <h2>Load shedding and graceful degradation</h2>
+    <p>
+      Timeouts, retries, breakers, and bulkheads all manage calls to a <em>dependency</em>. Load
+      shedding manages the <em>service's own</em> incoming traffic when total demand exceeds what
+      it can serve — whether the cause is a traffic spike or reduced capacity from a degraded
+      dependency eating into the pool. Two related but distinct moves:
+    </p>
+    <dl class="definition">
+      <dt>Load shedding</dt>
+      <dd>Once a queue or pool passes a threshold, actively reject <em>new</em> requests (a fast
+        <code>503</code>, ideally with a <code>Retry-After</code>) rather than accept them and let
+        them queue indefinitely. It looks like giving up on some users, and it is — deliberately:
+        finishing the requests you've already accepted well is better than accepting everything and
+        finishing none of it in time. Priority matters here: shed low-priority or non-critical
+        traffic (background jobs, low-tier customers, prefetch requests) first, before touching the
+        traffic that matters most.</dd>
+      <dt>Graceful degradation</dt>
+      <dd>Under pressure, serve a <em>cheaper, partial</em> response instead of the full one rather
+        than failing outright: return a product page without personalized recommendations if the
+        recommendation service is down, serve a cached (possibly stale) result instead of a fresh
+        one if the primary store is slow, skip a non-essential enrichment step. The user gets
+        something correct-if-incomplete instead of an error page.</dd>
+    </dl>
+    <p>
+      Both require deciding, ahead of time and by product judgment (not purely engineering), which
+      parts of a response are <em>essential</em> and which are <em>nice-to-have</em> — that
+      classification is what makes shedding and degradation safe rather than arbitrary.
+    </p>
+
+    <h2>How the patterns compose</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Pattern</th><th>Protects against</th><th>Costs</th></tr></thead>
+        <tbody>
+          <tr><td><b>Timeout</b></td><td>Unbounded waits on a hung call</td><td>Too tight → false failures on slow-but-fine calls</td></tr>
+          <tr><td><b>Retry (+ backoff/jitter)</b></td><td>Transient, one-off failures</td><td>Extra load on the dependency; unsafe without idempotency; storms without backoff+budget</td></tr>
+          <tr><td><b>Circuit breaker</b></td><td>Wasting resources on a dependency that's been failing for a while</td><td>False trips on brief blips if the threshold is too sensitive; requests fail fast (not succeed) while open</td></tr>
+          <tr><td><b>Bulkhead</b></td><td>One dependency's failure starving unrelated requests</td><td>Reserved capacity sits idle when not needed — lower utilization</td></tr>
+          <tr><td><b>Load shedding</b></td><td>A queue growing without bound under overload</td><td>Deliberately drops some requests — needs a priority policy</td></tr>
+          <tr><td><b>Graceful degradation</b></td><td>An optional dependency's failure becoming a full outage</td><td>Requires upfront design of what's essential vs optional</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      In production these stack: a timeout bounds each attempt, a retry budget with backoff+jitter
+      governs whether and how to try again, a circuit breaker short-circuits the whole dance once
+      the dependency is clearly down, a bulkhead makes sure that dance can't starve unrelated
+      traffic while it plays out, and load shedding is the last line of defense if, despite all of
+      that, total demand still exceeds what the service can do. None of them is a substitute for
+      the others — a circuit breaker without a bulkhead still starves the pool during the window
+      before it trips; a bulkhead without a timeout just isolates the damage of a hang instead of
+      preventing it.
+    </p>
+
+    <h2>Try it: failure-injection dashboard</h2>
+    <p>
+      <b>Order Service</b> calls a flaky downstream dependency; <b>Profile Service</b> shares the
+      same worker pool but never calls it. Set the downstream's health, then toggle the four
+      patterns on and off and watch two things: Order Service's own success rate and p99 latency,
+      and — the more important signal — whether <b>Profile Service</b>, which did nothing wrong,
+      gets dragged down with it.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Failure-injection dashboard</div>
+
+      <div class="rp-controls">
+        <div>
+          <label for="rpHealth">Downstream health</label>
+          <select id="rpHealth">
+            <option value="healthy">Healthy (2% fail, ~90ms)</option>
+            <option value="degraded" selected>Degraded (45% fail, ~1400ms)</option>
+            <option value="down">Down (95% fail, ~3500ms hang)</option>
+          </select>
+        </div>
+        <div>
+          <label for="rpRate">Request rate (each service): <span class="val" id="rpRateVal">14</span> req/s</label>
+          <input type="range" id="rpRate" min="4" max="30" step="1" value="14" />
+        </div>
+      </div>
+
+      <div class="rp-toggles">
+        <label class="rp-toggle"><input type="checkbox" id="rpTimeout" checked />
+          <span><span class="rp-toggle-label">Timeout</span><span class="rp-toggle-sub">cap wait at 400ms</span></span></label>
+        <label class="rp-toggle"><input type="checkbox" id="rpRetry" />
+          <span><span class="rp-toggle-label">Retry</span><span class="rp-toggle-sub">backoff + jitter, 2 attempts</span></span></label>
+        <label class="rp-toggle"><input type="checkbox" id="rpBreaker" />
+          <span><span class="rp-toggle-label">Circuit breaker</span><span class="rp-toggle-sub">trip after 5 failures</span></span></label>
+        <label class="rp-toggle"><input type="checkbox" id="rpBulkhead" />
+          <span><span class="rp-toggle-label">Bulkhead</span><span class="rp-toggle-sub">reserve 8/24 workers</span></span></label>
+      </div>
+
+      <div class="rp-actions">
+        <button class="btn" id="rpRun" type="button">Pause</button>
+        <button class="btn secondary" id="rpReset" type="button">Reset</button>
+      </div>
+
+      <div class="widget-label" style="margin-bottom: var(--sp-2);">Shared worker pool — 24 workers</div>
+      <div class="rp-pool-legend">
+        <span class="lg-checkout">Order Service</span>
+        <span class="lg-profile">Profile Service</span>
+      </div>
+      <div class="rp-pool-track" id="rpPoolTrack"></div>
+
+      <div class="rp-lanes">
+        <div class="rp-lane">
+          <div class="rp-lane-head">
+            <h4>Order Service <span class="mono muted" style="font-size:0.75rem;">(calls downstream)</span></h4>
+            <span class="rp-breaker-badge rp-breaker-closed" id="rpBreakerBadge">N/A</span>
+          </div>
+          <div class="rp-stats">
+            <div><span class="rp-stat-label">success rate</span><span class="rp-stat-val" id="rpOrderSuccess">—</span></div>
+            <div><span class="rp-stat-label">p50 latency</span><span class="rp-stat-val" id="rpOrderP50">—</span></div>
+            <div><span class="rp-stat-label">p99 latency</span><span class="rp-stat-val" id="rpOrderP99">—</span></div>
+            <div><span class="rp-stat-label">downstream calls made</span><span class="rp-stat-val" id="rpOrderCalls">0</span></div>
+          </div>
+        </div>
+        <div class="rp-lane">
+          <div class="rp-lane-head"><h4>Profile Service <span class="mono muted" style="font-size:0.75rem;">(unrelated)</span></h4></div>
+          <div class="rp-stats">
+            <div><span class="rp-stat-label">success rate</span><span class="rp-stat-val" id="rpProfileSuccess">—</span></div>
+            <div><span class="rp-stat-label">p50 latency</span><span class="rp-stat-val" id="rpProfileP50">—</span></div>
+            <div><span class="rp-stat-label">p99 latency</span><span class="rp-stat-val" id="rpProfileP99">—</span></div>
+            <div><span class="rp-stat-label">requests dropped (no worker)</span><span class="rp-stat-val" id="rpProfileDropped">0</span></div>
+          </div>
+        </div>
+      </div>
+
+      <p class="rp-note" id="rpNote"></p>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip — a suggested sequence</span>
+      <div class="callout-body">
+        <p>Set health to <b>Degraded</b> with only <b>Timeout</b> on and watch Profile Service's
+        p99 climb anyway — the shared pool has no isolation yet. Turn on <b>Bulkhead</b> and watch
+        Profile Service's numbers stabilize while Order Service still suffers — the damage is now
+        contained. Turn off Timeout and on Retry with health at <b>Down</b>: watch "downstream
+        calls made" climb far faster than the request rate (each request generates hung calls plus
+        retries) and the pool clog even with a bulkhead limiting its size. Finally enable <b>Circuit
+        breaker</b> and watch it trip open, downstream calls drop to ~0 while it's open, and Order
+        Service's own latency drop too — failing fast beats failing slowly.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>An inference gateway calling a feature store, a vector DB, or a second model in a
+        pipeline (retrieval → rerank → generate) is exactly this picture. A hung feature-store
+        call without a timeout stalls the request thread and, without a bulkhead, starves capacity
+        for requests that didn't need that feature at all — the same cascading failure, just with
+        "GPU worker" in place of "thread." Circuit breakers are common around optional
+        enrichment calls (fall back to a default feature vector or a smaller model if the primary
+        is unhealthy, rather than failing the whole request) — a form of graceful degradation
+        tailored to serving. And retries need the same idempotency discipline: retrying a
+        non-deterministic generation call can produce a <em>different</em> output on the second
+        attempt, which is a correctness issue disguised as a reliability fix if the caller assumes
+        retried calls are interchangeable.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">1. A downstream dependency is degraded — succeeding, but at 60% of
+          normal throughput. All callers retry immediately on timeout, with no backoff. What
+          happens?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The extra retries help the dependency recover faster by keeping connections warm.</button>
+          <button class="quiz-option" data-choice="b">Nothing changes — retries only resend failed requests, which doesn't add new load.</button>
+          <button class="quiz-option" data-choice="c">A retry storm: the dependency now receives its original load plus a wave of immediate retries, pushing it further past capacity and causing more timeouts and more retries — a self-reinforcing feedback loop.</button>
+        </div>
+        <p class="quiz-explain" hidden>Retries are additional requests. Without backoff and jitter to spread them out, retrying immediately on a struggling dependency adds load exactly when it can least afford it, which is what defines a retry storm.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">2. A circuit breaker for "calls to the recommendations service" is
+          OPEN. What happens when a request that needs a recommendation arrives?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The request waits for the recommendations service's normal timeout before failing, same as always.</button>
+          <button class="quiz-option" data-choice="b">The call fails immediately without any network call being made, freeing the caller's worker for other requests.</button>
+          <button class="quiz-option" data-choice="c">The circuit breaker automatically retries the call with backoff until it succeeds.</button>
+        </div>
+        <p class="quiz-explain" hidden>That's the entire point of the open state: skip the network call and its timeout entirely, fail fast, and free the worker — both sparing the caller the wait and sparing the struggling dependency the load.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. Order Service and Profile Service share one worker pool. Order
+          Service's downstream dependency is hanging (calls take 5s each, well above what the pool
+          can absorb at the incoming rate). Profile Service has nothing to do with that dependency.
+          Which single pattern most directly prevents Profile Service's requests from also
+          failing?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">A bulkhead — reserving a separate slice of the pool for Order Service's downstream calls so they can't consume the workers Profile Service needs.</button>
+          <button class="quiz-option" data-choice="b">A retry with exponential backoff on Order Service's calls.</button>
+          <button class="quiz-option" data-choice="c">Increasing the request rate to Profile Service.</button>
+        </div>
+        <p class="quiz-explain" hidden>Timeouts and circuit breakers reduce how much of the pool Order Service's failing calls consume, but only a bulkhead structurally guarantees Profile Service can't be starved by them — it partitions the shared resource so one dependency's failure is contained to its own slice.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Resilience patterns bound how badly a dependency's failure hurts you; the next natural
+      question is how you'd <em>know</em> it was failing in the first place, and how badly — that's
+      <em>Observability: Logs, Metrics &amp; Traces</em>, next in this section. <em>Performance,
+      Profiling &amp; Capacity Planning</em> gives the tail-latency measurement discipline these
+      timeouts should be set from, and <em>Deployment, CI/CD &amp; Release Strategies</em> covers
+      the release-side complement: shipping a bad version safely in the first place. Any of those
+      are fair game next.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var TICK_MS = 150;
+      var DT = 0.25;
+      var POOL_SIZE = 24;
+      var BULKHEAD_RESERVE = 8;
+      var TIMEOUT_S = 0.4;
+      var RETRY_MAX_ATTEMPTS = 3; // 1 original + 2 retries
+      var RETRY_BASE_S = 0.15;
+      var BREAKER_FAIL_THRESHOLD = 5;
+      var BREAKER_COOLDOWN_S = 3;
+      var QUEUE_CAP = 12;
+      var LATENCY_WINDOW = 60;
+
+      var HEALTH = {
+        healthy:  { fail: 0.02, latency: 0.09, jitter: 0.04 },
+        degraded: { fail: 0.45, latency: 1.4,  jitter: 0.5 },
+        down:     { fail: 0.95, latency: 3.5,  jitter: 0.8 }
+      };
+
+      var healthEl = document.getElementById("rpHealth");
+      var rateEl = document.getElementById("rpRate");
+      var rateVal = document.getElementById("rpRateVal");
+      var timeoutToggle = document.getElementById("rpTimeout");
+      var retryToggle = document.getElementById("rpRetry");
+      var breakerToggle = document.getElementById("rpBreaker");
+      var bulkheadToggle = document.getElementById("rpBulkhead");
+      var runBtn = document.getElementById("rpRun");
+      var resetBtn = document.getElementById("rpReset");
+      var poolTrack = document.getElementById("rpPoolTrack");
+      var breakerBadge = document.getElementById("rpBreakerBadge");
+      var noteEl = document.getElementById("rpNote");
+
+      var orderSuccessEl = document.getElementById("rpOrderSuccess");
+      var orderP50El = document.getElementById("rpOrderP50");
+      var orderP99El = document.getElementById("rpOrderP99");
+      var orderCallsEl = document.getElementById("rpOrderCalls");
+      var profileSuccessEl = document.getElementById("rpProfileSuccess");
+      var profileP50El = document.getElementById("rpProfileP50");
+      var profileP99El = document.getElementById("rpProfileP99");
+      var profileDroppedEl = document.getElementById("rpProfileDropped");
+
+      var running = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      var simTime = 0;
+
+      var pool = { checkoutActive: 0, profileActive: 0 };
+      var breaker = { state: "closed", consecFails: 0, cooldownLeft: 0, halfOpenInFlight: false };
+      // `outcomes` is a rolling window of recent booleans (true = success) used for the
+      // success-rate stat — it includes dropped (no-worker) requests as failures, so the
+      // rate reflects a request's whole fate, not just the fate of ones that got a worker.
+      // `dropped` is a separate all-time counter shown as its own stat.
+      var order = { active: [], results: [], outcomes: [], calls: 0, dropped: 0 };
+      var profile = { active: [], results: [], outcomes: [], dropped: 0 };
+
+      function resetSim() {
+        simTime = 0;
+        pool.checkoutActive = 0;
+        pool.profileActive = 0;
+        breaker.state = "closed";
+        breaker.consecFails = 0;
+        breaker.cooldownLeft = 0;
+        breaker.halfOpenInFlight = false;
+        order.active = [];
+        order.results = [];
+        order.outcomes = [];
+        order.calls = 0;
+        order.dropped = 0;
+        profile.active = [];
+        profile.results = [];
+        profile.outcomes = [];
+        profile.dropped = 0;
+        noteEl.textContent = "";
+      }
+
+      function checkoutCap() {
+        return bulkheadToggle.checked ? BULKHEAD_RESERVE : POOL_SIZE;
+      }
+      function profileCap() {
+        return bulkheadToggle.checked ? (POOL_SIZE - BULKHEAD_RESERVE) : POOL_SIZE;
+      }
+      function sharedRemaining() {
+        // when not bulkheaded, both draw from one pool
+        return POOL_SIZE - pool.checkoutActive - pool.profileActive;
+      }
+
+      function canAdmitCheckout() {
+        if (bulkheadToggle.checked) return pool.checkoutActive < checkoutCap();
+        return sharedRemaining() > 0;
+      }
+      function canAdmitProfile() {
+        if (bulkheadToggle.checked) return pool.profileActive < profileCap();
+        return sharedRemaining() > 0;
+      }
+
+      function poissonSample(lambda) {
+        if (lambda <= 0) return 0;
+        if (lambda > 30) {
+          var u = Math.random() || 1e-9, v = Math.random();
+          var g = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+          return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * g));
+        }
+        var L = Math.exp(-lambda), k = 0, p = 1;
+        do { k++; p *= Math.random(); } while (p > L);
+        return k - 1;
+      }
+
+      function sampleDownstream() {
+        var h = HEALTH[healthEl.value];
+        var failed = Math.random() < h.fail;
+        var lat = Math.max(0.02, h.latency + (Math.random() - 0.5) * 2 * h.jitter);
+        return { failed: failed, latency: lat };
+      }
+
+      function recordBreakerOutcome(success, wasProbe) {
+        if (!breakerToggle.checked) return;
+        if (wasProbe) {
+          breaker.halfOpenInFlight = false;
+          if (success) {
+            breaker.state = "closed";
+            breaker.consecFails = 0;
+          } else {
+            breaker.state = "open";
+            breaker.cooldownLeft = BREAKER_COOLDOWN_S;
+          }
+          return;
+        }
+        if (success) {
+          breaker.consecFails = 0;
+        } else {
+          breaker.consecFails++;
+          if (breaker.state === "closed" && breaker.consecFails >= BREAKER_FAIL_THRESHOLD) {
+            breaker.state = "open";
+            breaker.cooldownLeft = BREAKER_COOLDOWN_S;
+          }
+        }
+      }
+
+      // Drives one Order Service request (possibly multiple attempts, retries, and the
+      // circuit breaker) synchronously to completion in simulated time, then places it
+      // on a completion timeline for the tick loop to resolve once simTime reaches it.
+      function simulateOrderRequest() {
+        if (!canAdmitCheckout()) { order.dropped++; pushOutcome(order.outcomes, false); return; }
+        pool.checkoutActive++;
+        var attempt = 0;
+        var elapsed = 0;
+        var success = false;
+        while (true) {
+          if (breaker.state === "open") { elapsed += 0.01; success = false; break; }
+          var isProbe = breaker.state === "half-open";
+          if (isProbe && breaker.halfOpenInFlight) { elapsed += 0.01; success = false; break; }
+          if (isProbe) breaker.halfOpenInFlight = true;
+
+          order.calls++;
+          var call = sampleDownstream();
+          var waited = call.latency;
+          var timedOut = false;
+          if (timeoutToggle.checked && waited > TIMEOUT_S) { waited = TIMEOUT_S; timedOut = true; }
+          elapsed += waited;
+          attempt++;
+          var callFailed = call.failed || timedOut;
+          recordBreakerOutcome(!callFailed, isProbe);
+
+          if (!callFailed) { success = true; break; }
+          var canRetry = retryToggle.checked && attempt < RETRY_MAX_ATTEMPTS && breaker.state !== "open";
+          if (!canRetry) { success = false; break; }
+          var backoff = RETRY_BASE_S * Math.pow(2, attempt - 1) + Math.random() * RETRY_BASE_S;
+          elapsed += backoff;
+        }
+        order.active.push({ finishAt: simTime + elapsed, latency: elapsed, success: success });
+      }
+
+      function simulateProfileRequest() {
+        if (!canAdmitProfile()) { profile.dropped++; pushOutcome(profile.outcomes, false); return; }
+        pool.profileActive++;
+        var lat = Math.max(0.02, 0.08 + (Math.random() - 0.5) * 0.05);
+        profile.active.push({ finishAt: simTime + lat, latency: lat, success: true });
+      }
+
+      function pushResult(arr, value) {
+        arr.push(value);
+        if (arr.length > LATENCY_WINDOW) arr.shift();
+      }
+
+      function pushOutcome(arr, success) {
+        arr.push(success);
+        if (arr.length > LATENCY_WINDOW) arr.shift();
+      }
+
+      function percentile(values, p) {
+        if (!values.length) return null;
+        var sorted = values.slice().sort(function (a, b) { return a - b; });
+        var idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+        return sorted[idx];
+      }
+
+      function fmtMs(s) { return s === null ? "—" : Math.round(s * 1000) + "ms"; }
+      function fmtPct(successes, total) { return total === 0 ? "—" : Math.round((successes / total) * 100) + "%"; }
+
+      function tick() {
+        if (!running) return;
+        simTime += DT;
+
+        if (breaker.state === "open") {
+          breaker.cooldownLeft -= DT;
+          if (breaker.cooldownLeft <= 0) {
+            breaker.state = "half-open";
+            breaker.halfOpenInFlight = false;
+          }
+        }
+
+        var rate = parseInt(rateEl.value, 10);
+        var orderArrivals = poissonSample(rate * DT);
+        var profileArrivals = poissonSample(rate * DT);
+
+        for (var i = 0; i < orderArrivals; i++) simulateOrderRequest();
+        for (var j = 0; j < profileArrivals; j++) simulateProfileRequest();
+
+        var stillOrder = [];
+        order.active.forEach(function (r) {
+          if (r.finishAt <= simTime) {
+            pool.checkoutActive = Math.max(0, pool.checkoutActive - 1);
+            pushResult(order.results, { latency: r.latency, success: r.success });
+            pushOutcome(order.outcomes, r.success);
+          } else {
+            stillOrder.push(r);
+          }
+        });
+        order.active = stillOrder;
+
+        var stillProfile = [];
+        profile.active.forEach(function (r) {
+          if (r.finishAt <= simTime) {
+            pool.profileActive = Math.max(0, pool.profileActive - 1);
+            pushResult(profile.results, { latency: r.latency, success: r.success });
+            pushOutcome(profile.outcomes, r.success);
+          } else {
+            stillProfile.push(r);
+          }
+        });
+        profile.active = stillProfile;
+
+        render();
+      }
+
+      function render() {
+        rateVal.textContent = rateEl.value;
+
+        // pool bar
+        var checkoutPct = (pool.checkoutActive / POOL_SIZE) * 100;
+        var profilePct = (pool.profileActive / POOL_SIZE) * 100;
+        poolTrack.innerHTML =
+          '<div class="rp-pool-seg checkout" style="width:' + checkoutPct.toFixed(1) + '%"></div>' +
+          '<div class="rp-pool-seg profile" style="width:' + profilePct.toFixed(1) + '%"></div>';
+
+        // breaker badge
+        breakerBadge.classList.remove("rp-breaker-closed", "rp-breaker-open", "rp-breaker-half");
+        if (!breakerToggle.checked) {
+          breakerBadge.textContent = "N/A";
+          breakerBadge.classList.add("rp-breaker-closed");
+        } else if (breaker.state === "open") {
+          breakerBadge.textContent = "OPEN";
+          breakerBadge.classList.add("rp-breaker-open");
+        } else if (breaker.state === "half-open") {
+          breakerBadge.textContent = "HALF-OPEN";
+          breakerBadge.classList.add("rp-breaker-half");
+        } else {
+          breakerBadge.textContent = "CLOSED";
+          breakerBadge.classList.add("rp-breaker-closed");
+        }
+
+        // Success rate is computed from a rolling window of outcomes that counts a dropped
+        // (no-worker) request as a failure — a request that never got served is exactly the
+        // outcome these patterns exist to prevent, and it must show up in the rate to make
+        // the cascading-failure signal below visible.
+        var orderWins = order.outcomes.filter(Boolean).length;
+        var orderLatencies = order.results.map(function (r) { return r.latency; }).filter(function (v) { return v > 0; });
+        var orderRate = order.outcomes.length ? orderWins / order.outcomes.length : null;
+        orderSuccessEl.textContent = fmtPct(orderWins, order.outcomes.length);
+        orderSuccessEl.className = "rp-stat-val " + (orderRate !== null && orderRate < 0.6 ? "rp-bad" : orderRate !== null && orderRate < 0.9 ? "rp-warn" : "rp-good");
+        orderP50El.textContent = fmtMs(percentile(orderLatencies, 0.5));
+        orderP99El.textContent = fmtMs(percentile(orderLatencies, 0.99));
+        orderCallsEl.textContent = order.calls;
+
+        var profileWins = profile.outcomes.filter(Boolean).length;
+        var profileLatencies = profile.results.map(function (r) { return r.latency; });
+        var profileRate = profile.outcomes.length ? profileWins / profile.outcomes.length : null;
+        profileSuccessEl.textContent = fmtPct(profileWins, profile.outcomes.length);
+        profileSuccessEl.className = "rp-stat-val " + (profileRate !== null && profileRate < 0.9 ? "rp-bad" : profileRate !== null && profileRate < 0.98 ? "rp-warn" : "rp-good");
+        profileP50El.textContent = fmtMs(percentile(profileLatencies, 0.5));
+        profileP99El.textContent = fmtMs(percentile(profileLatencies, 0.99));
+        profileDroppedEl.textContent = profile.dropped;
+
+        if (!noteEl.textContent) {
+          noteEl.textContent = "Set the downstream to Degraded or Down, then toggle patterns on and off to see which ones keep Profile Service healthy.";
+        }
+      }
+
+      healthEl.addEventListener("change", function () {
+        noteEl.textContent = "Downstream health set to " + healthEl.options[healthEl.selectedIndex].text + ".";
+      });
+      rateEl.addEventListener("input", function () { rateVal.textContent = rateEl.value; });
+      [timeoutToggle, retryToggle, breakerToggle, bulkheadToggle].forEach(function (t) {
+        t.addEventListener("change", function () {
+          noteEl.textContent = t.parentElement.querySelector(".rp-toggle-label").textContent + " turned " + (t.checked ? "ON" : "OFF") + ".";
+        });
+      });
+      runBtn.addEventListener("click", function () {
+        running = !running;
+        runBtn.textContent = running ? "Pause" : "Run";
+      });
+      resetBtn.addEventListener("click", function () {
+        resetSim();
+        render();
+      });
+
+      resetSim();
+      render();
+      runBtn.textContent = running ? "Pause" : "Run";
+      setInterval(tick, TICK_MS);
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
