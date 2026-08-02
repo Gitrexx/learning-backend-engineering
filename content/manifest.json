@@ -190,7 +190,7 @@
       "summary": "The three pillars, RED/USE, cardinality pitfalls, SLIs/SLOs/error budgets, and alerting on symptoms.",
       "prerequisites": ["anatomy-of-a-backend"],
       "file": "observability.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "performance-and-capacity",
