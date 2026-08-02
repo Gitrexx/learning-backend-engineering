@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability: Logs, Metrics &amp; Traces — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the incident-console widget only. */
+    .ob-alert {
+      font-family: var(--font-mono); font-size: var(--fs-sm);
+      background: var(--danger-soft); color: var(--danger);
+      border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+      border-radius: var(--radius); padding: var(--sp-3) var(--sp-4);
+      margin-bottom: var(--sp-4);
+    }
+    .ob-breadcrumb {
+      display: flex; flex-wrap: wrap; gap: var(--sp-2);
+      font-family: var(--font-mono); font-size: 0.76rem;
+      color: var(--text-faint); margin-bottom: var(--sp-4); min-height: 1.4em;
+    }
+    .ob-breadcrumb .ob-crumb {
+      padding: 0.15em 0.55em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+    }
+    .ob-breadcrumb .ob-crumb.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+    .ob-breadcrumb .ob-crumb.dead { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+    .ob-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+    .ob-actions .btn[disabled] { opacity: 0.4; cursor: not-allowed; filter: none; }
+    .ob-output {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4) var(--sp-5); min-height: 5.5em;
+    }
+    .ob-output-label {
+      font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--text-faint); margin-bottom: var(--sp-3);
+    }
+    .ob-metrics-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+    .ob-metrics-table th, .ob-metrics-table td { padding: 0.35em 0.6em; text-align: left; border-bottom: 1px solid var(--border); }
+    .ob-metrics-table th { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.72rem; text-transform: uppercase; }
+    .ob-metrics-table td.hot { color: var(--danger); font-weight: 700; }
+    .ob-log-line { font-family: var(--font-mono); font-size: 0.82rem; white-space: pre-wrap; margin: 0.2em 0; }
+    .ob-log-line .lvl-warn { color: var(--warn); }
+    .ob-log-line .lvl-error { color: var(--danger); }
+    .ob-log-line .lvl-info { color: var(--text-faint); }
+    .ob-trace-row { display: grid; grid-template-columns: 190px 1fr auto; align-items: center; gap: var(--sp-3); margin: 0.35em 0; font-size: 0.82rem; }
+    .ob-trace-name { font-family: var(--font-mono); color: var(--text-muted); }
+    .ob-trace-track { position: relative; height: 1.4em; background: var(--surface-2); border-radius: var(--radius-sm); overflow: hidden; }
+    .ob-trace-bar { position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm); background: var(--blueprint); }
+    .ob-trace-bar.hot { background: var(--danger); }
+    .ob-trace-bar.miss { background: var(--warn); }
+    .ob-trace-ms { font-family: var(--font-mono); color: var(--text-faint); font-size: 0.76rem; text-align: right; }
+    .ob-hint { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-3); }
+    .ob-solved {
+      margin-top: var(--sp-4); padding: var(--sp-4); border-radius: var(--radius);
+      background: var(--ok-soft); border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+      font-size: var(--fs-sm);
+    }
+    @media (max-width: 560px) { .ob-trace-row { grid-template-columns: 110px 1fr auto; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Reliability &amp; Operating in Production // 02</p>
+    <h1>Observability: Logs, Metrics &amp; Traces</h1>
+
+    <p>
+      <a href="resilience-patterns.html">Resilience Patterns</a> ended on an honest limit: you
+      cannot prevent a dependency from failing, only bound how much its failure costs you. This
+      page is about the step that has to happen <em>before</em> any of those patterns can be
+      tuned, tripped, or trusted — knowing that something is wrong, and knowing enough about
+      <em>what</em> and <em>where</em> to act. <a href="anatomy-of-a-backend.html">Anatomy of a
+      Backend Service</a> named this as one pillar of production-readiness: a system is only as
+      operable as your ability to see inside it while it's running, under real traffic, without
+      stopping it to look.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Monitoring vs. observability</span>
+      <div class="callout-body">
+        <p><span class="term">Monitoring</span> answers questions you thought to ask in advance —
+        dashboards and alerts for failure modes you anticipated ("CPU &gt; 90%", "5xx rate &gt;
+        1%"). <span class="term">Observability</span> is the property of a system that lets you
+        answer questions you <em>didn't</em> anticipate, by exploring the data it emits — "why is
+        <em>this specific</em> customer's checkout slow, and only since this morning, and only
+        for orders with more than 3 items?" Monitoring covers known-unknowns; observability is
+        what you need for unknown-unknowns, which is most of what pages you at 3 AM. The three
+        pillars below — logs, metrics, traces — are the raw material for both, but it's the
+        ability to correlate across them, on the fly, for a question nobody wrote a dashboard
+        for, that separates a merely-monitored system from an observable one.</p>
+      </div>
+    </div>
+
+    <h2>The three pillars, and what each is actually for</h2>
+    <p>
+      Teams reach for "let's add logging" to every visibility problem, and it's usually the wrong
+      instrument for at least two of the three jobs. Each pillar has a shape and a cost profile
+      that fits one kind of question well and the others badly:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Pillar</th><th>Answers</th><th>Shape</th><th>Cost driver</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>Logs</b></td>
+            <td>What exactly happened, for this one request/entity, in detail?</td>
+            <td>Discrete, timestamped events with arbitrary structured fields</td>
+            <td>Volume — every request can emit several lines; storage + ingestion scale with traffic</td>
+          </tr>
+          <tr>
+            <td><b>Metrics</b></td>
+            <td>How is the system behaving in aggregate, right now, and over time?</td>
+            <td>Numbers (counters, gauges, histograms) sampled/aggregated over time, cheap to store</td>
+            <td>Cardinality — number of distinct label combinations, not request volume</td>
+          </tr>
+          <tr>
+            <td><b>Traces</b></td>
+            <td>Where did the time go, and which service caused it, for one request across a fan-out?</td>
+            <td>A tree of timed spans following one request through every service it touched</td>
+            <td>Instrumentation coverage + sampling rate — capturing every request is rarely affordable</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      None of the three is a substitute for the others. Logs don't scale to "which of my 40
+      services is slow" — you'd grep 40 log streams. Metrics don't tell you <em>why</em> a
+      specific request was slow, only that requests-in-aggregate are. Traces don't tell you
+      system-wide health — they show you one request's story, and you only have a story for the
+      ones you sampled. The incident-console exercise later on this page makes that division
+      concrete: you'll use all three, in a specific order, to localize a real regression.
+    </p>
+
+    <h2>Structured logs: queryable, not just readable</h2>
+    <p>
+      A log line like <code>"user login failed"</code> is readable by a human scrolling a
+      terminal and useless to a query engine. <span class="term">Structured logging</span> emits
+      each event as a set of typed fields — JSON is the common wire format — so a log platform
+      can filter, aggregate, and join on them the same way a database does:
+    </p>
+    <pre><code>{"ts":"2026-08-02T14:32:07.114Z","level":"warn","service":"recommendations",
+ "trace_id":"9f2a1c...","user_id":"88214","event":"cache_miss",
+ "cache_key":"recs:v3:user:88214","fallback":"db_query","msg":"falling back to DB"}</code></pre>
+    <p>
+      Three fields are worth calling out because they're what make logs useful <em>during</em> an
+      incident rather than only in a postmortem:
+    </p>
+    <dl class="definition">
+      <dt>A correlation / trace ID on every line</dt>
+      <dd>The single field that turns "40,000 log lines across 40 instances" into "the dozen lines
+        for this one request." Every log statement touched by a request should carry the same ID,
+        propagated the same way trace context propagates (see below) — without it, correlating
+        logs to a specific failure means grepping by timestamp and hoping nothing else was
+        happening at the same moment.</dd>
+      <dt>A log level used consistently</dt>
+      <dd><code>debug</code> for developer detail, <code>info</code> for normal operations worth
+        recording, <code>warn</code> for recovered-from problems (a cache miss, a retry that
+        succeeded), <code>error</code> for failures that need attention. The discipline matters
+        because alerting and dashboards key off level — logging everything as <code>error</code>
+        trains everyone to ignore error-level alerts, which is how a real error hides in the
+        noise.</dd>
+      <dt>Fields, not string interpolation</dt>
+      <dd><code>user_id=88214</code> as a field you can filter on beats
+        <code>f"user {user_id} failed"</code> as a string you can only grep — grep finds lines
+        that contain "88214" anywhere, including unrelated ones; a field lets you ask precisely
+        for <code>user_id = 88214</code>.</dd>
+    </dl>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — logging everything</span>
+      <div class="callout-body">
+        <p>Logs are billed and stored per line, and a service under load can emit millions of
+        lines an hour. The instinct to "just log more, storage is cheap" runs into two real costs:
+        ingestion/storage spend that scales linearly with traffic (unlike metrics, which stay flat
+        as traffic grows because they're pre-aggregated), and — worse — a signal-to-noise problem
+        where the one <code>error</code> line that mattered is buried under a million routine
+        <code>info</code> lines. Log what you'd actually want to read during an incident (request
+        boundaries, state transitions, errors, and warnings for degraded-but-handled paths), sample
+        or drop high-volume routine success logs, and lean on metrics for "how often does X
+        happen" — that's a job metrics do far more cheaply than counting log lines.</p>
+      </div>
+    </div>
+
+    <h2>Metrics: RED, USE, and why percentiles need histograms</h2>
+    <p>
+      Metrics are numbers aggregated over time, cheap enough to keep at high resolution
+      indefinitely because their cost doesn't scale with request volume — a counter is one
+      integer whether it counted ten requests or ten million. Three metric types cover nearly
+      everything:
+    </p>
+    <ul>
+      <li><b>Counter</b> — only goes up (requests served, errors raised); you graph its
+        <em>rate</em>, not its raw value.</li>
+      <li><b>Gauge</b> — a value that goes up and down (current queue depth, active connections,
+        memory used).</li>
+      <li><b>Histogram</b> (or summary) — a distribution of observed values (request durations)
+        bucketed so you can derive percentiles later.</li>
+    </ul>
+    <p>
+      Two field-tested frameworks tell you <em>which</em> metrics to instrument, for two different
+      things you monitor:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Framework</th><th>For</th><th>Signals</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>RED</b></td>
+            <td>Request-driven services (an API, a microservice)</td>
+            <td><b>R</b>ate (requests/sec), <b>E</b>rrors (rate of failed requests), <b>D</b>uration
+              (latency distribution — p50/p95/p99)</td>
+          </tr>
+          <tr>
+            <td><b>USE</b></td>
+            <td>Resources (CPU, disk, connection pool, a queue)</td>
+            <td><b>U</b>tilization (% busy), <b>S</b>aturation (work queued/waiting beyond
+              capacity), <b>E</b>rrors (resource-level errors — dropped packets, OOM kills)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      RED is what makes the incident-console exercise's first move work: a per-service RED
+      dashboard is how you localize <em>which of N services</em> regressed, before you commit to
+      reading any one service's internals in detail.
+    </p>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — averaging percentiles, and the cardinality explosion</span>
+      <div class="callout-body">
+        <p>Two mistakes recur in every metrics setup:</p>
+        <p><b>You cannot average percentiles.</b> If service A's p99 is 200ms and service B's p99
+        is 220ms, the p99 of A+B combined is <em>not</em> 210ms — percentiles aren't linear, so
+        averaging them silently produces a meaningless number. A histogram must be aggregated at
+        the bucket level (sum the counts in each latency bucket across instances, <em>then</em>
+        recompute the percentile from the combined buckets) — which is exactly what
+        Prometheus-style histograms are designed to let you do, and exactly what naively averaging
+        a "p99" gauge from each instance cannot.</p>
+        <p><b>Cardinality is the real cost driver, not traffic volume.</b> A label like
+        <code>user_id</code> or <code>order_id</code> on a metric creates one time-series
+        <em>per distinct value</em> — with a million users, that's a million time-series for one
+        metric, which can crash or bankrupt a metrics backend regardless of how little traffic
+        each user generates. High-cardinality dimensions (user ID, request ID, raw URL with path
+        params) belong in logs and trace attributes, which are built to handle them; metric labels
+        should stay low-cardinality (service name, endpoint <em>template</em>, status code class,
+        region) — a handful to a few hundred distinct values, not millions.</p>
+      </div>
+    </div>
+
+    <h2>Distributed traces: causality across a fan-out</h2>
+    <p>
+      A single user request to <code>checkout-service</code> might fan out to auth, inventory,
+      recommendations, and payments — each of those possibly calling further services. Logs and
+      metrics from each service, viewed separately, don't reconstruct that call tree; you're left
+      inferring it from timestamps. A <span class="term">distributed trace</span> makes the tree
+      explicit: one request gets one <span class="term">trace ID</span>, and every unit of work it
+      causes — an HTTP call, a DB query, a cache lookup — is recorded as a <span
+      class="term">span</span> with a start time, a duration, and a parent span ID, so the whole
+      request reassembles into a tree (commonly rendered as a waterfall, exactly like the widget
+      below).
+    </p>
+    <p>
+      The mechanism that makes this possible across service and even language boundaries is
+      <span class="term">context propagation</span>: the trace ID (and the calling span's ID, as
+      the new span's parent) travels as a header on every downstream call — the W3C
+      <code>traceparent</code> header is the standardized version most tracing systems (and
+      OpenTelemetry, the now-dominant vendor-neutral instrumentation standard) use today. Drop that
+      header at any hop — a service that doesn't propagate it, a message queue that doesn't carry
+      it through — and the trace fractures into disconnected pieces at exactly the boundary that
+      would have been most interesting to see.
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution — sampling is a bet, not a bug</span>
+      <div class="callout-body">
+        <p>Recording a full trace for every request at real production volume is often
+        prohibitively expensive, so most systems <em>sample</em> — trace 1% of requests, or trace
+        every request that errors or exceeds a latency threshold (<span
+        class="term">tail-based sampling</span>, which needs to buffer a request's spans until it
+        finishes to decide). The trade-off: low, fixed-rate sampling is cheap but might simply miss
+        the one slow request you cared about; tail-based sampling catches the interesting cases but
+        costs more to run (buffering + a decision step) and adds a little latency to the pipeline
+        that decides. Neither is free, and "why don't we just trace everything" is worth asking
+        explicitly — the honest answer is usually cost at your actual request volume, not
+        laziness.</p>
+      </div>
+    </div>
+
+    <h2>SLIs, SLOs, and alerting on symptoms, not causes</h2>
+    <p>
+      Metrics and traces exist to be looked at, but you don't want to be staring at dashboards
+      all day — you want to be paged only when something the <em>user</em> would notice is
+      actually wrong. That's what this vocabulary formalizes:
+    </p>
+    <dl class="definition">
+      <dt>SLI (Service Level Indicator)</dt>
+      <dd>A specific, measured metric of user-facing behavior — e.g. "the proportion of requests
+        served in under 300ms" or "the proportion of requests that return a non-5xx status."</dd>
+      <dt>SLO (Service Level Objective)</dt>
+      <dd>A target for an SLI over a window — "99.9% of requests succeed in under 300ms, measured
+        over a rolling 28 days." An SLO is internal; an <span class="term">SLA</span> is the
+        (usually looser) version with a contractual penalty attached, promised to customers.</dd>
+      <dt>Error budget</dt>
+      <dd>1 − SLO, turned into a spendable quantity: a 99.9% SLO over 28 days allows about 40
+        minutes of "badness" in that window. Burn it slowly on planned risk (a migration, a canary
+        rollout); burn it fast and you get paged before it's exhausted — the budget reframes
+        "reliability" from an abstract virtue into a number you can spend deliberately and run
+        out of.</dd>
+    </dl>
+    <p>
+      This is also the discipline that keeps you from alerting on every internal wobble. Page on
+      <em>symptoms</em> — SLO burn rate, user-facing error rate, checkout latency — not on
+      <em>causes</em> — "CPU is at 85%" might be completely fine, or the first sign of an
+      incident, depending on whether it's translating into user-visible pain. A cause-based alert
+      that fires constantly without correlating to actual harm is exactly how a team learns to
+      ignore pages, which is the precondition for missing the one that mattered.
+    </p>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>A fast-burn alert (e.g. "we'll exhaust the whole 28-day budget in the next 2 hours at
+        this rate") should page a human immediately; a slow-burn alert (e.g. "at this rate we
+        exhaust the budget in 10 days") can wait for business hours or just show up on a
+        dashboard. Multi-window burn-rate alerting — checking both a short window (catch fast
+        incidents) and a long one (catch slow leaks, and avoid paging on a brief blip that
+        self-corrects) — is the standard refinement or worth knowing the name of even if you don't
+        implement it from scratch; Google's SRE workbook is the canonical reference for the exact
+        thresholds.</p>
+      </div>
+    </div>
+
+    <h2>Try it: incident console</h2>
+    <p>
+      An SLO burn-rate alert just fired for <code>checkout-service</code>. You have three
+      instruments — a metrics dashboard, raw logs, and distributed traces — and you don't yet
+      know which service, or which line of code, is responsible. Pick a signal to check at each
+      step; some choices move you closer to the root cause, others are a legitimate thing to try
+      that just doesn't have the answer <em>yet</em> — the point is learning which instrument
+      answers which question, not memorizing the "right" click.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Incident console</div>
+
+      <div class="ob-alert" id="obAlert"></div>
+      <div class="ob-breadcrumb" id="obBreadcrumb"></div>
+
+      <div class="ob-actions">
+        <button class="btn secondary" id="obBtnMetrics" type="button">Check metrics dashboard</button>
+        <button class="btn secondary" id="obBtnLogs" type="button">Check logs</button>
+        <button class="btn secondary" id="obBtnTraces" type="button">Check traces</button>
+        <button class="btn" id="obBtnReset" type="button">Reset scenario</button>
+      </div>
+
+      <div class="ob-output" id="obOutput">
+        <div class="ob-output-label">Console</div>
+        <p class="muted" id="obPlaceholder">Pick an instrument above to begin the investigation.</p>
+      </div>
+      <p class="ob-hint" id="obHint"></p>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. You need to know, right now, which of your 40 services just started
+          returning more errors. Which pillar answers that fastest?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Logs — grep every service's log stream for "error".</button>
+          <button class="quiz-option" data-choice="b">Metrics — a per-service RED dashboard (error rate specifically) across all 40 at once.</button>
+          <button class="quiz-option" data-choice="c">Traces — pull a sample trace and read through its spans.</button>
+        </div>
+        <p class="quiz-explain" hidden>Metrics are pre-aggregated and cheap to compare across many services at once — exactly the shape of "which of these 40 regressed." Logs and traces are the right tool once you've narrowed to one service and want detail on one request.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. A metric is emitted as <code>http_requests_total</code> with labels
+          <code>service</code>, <code>status_code</code>, and <code>user_id</code>. What's the
+          problem?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a"><code>user_id</code> is high-cardinality — it creates one time-series per distinct user, which can overwhelm the metrics backend regardless of traffic volume.</button>
+          <button class="quiz-option" data-choice="b">Counters can't have labels at all.</button>
+          <button class="quiz-option" data-choice="c">Nothing — more labels always make a metric more useful.</button>
+        </div>
+        <p class="quiz-explain" hidden><code>user_id</code> belongs in logs or trace attributes, which are built for high-cardinality data. On a metric it multiplies the number of time-series by the number of distinct users, which is the classic way to crash a metrics backend.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. Your 99.9% latency SLO over 28 days allows roughly 40 minutes of
+          budget. You're burning it at a rate that would exhaust the whole budget in the next 2
+          hours. What should happen?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nothing yet — wait until the budget is actually exhausted before paging anyone.</button>
+          <button class="quiz-option" data-choice="b">File a low-priority ticket for someone to look at next week.</button>
+          <button class="quiz-option" data-choice="c">Page a human now — that burn rate is a fast-burn alert, and waiting means blowing the entire month's error budget in hours.</button>
+        </div>
+        <p class="quiz-explain" hidden>Error-budget alerting is meant to fire before the budget is gone, scaled to how fast it's disappearing. A 2-hour-to-exhaustion burn rate is exactly what a fast-burn alert exists to catch immediately, not after the fact.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>An inference service needs the same three pillars, plus a fourth signal a plain
+        backend doesn't: <b>model-quality metrics</b> alongside RED. Request rate, error rate, and
+        latency (including the batching/queueing behavior from a capacity planner's perspective)
+        cover the serving path; but a model can be "up" — 200s, low latency — while quietly
+        degrading, e.g. <span class="term">feature drift</span> or <span
+        class="term">training-serving skew</span> silently changing prediction quality with no
+        request ever failing. That needs its own SLI (a proxy label, human feedback rate,
+        prediction-distribution drift versus a baseline) and its own budget, because RED alone
+        will show a perfectly healthy dashboard on a model that's gotten quietly worse. Traces are
+        just as valuable here: a request through retrieval → feature store → model → post-processing
+        is a fan-out exactly like the checkout example, and a trace waterfall is how you'd learn
+        whether a p99 regression is GPU inference time, a slow feature-store lookup, or serialization
+        overhead — the same "where did the time go, across services" question, with "model" as one
+        more span in the tree.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Observability tells you something is wrong and roughly why; the next question is how much
+      capacity you actually have and how to plan for load before it becomes an incident — that's
+      <em>Performance, Profiling &amp; Capacity Planning</em>, next in this section, and it's
+      where the tail-latency measurement this page leaned on (percentiles, p99 versus average) gets
+      built up properly. <em>Deployment, CI/CD &amp; Release Strategies</em> covers the release-side
+      complement: shipping change into production in a way that keeps the SLOs you just defined
+      intact. Either is fair game next.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var TRACE_ID = "9f2a1c7e";
+
+      // Stage graph: each stage lists which instrument advances (next stage + note) and
+      // which are "not yet" (informative dead-ends that stay on the same stage).
+      var STAGES = {
+        0: {
+          alert: "ALERT — SLO burn-rate: checkout-service p99 latency 2400ms (SLO target: 300ms). Fast burn, started 14:32 UTC.",
+          metrics: {
+            advance: 1,
+            render: renderStage0Metrics,
+            crumb: "Metrics → localized: recommendations-service"
+          },
+          traces: {
+            advance: 1,
+            render: renderStage0Traces,
+            crumb: "Traces → sampled a slow request, points at recommendations-service"
+          },
+          logs: {
+            advance: null,
+            render: renderStage0Logs,
+            crumb: "Logs → too much noise without a service to narrow to",
+            hint: "40 instances, no way yet to isolate which one or which request — try a dashboard first to localize the service."
+          }
+        },
+        1: {
+          alert: "SUSPECT: recommendations-service — its p99 jumped from ~80ms to ~2100ms at 14:32, same window as the checkout regression. Request volume and error rate are flat.",
+          traces: {
+            advance: 2,
+            render: renderStage1Traces,
+            crumb: "Traces → pinpointed a 1900ms DB span behind a cache miss"
+          },
+          metrics: {
+            advance: null,
+            render: renderStage1Metrics,
+            crumb: "Metrics → confirms the hot spot again, no new detail",
+            hint: "You already know recommendations-service is hot. A per-service dashboard can't show where inside one request the time went — that needs a trace."
+          },
+          logs: {
+            advance: null,
+            render: renderStage1Logs,
+            crumb: "Logs → still too many concurrent requests to isolate",
+            hint: "You don't have a trace ID to filter by yet — get one from a trace waterfall first."
+          }
+        },
+        2: {
+          alert: "SUSPECT SPAN: a 1900ms DB query inside recommendations-service, triggered by a cache miss. trace_id=" + TRACE_ID + ".",
+          logs: {
+            advance: 3,
+            render: renderStage2Logs,
+            crumb: "Logs → root cause: index dropped in this morning's migration"
+          },
+          traces: {
+            advance: null,
+            render: renderStage2Traces,
+            crumb: "Traces → same span, no new detail",
+            hint: "The trace tells you how long the query took, not why it's slow. Filter the logs by trace_id to see the query text and what changed."
+          },
+          metrics: {
+            advance: null,
+            render: renderStage2Metrics,
+            crumb: "Metrics → confirms slow queries are trending up, no root cause",
+            hint: "Metrics can show *that* DB latency is up fleet-wide, but not *why this query* is slow — that detail lives in a log line."
+          }
+        }
+      };
+
+      var stage = 0;
+      var checks = 0;
+      var solved = false;
+
+      var alertEl = document.getElementById("obAlert");
+      var breadcrumbEl = document.getElementById("obBreadcrumb");
+      var outputEl = document.getElementById("obOutput");
+      var hintEl = document.getElementById("obHint");
+      var btnMetrics = document.getElementById("obBtnMetrics");
+      var btnLogs = document.getElementById("obBtnLogs");
+      var btnTraces = document.getElementById("obBtnTraces");
+      var btnReset = document.getElementById("obBtnReset");
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      function renderStage0Metrics() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Metrics dashboard — RED per service (14:20–14:40 UTC)</div>' +
+          '<table class="ob-metrics-table"><thead><tr><th>Service</th><th>Req/s</th><th>Error %</th><th>p99 latency</th></tr></thead><tbody>' +
+          "<tr><td>checkout-service</td><td>210</td><td>0.1%</td><td class=\"hot\">2400ms (was 260ms)</td></tr>" +
+          "<tr><td>auth</td><td>210</td><td>0.0%</td><td>35ms</td></tr>" +
+          "<tr><td>inventory</td><td>210</td><td>0.1%</td><td>60ms</td></tr>" +
+          "<tr><td>recommendations</td><td>205</td><td>0.2%</td><td class=\"hot\">2100ms (was 80ms)</td></tr>" +
+          "<tr><td>payments</td><td>198</td><td>0.1%</td><td>90ms</td></tr>" +
+          "</tbody></table>";
+      }
+      function renderStage0Traces() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Trace waterfall — one sampled slow request (trace_id=' + TRACE_ID + ')</div>' +
+          traceRows([
+            ["checkout-service (total)", 0, 2280, false],
+            ["→ auth.verify", 0, 32, false],
+            ["→ inventory.check", 40, 55, false],
+            ["→ recommendations.get", 100, 2100, true],
+            ["→ payments.authorize", 2210, 70, false]
+          ]) +
+          '<p class="muted" style="margin-top:var(--sp-3);font-size:0.82rem;">Nearly all the time sits inside the call to recommendations-service — same signal a dashboard gave you, from one concrete example instead of an aggregate.</p>';
+      }
+      function renderStage0Logs() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Log search — checkout-service, 14:30–14:35 UTC</div>' +
+          '<p class="muted">grep across 40 instances returned 41,382 lines. No service or trace ID to narrow to yet — this is a haystack, not a lead.</p>';
+      }
+
+      function renderStage1Traces() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Trace waterfall — inside recommendations.get (trace_id=' + TRACE_ID + ')</div>' +
+          traceRows([
+            ["recommendations.get (total)", 0, 2100, false],
+            ["→ auth check", 0, 5, false],
+            ["→ feature_fetch", 5, 15, false],
+            ["→ recs_cache.lookup", 20, 4, "miss"],
+            ["→ db.query(recs_history)", 24, 1900, true],
+            ["→ model.rank", 1924, 170, false]
+          ]) +
+          '<p class="muted" style="margin-top:var(--sp-3);font-size:0.82rem;">Cache lookup misses in 4ms, then falls back to a DB query that takes 1900ms — that query is the whole story.</p>';
+      }
+      function renderStage1Metrics() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Metrics dashboard — recommendations-service RED</div>' +
+          '<p class="muted">p99 2100ms, error rate 0.2%, request rate flat at 205/s. Same as before — this view can\'t see inside a single request.</p>';
+      }
+      function renderStage1Logs() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Log search — recommendations-service, 14:30–14:35 UTC</div>' +
+          '<p class="muted">6,214 lines across concurrent requests in this window. Without a trace ID to filter on, you can\'t tell which lines belong to a slow request versus a fast one.</p>';
+      }
+
+      function renderStage2Logs() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Log search — trace_id=' + TRACE_ID + '</div>' +
+          logLine("info", '14:32:07.098 recommendations "cache lookup" cache_key=recs:v3:user:88214') +
+          logLine("warn", '14:32:07.102 recommendations "cache_miss" falling back to DB') +
+          logLine("error", '14:32:09.002 recommendations "slow_query" recs_history WHERE user_id=88214 took 1899ms, no index used (seq scan)') +
+          logLine("info", '14:32:09.003 recommendations "schema_note" index rec_history_user_id_idx was dropped in migration 482, deployed this morning 09:14 UTC') +
+          '<p class="muted" style="margin-top:var(--sp-3);font-size:0.82rem;"><b>Root cause:</b> this morning\'s migration dropped an index the cache-miss fallback query depends on. The cache was masking it until misses started hitting the now-unindexed table with a full scan.</p>';
+      }
+      function renderStage2Traces() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Trace waterfall — same trace, same span</div>' +
+          '<p class="muted">Still just "db.query(recs_history): 1900ms." The trace tells you where the time went and how much — it can\'t tell you why the query itself is slow.</p>';
+      }
+      function renderStage2Metrics() {
+        outputEl.innerHTML =
+          '<div class="ob-output-label">Metrics dashboard — DB query duration, recs_history table</div>' +
+          '<p class="muted">Fleet-wide p99 for queries against recs_history has climbed the same way, starting ~09:15 UTC. Confirms it\'s systemic, not one bad request — but the "why" still isn\'t here.</p>';
+      }
+
+      function traceRows(rows) {
+        var total = 0;
+        rows.forEach(function (r) { total = Math.max(total, r[1] + r[2]); });
+        var html = "";
+        rows.forEach(function (r) {
+          var name = r[0], start = r[1], dur = r[2], hot = r[3];
+          var leftPct = (start / total) * 100;
+          var widthPct = Math.max(0.6, (dur / total) * 100);
+          var cls = hot === true ? "hot" : hot === "miss" ? "miss" : "";
+          html += '<div class="ob-trace-row">' +
+            '<span class="ob-trace-name">' + escapeHtml(name) + '</span>' +
+            '<span class="ob-trace-track"><span class="ob-trace-bar ' + cls + '" style="left:' + leftPct.toFixed(1) + '%;width:' + widthPct.toFixed(1) + '%"></span></span>' +
+            '<span class="ob-trace-ms">' + dur + 'ms</span>' +
+            '</div>';
+        });
+        return html;
+      }
+      function logLine(level, text) {
+        return '<div class="ob-log-line"><span class="lvl-' + level + '">[' + level.toUpperCase() + ']</span> ' + escapeHtml(text) + '</div>';
+      }
+
+      function renderBreadcrumb() {
+        breadcrumbEl.innerHTML = "";
+        if (!breadcrumbEl._trail) breadcrumbEl._trail = [];
+      }
+
+      function addCrumb(text, kind) {
+        var span = document.createElement("span");
+        span.className = "ob-crumb " + kind;
+        span.textContent = text;
+        breadcrumbEl.appendChild(span);
+      }
+
+      function refreshAlert() {
+        alertEl.textContent = STAGES[stage].alert;
+      }
+
+      function setHint(text) {
+        hintEl.textContent = text || "";
+      }
+
+      function handleClick(kind) {
+        if (solved) return;
+        var def = STAGES[stage][kind];
+        checks++;
+        var label = kind === "metrics" ? "Metrics" : kind === "logs" ? "Logs" : "Traces";
+        if (!def) return;
+        def.render();
+        if (def.advance !== null) {
+          addCrumb(def.crumb, "ok");
+          stage = def.advance;
+          refreshAlert();
+          setHint("");
+          if (stage === 3) {
+            solved = true;
+            var optimal = 3;
+            outputEl.innerHTML +=
+              '<div class="ob-solved"><b>Case closed.</b> Root cause: the migration this morning ' +
+              'dropped an index the cache-miss fallback query relied on; the cache absorbed most ' +
+              'traffic until misses started hitting a full table scan. Solved in ' + checks +
+              ' check' + (checks === 1 ? "" : "s") + ' (optimal path — Metrics or Traces → Traces → Logs — is ' + optimal + ').' +
+              '<br><br>Notice what each instrument actually answered: metrics told you <em>which service</em>, ' +
+              "a trace told you <em>which part of the request, and how much time</em>, and a log line told you " +
+              "<em>why, specifically, this time</em>. That division is the whole point of keeping all three." +
+              '</div>';
+            setButtonsDisabled(true);
+          }
+        } else {
+          addCrumb(def.crumb, "dead");
+          setHint(def.hint || "");
+        }
+      }
+
+      function setButtonsDisabled(disabled) {
+        btnMetrics.disabled = disabled;
+        btnLogs.disabled = disabled;
+        btnTraces.disabled = disabled;
+      }
+
+      function reset() {
+        stage = 0;
+        checks = 0;
+        solved = false;
+        breadcrumbEl.innerHTML = "";
+        outputEl.innerHTML = '<div class="ob-output-label">Console</div><p class="muted" id="obPlaceholder">Pick an instrument above to begin the investigation.</p>';
+        setHint("");
+        setButtonsDisabled(false);
+        refreshAlert();
+      }
+
+      btnMetrics.addEventListener("click", function () { handleClick("metrics"); });
+      btnLogs.addEventListener("click", function () { handleClick("logs"); });
+      btnTraces.addEventListener("click", function () { handleClick("traces"); });
+      btnReset.addEventListener("click", reset);
+
+      reset();
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
