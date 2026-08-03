@@ -200,7 +200,7 @@
       "summary": "Latency vs throughput, percentiles and tail latency, Little's Law, back-of-envelope estimation.",
       "prerequisites": ["concurrency-and-io"],
       "file": "performance-and-capacity.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "deployment-and-cicd",

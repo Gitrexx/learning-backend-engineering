@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Performance, Profiling &amp; Capacity Planning — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the percentile/fan-out explorer and Little's Law calculator only. */
+    .pc-controls {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin-bottom: var(--sp-5);
+      align-items: end;
+    }
+    .pc-controls label { display: block; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.35em; }
+    .pc-controls .val { font-family: var(--font-mono); color: var(--accent-strong); font-weight: 700; }
+    .pc-actions { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-5); flex-wrap: wrap; }
+
+    .pc-compare { display: grid; gap: var(--sp-5); grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .pc-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-4); }
+    .pc-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); flex-wrap: wrap; }
+    .pc-card-head h4 { margin: 0; font-size: var(--fs-md); color: var(--text); }
+
+    .pc-stats { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2) var(--sp-4); font-size: var(--fs-sm); margin-bottom: var(--sp-3); }
+    .pc-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); border-bottom: 1px dashed var(--border); padding-bottom: 0.3em; }
+    .pc-stat-label { color: var(--text-muted); }
+    .pc-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .pc-stat-val.hot { color: var(--danger); }
+
+    .pc-hist { display: flex; align-items: flex-end; gap: 2px; height: 90px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; }
+    .pc-bar { flex: 1; background: var(--blueprint); border-radius: 2px 2px 0 0; min-height: 1px; }
+    .pc-bar.p50 { background: var(--accent); }
+    .pc-bar.p95 { background: var(--warn); }
+    .pc-bar.p99 { background: var(--danger); }
+    .pc-hist-caption { font-size: var(--fs-eyebrow); color: var(--text-faint); font-family: var(--font-mono); margin-top: 0.4em; letter-spacing: 0.04em; }
+
+    .pc-amplify { margin-top: var(--sp-4); font-size: var(--fs-sm); }
+
+    .pc-ll-grid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: var(--sp-3); }
+    .pc-ll-field { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); }
+    .pc-ll-field label { display: flex; align-items: center; gap: 0.5em; font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 0.4em; }
+    .pc-ll-field input[type="radio"] { width: auto; accent-color: var(--accent); }
+    .pc-ll-field input[type="number"] { width: 100%; }
+    .pc-ll-field input[type="number"]:disabled { color: var(--text-faint); background: var(--surface-2); }
+    .pc-ll-result { font-size: var(--fs-sm); color: var(--text-muted); }
+    .pc-ll-result b { color: var(--text); font-family: var(--font-mono); }
+
+    @media (max-width: 560px) { .pc-controls { grid-template-columns: 1fr; } .pc-stats { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Reliability &amp; Operating in Production // 03</p>
+    <h1>Performance, Profiling &amp; Capacity Planning</h1>
+
+    <p>
+      <a href="observability.html">Observability</a> gave you the instruments to see that
+      something is wrong and roughly where. This page is about the numbers behind those
+      instruments: what latency and throughput actually mean and how they trade off, why the
+      average is close to useless for anything user-facing, why a single slow dependency gets
+      <em>worse</em> the more services a request fans out to, and how to turn "will this handle
+      launch day" into an estimate you can defend with arithmetic instead of a shrug. It's the
+      quantitative half of production-readiness — the half that lets you answer "how much
+      capacity do we actually have" before the answer arrives as an incident.
+    </p>
+
+    <h2>Latency vs. throughput: not the same axis</h2>
+    <p>
+      <span class="term">Latency</span> is how long one request takes. <span
+      class="term">Throughput</span> is how many requests the system completes per unit time.
+      They're related but not interchangeable, and conflating them is a common planning mistake:
+    </p>
+    <ul>
+      <li>You can raise throughput while making latency <em>worse</em> — batching is the classic
+        move. Group 32 requests into one GPU inference call and you 10x throughput per
+        GPU-second, but each individual request now waits for the batch to fill, so its latency
+        goes up. (More on this in the <a href="concurrency-and-io.html">Concurrency &amp; Async
+        I/O</a> page's thread-pool-vs-event-loop trade-off, and again in the ML bridge below.)</li>
+      <li>You can improve latency while <em>capping</em> throughput — give every request its own
+        dedicated thread and CPU core and each one runs as fast as the hardware allows, right up
+        until you run out of cores, at which point throughput collapses because nothing new can
+        start.</li>
+      <li>Both are governed by the same underlying resource: concurrency (how much work is
+        in flight at once) — which is exactly what <span class="term">Little's Law</span>, below,
+        makes precise.</li>
+    </ul>
+    <p>
+      A system is never described by one number. "Fast" without a throughput figure, or "handles
+      10k req/s" without a latency figure, is an incomplete sentence — and interviewers who ask
+      "how would this scale" are usually listening for whether you reach for both.
+    </p>
+
+    <h2>Why the average lies: percentiles and the shape of a distribution</h2>
+    <p>
+      Request latency is never a single number repeated — it's a distribution, usually with a
+      long right tail: most requests are fast, a minority are slow, and a few are very slow (GC
+      pause, a lock contended, a cold cache, a retry). The <span class="term">mean</span> gets
+      dragged toward that tail and hides exactly the thing you need to see:
+    </p>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — "average latency is 45ms" can still mean 1 in 100 users waits 3 seconds</span>
+      <div class="callout-body">
+        <p>Take 1,000 requests: 990 complete in ~20ms and 10 take 3,000ms (a GC pause, say). The
+        mean is <code>(990×20 + 10×3000) / 1000 ≈ 49.8ms</code> — looks fine. But that "fine"
+        number is a lie for the 1% who experienced 3 seconds, and at scale 1% is not a rounding
+        error: at 10,000 req/s, 1% is 100 people <em>every second</em> having a bad experience
+        your dashboard is telling you doesn't exist. This is why SRE practice reports <span
+        class="term">percentiles</span> — p50 (median), p95, p99, sometimes p99.9 — instead of, or
+        alongside, the mean. p99 = 3000ms in that example tells the truth the mean hid.</p>
+      </div>
+    </div>
+    <p>
+      Percentiles matter more, not less, as a service grows, for a structural reason: <span
+      class="term">tail latency amplification</span>. If a single call has a 1% chance of hitting
+      the slow path, a user who triggers <em>20</em> such calls per page load (a common fan-out —
+      auth, several backend services, a couple of DB queries each) has a much higher chance that
+      <em>at least one</em> of them is slow:
+    </p>
+    <p class="center mono" style="font-size:var(--fs-lg);">
+      P(at least one slow call in N) = 1 − (1 − p)<sup>N</sup>
+    </p>
+    <p>
+      At p = 1% and N = 20: <code>1 − 0.99^20 ≈ 18%</code>. Nearly one in five page loads now
+      experiences the "rare" slow path, purely because of fan-out — nobody's code got slower, the
+      composition did. This is precisely the mechanism the widget below lets you drive with your
+      own numbers, and it's why "our p99 is fine" at the single-service level is not the same
+      claim as "our users have a good p99" once you compose enough calls per request.
+    </p>
+
+    <h2>Try it: percentile &amp; fan-out explorer</h2>
+    <p>
+      Pick how heavy the tail is (how much variance a single call's latency has) and how many
+      calls a request fans out to, then compare the single-call latency distribution against the
+      <b>slowest-of-N</b> distribution a real multi-service request actually experiences —
+      because the user waits for the <em>slowest</em> of the calls their page load triggers, not
+      the average one.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Percentile &amp; fan-out explorer</div>
+
+      <div class="pc-controls">
+        <div>
+          <label>Tail heaviness <span class="val" id="pcTailVal">2</span> / 5</label>
+          <input type="range" id="pcTail" min="1" max="5" step="1" value="2" />
+        </div>
+        <div>
+          <label>Fan-out width (N calls per request) <span class="val" id="pcFanVal">5</span></label>
+          <input type="range" id="pcFan" min="1" max="15" step="1" value="5" />
+        </div>
+      </div>
+      <div class="pc-actions">
+        <button class="btn" id="pcResample" type="button">Resample 4,000 requests</button>
+      </div>
+
+      <div class="pc-compare">
+        <div class="pc-card">
+          <div class="pc-card-head"><h4>Single call</h4><span class="badge">baseline</span></div>
+          <div class="pc-stats" id="pcSingleStats"></div>
+          <div class="pc-hist" id="pcSingleHist"></div>
+          <div class="pc-hist-caption">latency distribution, one call</div>
+        </div>
+        <div class="pc-card">
+          <div class="pc-card-head"><h4>Slowest of N</h4><span class="badge accent">what the user waits for</span></div>
+          <div class="pc-stats" id="pcFanStats"></div>
+          <div class="pc-hist" id="pcFanHist"></div>
+          <div class="pc-hist-caption">max latency across N calls, per request</div>
+        </div>
+      </div>
+
+      <div class="pc-amplify callout caution" id="pcAmplify" style="margin-top:var(--sp-4);">
+        <span class="callout-icon">!</span>
+        <span class="callout-title">Amplification</span>
+        <div class="callout-body"><p id="pcAmplifyText"></p></div>
+      </div>
+    </div>
+
+    <h2>Little's Law: the equation behind capacity</h2>
+    <p>
+      <span class="term">Little's Law</span> is a small, exact result from queueing theory that
+      applies to almost every backend capacity question: in a stable system, the average number
+      of requests <em>in flight</em> equals the arrival rate times the average time each spends
+      in the system.
+    </p>
+    <p class="center mono" style="font-size:var(--fs-lg);">L = λ × W</p>
+    <dl class="definition">
+      <dt>L — concurrency</dt>
+      <dd>Average number of requests being worked on at once (in the app, in a queue, on a
+        connection pool) — this is the number that determines how many threads, connections, or
+        pool slots you need.</dd>
+      <dt>λ (lambda) — arrival rate / throughput</dt>
+      <dd>Requests arriving (and, at steady state, completing) per unit time — req/s.</dd>
+      <dt>W — latency</dt>
+      <dd>Average time a request spends in the system, from arrival to completion.</dd>
+    </dl>
+    <p>
+      This is the formal version of the thread-pool-sizing intuition from <a
+      href="concurrency-and-io.html">Concurrency, Threads &amp; Async I/O</a>: if you're serving
+      2,000 req/s and each takes 50ms on average, you need roughly <code>2000 × 0.05 = 100</code>
+      requests' worth of concurrency in flight at any moment — 100 threads (or 100 outstanding
+      async tasks) is your floor, not a guess. Raise λ or W without raising available concurrency
+      and the excess doesn't vanish — it queues, which is exactly how W then gets <em>worse</em>,
+      a feedback loop that turns "a bit slower" into a queue that never drains once utilization
+      crosses the point where arrivals outpace completions.
+    </p>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip — use it in both directions</span>
+      <div class="callout-body">
+        <p>Little's Law is symmetric, and each direction answers a different real question:
+        given expected traffic (λ) and a latency budget (W), it tells you the pool size (L) to
+        provision. Given a fixed pool size (L) and a measured latency (W), it tells you the
+        maximum throughput (λ) that pool can sustain before requests start queueing — a quick
+        sanity check on "why is this connection pool the bottleneck" during an incident, no load
+        test required.</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span class="eyebrow">Interactive — Little's Law calculator</span></div>
+      <p class="muted" style="margin-top:0;">Pick which value to solve for, then edit the other two.</p>
+      <div class="pc-ll-grid">
+        <div class="pc-ll-field">
+          <label><input type="radio" name="pcLLSolve" value="L" /> Concurrency L (in-flight)</label>
+          <input type="number" id="pcLLL" min="0" step="1" value="100" />
+        </div>
+        <div class="pc-ll-field">
+          <label><input type="radio" name="pcLLSolve" value="lambda" checked /> Throughput λ (req/s)</label>
+          <input type="number" id="pcLLLambda" min="0" step="1" value="2000" />
+        </div>
+        <div class="pc-ll-field">
+          <label><input type="radio" name="pcLLSolve" value="W" /> Latency W (ms)</label>
+          <input type="number" id="pcLLW" min="0" step="1" value="50" />
+        </div>
+      </div>
+      <p class="pc-ll-result" id="pcLLResult"></p>
+    </div>
+
+    <h2>Back-of-the-envelope capacity estimation</h2>
+    <p>
+      Interviewers ask "how would you estimate scale" because it's precisely the skill that
+      separates "I'll provision generously and hope" from a defensible number. The method is the
+      same every time — start from a business number, derive load, then derive resource
+      requirements — worked here for a hypothetical URL-shortener-style service:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Step</th><th>Reasoning</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>1. Business scale</td>
+            <td>10M daily active users, each creates ~0.2 links/day and clicks ~2 links/day</td>
+            <td>2M writes/day, 20M reads/day</td>
+          </tr>
+          <tr>
+            <td>2. Average QPS</td>
+            <td>22M requests over 86,400 seconds/day</td>
+            <td>~255 req/s average</td>
+          </tr>
+          <tr>
+            <td>3. Peak QPS</td>
+            <td>Traffic isn't uniform — apply a peak factor (commonly 3–5× average for diurnal
+              traffic; higher for a launch or viral spike)</td>
+            <td>~250 × 4 ≈ 1,000 req/s peak</td>
+          </tr>
+          <tr>
+            <td>4. Storage</td>
+            <td>2M new rows/day × ~500 bytes/row (URL + metadata + index overhead) × 365 × 5 years</td>
+            <td>~1.8 TB over 5 years — modest, fits a single well-indexed relational store</td>
+          </tr>
+          <tr>
+            <td>5. Bandwidth</td>
+            <td>Peak reads (~900 req/s of the 1,000) × ~1 KB average response</td>
+            <td>~0.9 MB/s peak egress — trivial; caching will absorb most of it anyway</td>
+          </tr>
+          <tr>
+            <td>6. Concurrency (Little's Law)</td>
+            <td>Peak QPS × p99 latency budget: 1,000 req/s × 0.05s</td>
+            <td>~50 requests in flight at peak — sizes the app-tier pool</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Notice what the exercise actually produces: not a precise number (nobody believes the "5th
+      significant figure" of a back-of-envelope estimate) but the <em>right order of magnitude</em>
+      and, just as importantly, which resource is the actual constraint. Here, reads dominate
+      writes 10:1 — that alone tells you caching (<a href="caching-strategies.html">Caching
+      Strategies</a>) is probably where the design effort belongs, before you've written a line of
+      code. Getting the order of magnitude right — thousands vs. millions of req/s — is the bar;
+      spending an hour trying to nail the exact figure is a waste the exercise doesn't reward.
+    </p>
+
+    <h2>Load testing: finding the wall before your users do</h2>
+    <p>
+      Estimation gives you a target; load testing tells you whether the system actually meets it,
+      and — more usefully — exactly where and how it fails once pushed past that point. Different
+      test shapes answer different questions:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Test type</th><th>Shape</th><th>Answers</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>Smoke test</b></td>
+            <td>Minimal load, quick run</td>
+            <td>Does the system work at all, under trivial load, before a real test is worth the time?</td>
+          </tr>
+          <tr>
+            <td><b>Load test</b></td>
+            <td>Expected peak traffic, sustained</td>
+            <td>Does the system meet its latency/error targets at the load you actually planned for?</td>
+          </tr>
+          <tr>
+            <td><b>Stress test</b></td>
+            <td>Ramp well past expected peak until something breaks</td>
+            <td>Where's the wall, and does it fail gracefully (shed load, degrade) or catastrophically
+              (cascading timeouts, OOM)?</td>
+          </tr>
+          <tr>
+            <td><b>Soak test</b></td>
+            <td>Moderate load sustained for hours/days</td>
+            <td>Slow leaks — memory growth, connection leaks, log-disk fill — that only show up over time,
+              not in a five-minute burst.</td>
+          </tr>
+          <tr>
+            <td><b>Spike test</b></td>
+            <td>Sudden, brief surge far above baseline</td>
+            <td>Does autoscaling/backpressure react fast enough, or does the surge arrive and leave before
+              new capacity even comes online?</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Tools like <b>k6</b>, <b>Locust</b>, <b>Gatling</b>, and <b>JMeter</b> generate the traffic;
+      what to actually watch is the same regardless of tool: throughput as you increase offered
+      load (does it plateau — the saturation point — or does it fall over, meaning the system is
+      doing less useful work at high load than at moderate load, a classic sign of thrashing),
+      p95/p99 latency alongside it (latency should degrade gracefully approaching the plateau,
+      not explode suddenly), the error rate (a system that keeps accepting requests it can't serve
+      in time is worse than one that fails fast at a stable rate — see <a
+      href="resilience-patterns.html">Resilience Patterns</a> on load shedding), and resource
+      utilization at the point things go bad (CPU pegged? connection pool exhausted? GC pauses
+      dominating? that's usually your actual bottleneck, and it's rarely the one you assumed).
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution — test against production-shaped data and dependencies</span>
+      <div class="callout-body">
+        <p>A load test against an empty database, warm caches, and a mocked-out downstream tells
+        you almost nothing about production, where the DB has years of data (different query
+        plans — see <a href="sql-and-query-performance.html">SQL &amp; Query Performance</a>),
+        caches start cold, and downstreams have their own latency and failure modes. The closer the
+        test environment mirrors production shape (data volume, index state, realistic dependency
+        latency), the more the result is a forecast rather than a fiction.</p>
+      </div>
+    </div>
+
+    <h2>Profiling: finding where the time actually goes</h2>
+    <p>
+      Load testing tells you a service is slow at some load level; a <span
+      class="term">profiler</span> tells you which line of code is responsible. Two mechanisms
+      dominate:
+    </p>
+    <ul>
+      <li><b>Sampling profilers</b> interrupt the running program periodically (e.g. every 10ms)
+        and record the call stack at that instant. Low overhead, safe for production, statistical
+        rather than exact — a function that's on-stack in 40% of samples is (roughly) consuming
+        40% of the profiled time.</li>
+      <li><b>Instrumenting profilers</b> insert timing code around every function call to measure
+        exact elapsed time per call. Precise, but the instrumentation itself adds overhead that can
+        distort the very thing being measured — usually a dev/staging tool, not a production one.</li>
+    </ul>
+    <p>
+      The result is commonly rendered as a <span class="term">flame graph</span>: each box is a
+      function; width is proportion of total time spent in it (and everything it calls); stacking
+      upward represents the call stack getting deeper. A single wide box near the bottom is the
+      signature of one hot function dominating runtime — the thing worth optimizing first, because
+      speeding up a box that's 2% of total width can't move the needle much no matter how much
+      faster you make it.
+    </p>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">On-CPU vs. off-CPU time</span>
+      <div class="callout-body">
+        <p>A profile of <em>on-CPU</em> time (what a standard CPU profiler shows) only sees code
+        that's actively executing — it's blind to a thread that's blocked waiting on a lock, a DB
+        response, or I/O, because a blocked thread isn't consuming CPU and so never appears as a
+        "hot" stack. If your service is slow but every CPU profile looks flat and uninteresting,
+        the bottleneck is very likely <em>off-CPU</em> — waiting, not computing — and you need a
+        tool built for that (e.g. off-CPU flame graphs, or simply a distributed trace showing a
+        span mostly spent awaiting a downstream call, exactly the <a
+        href="observability.html">Observability</a> page's trace waterfall). This is one of the
+        most common false leads in performance work: profiling compute when the problem is
+        waiting.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A service reports mean latency of 50ms. What's the one honest
+          conclusion you can draw from that number alone?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nearly all users experience roughly 50ms.</button>
+          <button class="quiz-option" data-choice="b">Almost nothing — a heavy tail could mean a meaningful fraction of users wait far longer while the mean stays low.</button>
+          <button class="quiz-option" data-choice="c">The p99 must also be close to 50ms, since means and percentiles track closely.</button>
+        </div>
+        <p class="quiz-explain" hidden>The mean is dominated by the bulk of fast requests and can hide a long tail entirely — it says nothing about p95/p99 without more information. That's why production dashboards report percentiles, not just the mean.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. Each call in a request has a 2% chance of hitting a slow path, and a
+          request fans out to 10 such calls. Roughly what fraction of requests hit the slow path
+          at least once?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">About 18% — 1 − 0.98<sup>10</sup> ≈ 0.18.</button>
+          <button class="quiz-option" data-choice="b">About 2% — the same as a single call, since fan-out doesn't change per-call probability.</button>
+          <button class="quiz-option" data-choice="c">About 20% exactly — 2% × 10 calls.</button>
+        </div>
+        <p class="quiz-explain" hidden>Tail-latency amplification: P(at least one slow call) = 1 − (1 − p)^N = 1 − 0.98^10 ≈ 18%. The naive "2% × 10 = 20%" is close here but isn't the correct formula (and diverges more at higher p or N) — the multiplicative form is exact.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. A CPU profile of a slow endpoint looks completely flat — no function
+          dominates on-CPU time — yet the endpoint takes 900ms. What's the most likely explanation?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The profiler is broken; on-CPU profiles always find the bottleneck.</button>
+          <button class="quiz-option" data-choice="b">900ms is actually fine and there's no bottleneck to find.</button>
+          <button class="quiz-option" data-choice="c">The time is mostly off-CPU — the thread is blocked waiting (a DB call, a lock, a downstream service), which an on-CPU profiler can't see; a trace or an off-CPU profile is the right tool.</button>
+        </div>
+        <p class="quiz-explain" hidden>On-CPU profilers are blind to blocked/waiting time by construction — a thread parked on I/O never shows up as a hot stack. A flat CPU profile alongside high latency is the classic signature of an off-CPU bottleneck; reach for a distributed trace or an off-CPU flame graph instead.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Every idea on this page has a direct inference-serving analogue. <b>Latency vs.
+        throughput</b> is exactly the batching knob: a larger batch raises GPU utilization
+        (throughput) but makes each request wait longer for the batch to fill (latency) — the same
+        trade-off as the batching example above, just with a GPU instead of a generic backend
+        call. <b>Little's Law</b> sizes an inference queue precisely: at λ requests/s and W
+        seconds of model latency (including queueing for a batch slot), you need L = λW requests'
+        worth of in-flight capacity — undersize it and requests queue past their latency budget
+        exactly like an undersized thread pool. <b>Tail-latency amplification</b> shows up when a
+        feature-serving path fans out to several feature stores or a retrieval step before the
+        model call — the user-visible p99 is the slowest-of-N across that fan-out, not any one
+        store's own p99. And <b>capacity estimation</b> is identical in method: daily active
+        users → inference requests/day → peak QPS → GPU-seconds needed → number of replicas,
+        the same six-step chain as the URL-shortener example, just with a model call in place of a
+        DB write.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      You now have the vocabulary and the arithmetic to say precisely how fast, how much, and
+      where the wall is — <em>Deployment, CI/CD &amp; Release Strategies</em> is next in this
+      section and covers how you actually get change into production without betting the numbers
+      you just estimated on a risky release. <em>Authentication &amp; Authorization</em> and the
+      rest of Security &amp; Quality are equally fair game next, since this is a landscape past
+      Foundations — pick whichever gap matters more for where you're headed.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var N_REQUESTS = 4000;
+
+      function gaussian() {
+        var u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      }
+
+      // Lognormal-ish single-call latency, ms. tailLevel 1..5 controls sigma (tail heaviness).
+      function sampleLatency(tailLevel) {
+        var mu = Math.log(30); // ~30ms median at low tail
+        var sigma = 0.25 + (tailLevel - 1) * 0.25; // 0.25 .. 1.25
+        var v = Math.exp(mu + sigma * gaussian());
+        return Math.max(1, v);
+      }
+
+      function percentile(sortedArr, p) {
+        var idx = Math.min(sortedArr.length - 1, Math.max(0, Math.ceil(p * sortedArr.length) - 1));
+        return sortedArr[idx];
+      }
+
+      function mean(arr) {
+        var s = 0;
+        for (var i = 0; i < arr.length; i++) s += arr[i];
+        return s / arr.length;
+      }
+
+      function fmt(ms) {
+        return ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : Math.round(ms) + "ms";
+      }
+
+      function renderHist(containerId, sortedArr) {
+        var el = document.getElementById(containerId);
+        el.innerHTML = "";
+        var binCount = 24;
+        var cap = percentile(sortedArr, 0.995); // clip extreme outliers for a readable chart
+        var min = sortedArr[0];
+        var range = Math.max(1, cap - min);
+        var bins = new Array(binCount).fill(0);
+        for (var i = 0; i < sortedArr.length; i++) {
+          var v = Math.min(sortedArr[i], cap);
+          var b = Math.min(binCount - 1, Math.floor(((v - min) / range) * binCount));
+          bins[b]++;
+        }
+        var maxBin = Math.max.apply(null, bins);
+        var p50 = percentile(sortedArr, 0.5), p95 = percentile(sortedArr, 0.95), p99 = percentile(sortedArr, 0.99);
+        for (var j = 0; j < binCount; j++) {
+          var bar = document.createElement("div");
+          var binStart = min + (j / binCount) * range;
+          var binEnd = min + ((j + 1) / binCount) * range;
+          var cls = "pc-bar";
+          if (binStart <= p99 && p99 <= binEnd) cls += " p99";
+          else if (binStart <= p95 && p95 <= binEnd) cls += " p95";
+          else if (binStart <= p50 && p50 <= binEnd) cls += " p50";
+          bar.className = cls;
+          bar.style.height = maxBin ? Math.max(2, (bins[j] / maxBin) * 100) + "%" : "2%";
+          bar.title = fmt(binStart) + "–" + fmt(binEnd) + ": " + bins[j] + " requests";
+          el.appendChild(bar);
+        }
+      }
+
+      function renderStats(containerId, sortedArr) {
+        var el = document.getElementById(containerId);
+        var m = mean(sortedArr), p50 = percentile(sortedArr, 0.5), p95 = percentile(sortedArr, 0.95), p99 = percentile(sortedArr, 0.99);
+        el.innerHTML =
+          '<div><span class="pc-stat-label">mean</span><span class="pc-stat-val">' + fmt(m) + '</span></div>' +
+          '<div><span class="pc-stat-label">p50</span><span class="pc-stat-val">' + fmt(p50) + '</span></div>' +
+          '<div><span class="pc-stat-label">p95</span><span class="pc-stat-val">' + fmt(p95) + '</span></div>' +
+          '<div><span class="pc-stat-label">p99</span><span class="pc-stat-val hot">' + fmt(p99) + '</span></div>';
+        return { mean: m, p50: p50, p95: p95, p99: p99 };
+      }
+
+      var tailInput = document.getElementById("pcTail");
+      var fanInput = document.getElementById("pcFan");
+      var tailVal = document.getElementById("pcTailVal");
+      var fanVal = document.getElementById("pcFanVal");
+      var resampleBtn = document.getElementById("pcResample");
+
+      function run() {
+        var tail = parseInt(tailInput.value, 10);
+        var fan = parseInt(fanInput.value, 10);
+        tailVal.textContent = tail;
+        fanVal.textContent = fan;
+
+        var single = [];
+        var fanout = [];
+        for (var i = 0; i < N_REQUESTS; i++) {
+          single.push(sampleLatency(tail));
+          var maxV = 0;
+          for (var k = 0; k < fan; k++) {
+            var v = sampleLatency(tail);
+            if (v > maxV) maxV = v;
+          }
+          fanout.push(maxV);
+        }
+        single.sort(function (a, b) { return a - b; });
+        fanout.sort(function (a, b) { return a - b; });
+
+        renderHist("pcSingleHist", single);
+        renderHist("pcFanHist", fanout);
+        var s = renderStats("pcSingleStats", single);
+        var f = renderStats("pcFanStats", fanout);
+
+        var ampP99 = f.p99 / s.p99;
+        var ampP50 = f.p50 / s.p50;
+        document.getElementById("pcAmplifyText").innerHTML =
+          "With N = " + fan + " calls per request, the user waits for the <b>slowest</b> of them, not the " +
+          "average. The typical (median) wait rose from " + fmt(s.p50) + " to " + fmt(f.p50) + " — a <b>" +
+          ampP50.toFixed(1) + "×</b> jump — while p99 rose from " + fmt(s.p99) + " to " + fmt(f.p99) + " (" +
+          ampP99.toFixed(1) + "×). The <em>median</em> usually amplifies more in relative terms: fan-out drags " +
+          "the typical experience up toward what used to be a rare bad case for one call, exactly the " +
+          "1 − (1 − p)^N effect above, now applied across the whole distribution instead of one threshold.";
+      }
+
+      tailInput.addEventListener("input", run);
+      fanInput.addEventListener("input", run);
+      resampleBtn.addEventListener("click", run);
+      run();
+
+      // Little's Law calculator
+      var llL = document.getElementById("pcLLL");
+      var llLambda = document.getElementById("pcLLLambda");
+      var llW = document.getElementById("pcLLW");
+      var llResult = document.getElementById("pcLLResult");
+      var llRadios = document.getElementsByName("pcLLSolve");
+
+      function currentSolveTarget() {
+        for (var i = 0; i < llRadios.length; i++) if (llRadios[i].checked) return llRadios[i].value;
+        return "lambda";
+      }
+
+      function updateDisabled() {
+        var target = currentSolveTarget();
+        llL.disabled = target === "L";
+        llLambda.disabled = target === "lambda";
+        llW.disabled = target === "W";
+      }
+
+      function recompute() {
+        var target = currentSolveTarget();
+        var L = parseFloat(llL.value) || 0;
+        var lambda = parseFloat(llLambda.value) || 0;
+        var Wms = parseFloat(llW.value) || 0;
+        var Ws = Wms / 1000;
+
+        if (target === "L") {
+          L = lambda * Ws;
+          llL.value = L.toFixed(1);
+        } else if (target === "lambda") {
+          lambda = Ws > 0 ? L / Ws : 0;
+          llLambda.value = lambda.toFixed(1);
+        } else if (target === "W") {
+          Ws = lambda > 0 ? L / lambda : 0;
+          llW.value = (Ws * 1000).toFixed(1);
+          Wms = Ws * 1000;
+        }
+
+        llResult.innerHTML =
+          "L = λ × W → <b>" + L.toFixed(1) + "</b> in flight = <b>" + lambda.toFixed(1) +
+          "</b> req/s × <b>" + (Wms).toFixed(1) + "ms</b>. This is the minimum concurrency " +
+          "(threads / async tasks / pool slots) needed to sustain that throughput at that latency " +
+          "without requests queueing.";
+      }
+
+      for (var r = 0; r < llRadios.length; r++) {
+        llRadios[r].addEventListener("change", function () { updateDisabled(); recompute(); });
+      }
+      llL.addEventListener("input", recompute);
+      llLambda.addEventListener("input", recompute);
+      llW.addEventListener("input", recompute);
+      updateDisabled();
+      recompute();
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
