@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deployment, CI/CD &amp; Release Strategies — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the rollout-comparison widget only. */
+    .dc-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-2); }
+    .dc-elapsed {
+      font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-faint);
+      margin: 0 0 var(--sp-5);
+    }
+    .dc-cols {
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .dc-col {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4);
+    }
+    .dc-col-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+    .dc-col-head h4 { margin: 0; font-size: var(--fs-md); font-family: var(--font-mono); }
+    .dc-phase {
+      display: inline-block; font-family: var(--font-mono); font-size: 0.72rem;
+      letter-spacing: 0.04em; padding: 0.2em 0.55em; border-radius: 999px;
+      border: 1px solid var(--border-strong); color: var(--text-muted); background: var(--surface-2);
+      margin-bottom: var(--sp-3);
+    }
+    .dc-phase.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+    .dc-phase.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+    .dc-phase.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: var(--ok-soft); }
+    .dc-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-bottom: var(--sp-3); }
+    .dc-box {
+      aspect-ratio: 1; border-radius: 4px; background: var(--surface-2);
+      border: 1px solid var(--border); transition: background .3s, border-color .3s;
+    }
+    .dc-box.old { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+    .dc-box.bad { background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
+    .dc-stats { font-size: var(--fs-sm); display: grid; gap: 0.3em; }
+    .dc-stats > div { display: flex; justify-content: space-between; gap: var(--sp-2); }
+    .dc-stat-label { color: var(--text-muted); }
+    .dc-stat-val { font-family: var(--font-mono); color: var(--text); font-weight: 700; }
+    .dc-stat-val.dc-bad { color: var(--danger); }
+    .dc-stat-val.dc-good { color: var(--ok); }
+    .dc-spark { display: flex; align-items: flex-end; gap: 2px; height: 34px; margin: var(--sp-2) 0 var(--sp-3); }
+    .dc-spark-bar { flex: 1; background: var(--border-strong); border-radius: 2px 2px 0 0; min-height: 2px; }
+    .dc-spark-bar.hot { background: var(--danger); }
+    .dc-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: var(--sp-2); min-height: 2.6em; }
+    @media (max-width: 420px) { .dc-grid { grid-template-columns: repeat(5, 1fr); } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Reliability &amp; Operating in Production // 04</p>
+    <h1>Deployment, CI/CD &amp; Release Strategies</h1>
+
+    <p>
+      Every earlier page in this section assumed a system that's already running well and asked
+      how it stays that way under load or failure. This one asks the question that precedes all of
+      them: how does <em>new code</em> get into that running system without being the thing that
+      breaks it? <a href="performance-and-capacity.html">Performance, Profiling &amp; Capacity
+      Planning</a> gave you the numbers to know when a system is healthy; deployment is the
+      discipline of changing that system while it keeps being healthy — repeatedly, by many
+      engineers, many times a day, without anyone needing to hold their breath.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Production-readiness isn't a property of code at rest — it's a property of a
+        <em>process</em> that gets code from a developer's laptop into users' hands safely, and
+        gets it back out just as fast if it's wrong. A brilliant service with a risky, manual,
+        all-at-once release process is not production-ready, no matter how clean its code is.
+        This page is about building that process: package the same artifact everywhere
+        (12-factor, containers), build infrastructure that's replaced rather than patched
+        (immutable infra), gate every change with automation (CI/CD), and control <em>how much
+        of production</em> a bad build can touch before anyone notices (release strategy).</p>
+      </div>
+    </div>
+
+    <h2>The twelve-factor app: what makes a service deployable at all</h2>
+    <p>
+      Before any of this works, the application itself has to be built in a way that's amenable to
+      automated, repeatable deployment. The <a href="https://12factor.net">twelve-factor app</a>
+      methodology (Heroku, 2011) codified the habits that make that possible — most of which you've
+      already met from other angles in this roadmap. Four matter most for this page:
+    </p>
+    <dl class="definition">
+      <dt>Config lives in the environment, not the code</dt>
+      <dd>Database URLs, API keys, feature flags, and anything that differs between dev, staging,
+        and prod are injected via environment variables or a config service — <em>never</em>
+        hardcoded or branched on in code (<code>if env == "prod"</code> is a smell). This is what
+        makes "the same artifact" meaningful: one built image runs unmodified in every environment
+        because environment-specific values are supplied at runtime, not baked in at build time.</dd>
+      <dt>Processes are stateless and share-nothing</dt>
+      <dd>Anything that must persist across requests goes in a backing service (a database, an
+        object store, a cache) — never on the local disk or in local memory of the process itself.
+        This is the same statelessness <a href="scaling-and-load-balancing.html">Scaling &amp; Load
+        Balancing</a> called the precondition for horizontal scale-out; here it's also the
+        precondition for a deploy: you can only kill and replace a process safely if killing it
+        loses nothing.</dd>
+      <dt>Disposability — fast startup, graceful shutdown</dt>
+      <dd>A process should be startable and killable in seconds, and on receiving a termination
+        signal (<code>SIGTERM</code>) should stop accepting new work, finish in-flight requests,
+        then exit — not be killed mid-request. Every release strategy on this page works by
+        starting new processes and stopping old ones; if that's slow or lossy, every strategy
+        inherits the pain.</dd>
+      <dt>Logs are an event stream, not a file to manage</dt>
+      <dd>Write logs to stdout/stderr and let the execution environment route them, instead of
+        managing log files and rotation inside the app. This is what makes the app portable across
+        deployment targets and is a direct prerequisite for the log pipeline in <a
+        href="observability.html">Observability</a>.</dd>
+    </dl>
+    <p>
+      The other eight factors — a single codebase per app, explicit declared dependencies,
+      backing services treated as attachable resources, a strict build/release/run separation,
+      port-binding as a self-contained service, scaling out via the process model, dev/prod
+      parity, and running admin tasks as one-off processes — are the same spirit applied further.
+      The throughline: <b>an app that doesn't assume anything about the machine it happens to be
+      running on</b> is an app you can deploy by machine, not by hand.
+    </p>
+
+    <h2>Containers: packaging the "it depends" problem away</h2>
+    <p>
+      "Works on my machine" is a packaging problem: a process depends on an OS version, system
+      libraries, a language runtime, environment variables, and file paths, and any mismatch
+      between where it was built and where it runs is a place for it to break. A <span
+      class="term">container</span> solves this by packaging the application together with its
+      entire user-space dependency tree — runtime, libraries, config defaults — into a single
+      <span class="term">image</span>: a stack of read-only, content-addressed layers built from a
+      Dockerfile-like recipe, plus a thin writable layer added at run time.
+    </p>
+    <p>
+      Containers are not lightweight VMs, and the distinction matters operationally: a VM
+      virtualizes hardware and runs a full guest OS and kernel per instance; a container shares the
+      host kernel and is isolated from other containers using kernel primitives — namespaces (a
+      private view of process IDs, network, mounts) and cgroups (resource limits/accounting). That's
+      why containers start in milliseconds instead of the tens of seconds a VM boot takes, and why
+      you can pack far more of them per host — but also why the isolation boundary is weaker than a
+      VM's (a kernel-level exploit can cross container boundaries in a way it can't cross a
+      hypervisor boundary, which is why untrusted multi-tenant workloads often still want a VM, or a
+      VM-backed sandbox like gVisor/Firecracker, underneath the container).
+    </p>
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip — build once, promote the same artifact</span>
+      <div class="callout-body">
+        <p>The operational payoff of a container image isn't "it's small" — it's that the
+        <em>exact same immutable image</em>, identified by a content digest, can be built once by
+        CI and then run unmodified in staging, then in prod. What differs between environments is
+        only the config injected at start time (per the twelve-factor rule above). If you rebuild
+        the artifact for each environment, you've reintroduced "works on my machine" one layer up —
+        now it's "works in staging." Dev/prod parity, one of the twelve factors, is this idea
+        stated as a principle: keep dev, staging, and prod as similar as possible so what you
+        tested is what you ship.</p>
+      </div>
+    </div>
+
+    <h2>Immutable infrastructure &amp; infrastructure as code</h2>
+    <p>
+      The same logic that says "don't patch a running process, replace it" applies one layer down,
+      to the servers themselves. <span class="term">Immutable infrastructure</span> means a running
+      server is never modified in place (no SSH-in-and-<code>apt upgrade</code>, no hotfixing a
+      config file on the box) — instead, a new server is built from an updated image or template
+      and the old one is destroyed. The old shorthand is <b>cattle, not pets</b>: a pet server has a
+      name, gets nursed back to health when it's sick, and its exact configuration lives only in
+      someone's memory or shell history; cattle are numbered, replaced without ceremony when
+      unhealthy, and their configuration lives entirely in version control.
+    </p>
+    <p>
+      <span class="term">Infrastructure as Code</span> (IaC — Terraform, CloudFormation, Pulumi) is
+      what makes that practical at scale: infrastructure (VPCs, load balancers, managed databases,
+      the instances or clusters that run your containers) is described declaratively in files,
+      checked into the same version control as application code, and applied by a tool that diffs
+      the declared state against reality and reconciles it. This buys three things a backend
+      engineer actually cares about at 3 AM: the infrastructure is <em>reviewable</em> (a pull
+      request, not a Slack message), <em>reproducible</em> (rebuild the whole environment from the
+      same files), and <em>driftless-by-construction</em> — if someone changes something by hand in
+      the console, the next <code>terraform plan</code> shows exactly what drifted and offers to
+      undo it.
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Immutable infrastructure and IaC are enablers, not guarantees — a Terraform config
+        that's manually edited via <code>terraform apply -target</code> under pressure, or an image
+        that's hand-patched "just this once" because a fix can't wait for a pipeline, quietly
+        reintroduces the pet you were trying to avoid. The discipline only holds if the emergency
+        path is <em>also</em> the pipeline, just a faster one — not a bypass of it.</p>
+      </div>
+    </div>
+
+    <h2>CI/CD: the pipeline that turns a commit into a safe release</h2>
+    <p>
+      <span class="term">Continuous Integration</span> (CI) is the practice of merging and building
+      every change frequently — ideally on every commit — against an automated test suite, so
+      integration problems surface in minutes, not at the end of a multi-week branch. <span
+      class="term">Continuous Delivery</span> extends this so that every change that passes CI
+      produces a release-ready artifact, deployable at any time — deployment to production is still
+      a deliberate (often one-click) decision. <span class="term">Continuous Deployment</span> goes
+      one step further and removes that manual gate: every change that passes all automated checks
+      deploys to production automatically. The three terms are commonly compressed into "CI/CD,"
+      but the CD half is a spectrum, not a binary — and where a team sits on it should track how
+      much they trust their automated gates, not how impressive they want to sound.
+    </p>
+    <p>A representative pipeline, as a sequence of <span class="term">quality gates</span> — each
+      stage only runs if the previous one passed, and a failure stops the artifact from advancing:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Stage</th><th>Checks</th><th>Catches</th></tr></thead>
+        <tbody>
+          <tr><td>Build</td><td>Compile / install deps / build the image</td><td>Syntax errors, missing dependencies, broken builds</td></tr>
+          <tr><td>Unit tests</td><td>Fast, isolated tests (see <em>Testing Backend Systems</em>)</td><td>Logic regressions, in seconds</td></tr>
+          <tr><td>Static analysis</td><td>Lint, type-check, dependency &amp; secret scanning</td><td>Style drift, known-CVE dependencies, leaked credentials</td></tr>
+          <tr><td>Integration tests</td><td>Tests against real (often containerized) dependencies</td><td>Contract mismatches unit tests can't see</td></tr>
+          <tr><td>Package</td><td>Build and tag the immutable artifact (the container image)</td><td>Anything env-specific baked in by mistake</td></tr>
+          <tr><td>Deploy to staging</td><td>Automated deploy to a prod-like environment</td><td>Environment-specific config/integration issues</td></tr>
+          <tr><td>Smoke / E2E tests</td><td>A thin slice of critical user journeys, against staging</td><td>"It builds but doesn't actually work"</td></tr>
+          <tr><td>Deploy to prod</td><td>The release strategy — see below</td><td>Whatever slipped through everything above</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — rebuilding per environment</span>
+      <div class="callout-body">
+        <p>A pipeline that runs <code>docker build</code> separately for staging and for prod
+        breaks the "same artifact" guarantee — a dependency resolved slightly differently, a base
+        image that moved between the two builds, and staging just stopped meaning anything. The
+        package stage should produce <em>one</em> immutable, digest-addressed artifact, and every
+        later stage should deploy <em>that exact artifact</em>, not rebuild from source again.</p>
+      </div>
+    </div>
+    <p>
+      The other structural choice CI/CD forces is how branches flow into that pipeline.
+      <span class="term">Trunk-based development</span> — short-lived branches (hours, not weeks)
+      merged frequently to a single trunk, with incomplete work hidden behind feature flags rather
+      than a long-lived branch — keeps the integration problem small and constant instead of large
+      and occasional, which is what actually makes "every commit through the full pipeline" tractable
+      at team scale. Long-lived feature branches don't just delay integration pain, they compound it:
+      merge conflicts grow with branch age, and the pipeline is exercising code that's increasingly
+      unlike what's actually running in prod.
+    </p>
+
+    <h2>Release strategies: how much of production a bad build can touch</h2>
+    <p>
+      Everything above gets a validated artifact to the door of production. The release strategy
+      decides how it walks through that door — and it is, in effect, the last resilience pattern
+      from the previous page, applied to your own deploys instead of a downstream dependency: it
+      bounds the <span class="term">blast radius</span> (how much of your traffic can be hit by a
+      bad build) and the <span class="term">rollback time</span> (how fast you can undo it once
+      detected).
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Strategy</th><th>How it works</th><th>Blast radius</th><th>Rollback</th><th>Cost</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>Rolling</b></td>
+            <td>Replace instances in small batches, health-checking each batch before continuing</td>
+            <td>Grows with each batch until stopped — no separate old environment left once complete</td>
+            <td>Redeploy the old image, batch by batch — a second rollout, not a switch</td>
+            <td>Low — no extra capacity held</td>
+          </tr>
+          <tr>
+            <td><b>Blue-green</b></td>
+            <td>Deploy a full parallel environment ("green"); cut traffic over all at once when ready</td>
+            <td>0% pre-cutover; 100% instantly if the bug wasn't caught before cutover</td>
+            <td>Instant — flip the router back to blue, which is still warm</td>
+            <td>High — two full environments running simultaneously</td>
+          </tr>
+          <tr>
+            <td><b>Canary</b></td>
+            <td>Route a small traffic slice to the new version; expand gradually if it stays healthy</td>
+            <td>Capped at the canary's slice for as long as it's held there</td>
+            <td>Fast — redirect the small slice back; nothing else was ever exposed</td>
+            <td>Low-moderate — a small extra deployment, held temporarily</td>
+          </tr>
+          <tr>
+            <td><b>Feature flags</b></td>
+            <td>Ship code dark (deployed but inert), then flip a runtime toggle to expose it — per-user, per-cohort, or globally</td>
+            <td>Exactly whoever the flag targets — independent of deploy batches entirely</td>
+            <td>Instant — flip the flag off; no redeploy needed at all</td>
+            <td>Low infra cost; ongoing complexity of flag lifecycle/cleanup</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight — deploy is not release</span>
+      <div class="callout-body">
+        <p>Feature flags make explicit an idea the other three strategies blur: <em>deploying</em>
+        code (getting it running in production) and <em>releasing</em> it (making it affect users)
+        don't have to be the same action. Once they're decoupled, you can deploy constantly and cheaply
+        — the risky part — and control exposure separately and cheaply too, including turning a
+        feature off for one misbehaving cohort without any deploy at all. Most mature release
+        strategies are really this idea plus a mechanism: canary is "deploy dark, release
+        gradually by traffic weight"; a flag rollout is "deploy dark, release gradually by
+        targeting rule." The mechanism differs; the separation of concerns is the same.</p>
+      </div>
+    </div>
+
+    <h2>Try it: push a bad build, compare all three</h2>
+    <p>
+      Same bad build (35% error rate on the new version), released the same way, through three
+      different strategies at once, with automated rollback watching for a sustained error-rate
+      breach. Watch how differently "bad" plays out depending on <em>how much traffic was exposed
+      before anyone noticed</em> — not just on how fast the rollback mechanism itself is.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — Rolling vs. blue-green vs. canary</div>
+
+      <div class="dc-actions">
+        <button class="btn" id="dcRun" type="button">Deploy v2 (bad build)</button>
+        <button class="btn secondary" id="dcReset" type="button">Reset</button>
+      </div>
+      <p class="dc-elapsed">Elapsed: <span id="dcElapsed">0:00</span> <span class="muted">(≈2 min of wall-clock time per step)</span></p>
+
+      <div class="dc-cols" id="dcCols"></div>
+
+      <p class="dc-note" id="dcNote">Press "Deploy v2 (bad build)" to run the same bad release through all three strategies.</p>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip — what to look for</span>
+      <div class="callout-body">
+        <p>Compare <b>peak traffic on the bad build</b> across the three columns, not just "who
+        rolled back fastest." Blue-green's rollback mechanism is the fastest of the three — a
+        single router flip — yet it produces the worst outcome, because it had already committed
+        100% of traffic before the flip. Canary never got close to that, precisely because it never
+        exposed more than its slice in the first place. The lesson generalizes: <em>controlling
+        exposure beats fast rollback</em> — rollback speed only bounds how long a bad build hurts
+        you, exposure control bounds how <em>many people</em> it hurts to begin with.</p>
+      </div>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Model deployment is this exact picture with "model version" in place of "code version."
+        <b>Shadow deployment</b> sends production traffic to a new model in parallel with the live
+        one, scores its predictions offline, and serves nothing from it — a canary with the
+        exposure dialed to zero, used when even a small live blast radius is unacceptable (e.g. a
+        fraud model). <b>Canary releases</b> of models work identically to canary releases of
+        services — a traffic slice, staged promotion, rollback by redirecting weight. <b>Feature
+        flags</b> gate which model version a request uses, independent of when it was deployed —
+        exactly the deploy/release split above, letting you kill a misbehaving model for one
+        segment without touching infrastructure. And a <b>model registry</b> with immutable,
+        versioned artifacts is the same "build once, promote the same artifact" discipline as a
+        container image — the alternative, mutable model files that get overwritten in place, is
+        precisely the pet-server pattern this page argues against, and it makes "which weights are
+        actually serving right now" an unanswerable question during an incident.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A team builds a container image separately for staging and for
+          production, from the same source commit. What does this break?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Nothing — as long as the commit is identical, the two builds are guaranteed identical too.</button>
+          <button class="quiz-option" data-choice="b">The "build once, promote the same artifact" guarantee — a dependency resolving differently or a moved base image between the two builds means staging no longer represents what will actually run in prod.</button>
+          <button class="quiz-option" data-choice="c">Nothing important — twelve-factor config injection makes rebuilding per environment the recommended approach.</button>
+        </div>
+        <p class="quiz-explain" hidden>Config should be injected at runtime into one artifact, not baked in by rebuilding. Rebuilding per environment reintroduces exactly the "works on my machine" class of bug that immutable, promoted artifacts exist to eliminate.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. Why can blue-green deployment have a worse worst-case outcome than
+          canary, even though its rollback mechanism (an instant router flip) is faster than
+          canary's?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Because blue-green doesn't support automated rollback at all.</button>
+          <button class="quiz-option" data-choice="b">It can't — blue-green is strictly safer than canary in every scenario.</button>
+          <button class="quiz-option" data-choice="c">Because blue-green cuts over 100% of traffic at once, so a bug not caught before cutover is instantly exposed to every user; canary limits exposure to a small slice by design, so rollback speed matters less than exposure control did in the first place.</button>
+        </div>
+        <p class="quiz-explain" hidden>Rollback speed only bounds how long a bad release hurts you. Blue-green's all-at-once cutover means the exposure itself — before any rollback can even trigger — is already total. Canary's gradual exposure caps the damage regardless of how fast its own rollback is.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. A feature is deployed behind a feature flag that's off. What is true?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">The code is running in production but not affecting any users — deploying and releasing have been decoupled, and turning the feature on (or off) later needs no redeploy.</button>
+          <button class="quiz-option" data-choice="b">The code has not been deployed yet — the flag controls whether the deploy pipeline runs.</button>
+          <button class="quiz-option" data-choice="c">This is only possible with a canary or blue-green release strategy, since rolling deploys don't support feature flags.</button>
+        </div>
+        <p class="quiz-explain" hidden>Feature flags are runtime toggles, orthogonal to which release strategy shipped the code. "Deployed but dark" means the artifact is live in prod, executing on real infrastructure, but the flag keeps it from being reached — a release-strategy-independent way to decouple exposure from deployment.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      That closes out Reliability &amp; Operating in Production: resilience under a dependency's
+      failure, visibility into what's actually happening, the numbers to plan capacity, and now a
+      safe path for change itself. Security &amp; Quality is the natural next area — <em>
+      Authentication &amp; Authorization Done Right</em>, <em>Backend Security &amp; the OWASP Top
+      10</em>, and <em>Testing Backend Systems</em> are all unlocked and order-independent from
+      here. <em>The System Design Method</em> and <em>ML Systems as Backend Systems</em>, the
+      capstone, are worth saving for after Security — they draw on everything, including this page's
+      release-strategy vocabulary, when the design conversation turns to "how would you ship this
+      safely."
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var BAD_ERROR_RATE = 0.35;
+      var TICK_MS = 1100;
+      var STEP_MINUTES = 2;
+
+      // Each schedule is the fraction of traffic on the bad ("new") build at the END of each
+      // tick (index 0 = tick 1). Phases are the human-readable label for that same tick.
+      // These are pre-scripted (not simulated from a live threshold check) so the numbers in
+      // the UI are always exactly reproducible and match the prose above.
+      var STRATEGIES = [
+        {
+          key: "rolling",
+          name: "Rolling",
+          sub: "batches of 25%, no auto-pause",
+          fractions:  [0.25, 0.50, 0.25, 0.00, 0.00, 0.00],
+          phases: [
+            "Rolling out (batch 1/4)",
+            "Rolling out (batch 2/4) — breach detected",
+            "Rolling back (redeploying old image)",
+            "Rolling back (redeploying old image)",
+            "Rolled back ✓",
+            "Stable"
+          ],
+          phaseClass: ["", "warn", "bad", "bad", "good", "good"]
+        },
+        {
+          key: "bluegreen",
+          name: "Blue-Green",
+          sub: "full parallel env, instant cutover",
+          fractions:  [0.00, 0.00, 1.00, 1.00, 0.00, 0.00],
+          phases: [
+            "Green deploying (0% traffic)",
+            "Pre-cutover checks (0% traffic)",
+            "Cutover — 100% on green",
+            "Breach confirmed — full exposure",
+            "Instant switch back to blue",
+            "Rolled back ✓"
+          ],
+          phaseClass: ["", "", "bad", "bad", "warn", "good"]
+        },
+        {
+          key: "canary",
+          name: "Canary",
+          sub: "5% slice, canary-only monitoring",
+          fractions:  [0.05, 0.05, 0.00, 0.00, 0.00, 0.00],
+          phases: [
+            "Canary live (5%) — monitoring",
+            "Breach confirmed on canary slice",
+            "Redirected back to stable",
+            "Rolled back ✓",
+            "Stable",
+            "Stable"
+          ],
+          phaseClass: ["", "warn", "good", "good", "good", "good"]
+        }
+      ];
+
+      var TICKS = STRATEGIES[0].fractions.length;
+
+      var runBtn = document.getElementById("dcRun");
+      var resetBtn = document.getElementById("dcReset");
+      var colsEl = document.getElementById("dcCols");
+      var noteEl = document.getElementById("dcNote");
+      var elapsedEl = document.getElementById("dcElapsed");
+
+      var tickIndex = -1; // -1 = idle, before any tick has resolved
+      var timer = null;
+
+      function buildColumns() {
+        colsEl.innerHTML = STRATEGIES.map(function (s) {
+          return (
+            '<div class="dc-col" data-key="' + s.key + '">' +
+              '<div class="dc-col-head"><h4>' + s.name + '</h4></div>' +
+              '<p class="muted" style="font-size:0.78rem;margin:0 0 var(--sp-2);">' + s.sub + '</p>' +
+              '<span class="dc-phase" data-role="phase">Idle — old build, 100% healthy</span>' +
+              '<div class="dc-grid" data-role="grid"></div>' +
+              '<div class="dc-spark" data-role="spark"></div>' +
+              '<div class="dc-stats">' +
+                '<div><span class="dc-stat-label">traffic on bad build</span><span class="dc-stat-val" data-role="frac">0%</span></div>' +
+                '<div><span class="dc-stat-label">fleet error rate</span><span class="dc-stat-val" data-role="err">0%</span></div>' +
+                '<div><span class="dc-stat-label">peak blast radius</span><span class="dc-stat-val" data-role="peak">—</span></div>' +
+                '<div><span class="dc-stat-label">fully rolled back at</span><span class="dc-stat-val" data-role="rb">—</span></div>' +
+              '</div>' +
+            '</div>'
+          );
+        }).join("");
+      }
+
+      function renderGrid(el, fraction) {
+        var boxesOn = Math.round(fraction * 10);
+        var html = "";
+        for (var i = 0; i < 10; i++) {
+          html += '<div class="dc-box ' + (i < boxesOn ? "bad" : "old") + '"></div>';
+        }
+        el.innerHTML = html;
+      }
+
+      function renderSpark(el, fractions, upTo) {
+        var html = "";
+        for (var i = 0; i < fractions.length; i++) {
+          var active = i <= upTo;
+          var err = active ? fractions[i] * BAD_ERROR_RATE : 0;
+          var h = Math.max(2, Math.round(err / BAD_ERROR_RATE * 32));
+          html += '<div class="dc-spark-bar' + (err > 0.05 ? " hot" : "") + '" style="height:' + (active ? h : 2) + 'px"></div>';
+        }
+        el.innerHTML = html;
+      }
+
+      function render() {
+        STRATEGIES.forEach(function (s) {
+          var col = colsEl.querySelector('.dc-col[data-key="' + s.key + '"]');
+          var phaseEl = col.querySelector('[data-role="phase"]');
+          var gridEl = col.querySelector('[data-role="grid"]');
+          var sparkEl = col.querySelector('[data-role="spark"]');
+          var fracEl = col.querySelector('[data-role="frac"]');
+          var errEl = col.querySelector('[data-role="err"]');
+          var peakEl = col.querySelector('[data-role="peak"]');
+          var rbEl = col.querySelector('[data-role="rb"]');
+
+          var idx = Math.max(0, tickIndex);
+          var fraction = tickIndex < 0 ? 0 : s.fractions[idx];
+          var errorRate = fraction * BAD_ERROR_RATE;
+
+          renderGrid(gridEl, fraction);
+          renderSpark(sparkEl, s.fractions, tickIndex);
+
+          if (tickIndex < 0) {
+            phaseEl.textContent = "Idle — old build, 100% healthy";
+            phaseEl.className = "dc-phase";
+          } else {
+            phaseEl.textContent = s.phases[idx];
+            phaseEl.className = "dc-phase " + s.phaseClass[idx];
+          }
+
+          fracEl.textContent = Math.round(fraction * 100) + "%";
+          errEl.textContent = Math.round(errorRate * 100) + "%";
+          errEl.className = "dc-stat-val " + (errorRate > 0.05 ? "dc-bad" : "dc-good");
+
+          if (tickIndex < 0) {
+            peakEl.textContent = "—";
+            rbEl.textContent = "—";
+          } else {
+            var peak = 0;
+            for (var i = 0; i <= idx; i++) peak = Math.max(peak, s.fractions[i]);
+            peakEl.textContent = Math.round(peak * 100) + "%";
+            peakEl.className = "dc-stat-val " + (peak >= 0.99 ? "dc-bad" : peak > 0.05 ? "" : "dc-good");
+
+            var rbTick = -1;
+            var everNonZero = false;
+            for (var j = 0; j <= idx; j++) {
+              if (s.fractions[j] > 0) everNonZero = true;
+              if (everNonZero && s.fractions[j] === 0) { rbTick = j; break; }
+            }
+            rbEl.textContent = rbTick >= 0 ? ("step " + (rbTick + 1)) : (idx === s.fractions.length - 1 ? "did not fully clear" : "—");
+          }
+        });
+
+        var mins = tickIndex < 0 ? 0 : (tickIndex + 1) * STEP_MINUTES;
+        elapsedEl.textContent = Math.floor(mins / 60) + ":" + String(mins % 60).padStart(2, "0");
+      }
+
+      function step() {
+        tickIndex++;
+        render();
+        if (tickIndex >= TICKS - 1) {
+          clearInterval(timer);
+          timer = null;
+          runBtn.disabled = false;
+          runBtn.textContent = "Deploy again";
+          noteEl.textContent = "Run complete. Compare “peak blast radius” across the three columns — that gap is the point, not the rollback-time numbers alone.";
+        }
+      }
+
+      runBtn.addEventListener("click", function () {
+        if (timer) return;
+        tickIndex = -1;
+        render();
+        runBtn.disabled = true;
+        noteEl.textContent = "Deploying v2 (35% error rate) through all three strategies at once…";
+        timer = setInterval(step, TICK_MS);
+        step();
+      });
+
+      resetBtn.addEventListener("click", function () {
+        if (timer) { clearInterval(timer); timer = null; }
+        tickIndex = -1;
+        runBtn.disabled = false;
+        runBtn.textContent = "Deploy v2 (bad build)";
+        noteEl.textContent = "Press “Deploy v2 (bad build)” to run the same bad release through all three strategies.";
+        render();
+      });
+
+      buildColumns();
+      render();
+
+      // Quiz interactivity
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

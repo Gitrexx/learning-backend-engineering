@@ -210,7 +210,7 @@
       "summary": "12-factor, containers, IaC, CI/CD gates, and blue-green vs canary vs rolling with fast rollback.",
       "prerequisites": ["anatomy-of-a-backend"],
       "file": "deployment-and-cicd.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "auth-and-access",
