@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Authentication &amp; Authorization Done Right — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the OAuth2/PKCE flow stepper and the JWT flaw-spotter only. */
+    .flow-track {
+      display: flex; align-items: center; overflow-x: auto;
+      padding: var(--sp-2) var(--sp-1) var(--sp-4);
+      -webkit-overflow-scrolling: touch;
+    }
+    .flow-node {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 0.3rem;
+      min-width: 108px; font: inherit; color: var(--text); text-align: center;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-3) var(--sp-3); cursor: pointer;
+      transition: border-color .15s, background .15s, transform .1s;
+    }
+    .flow-node .fn-name { font-weight: 600; font-size: var(--fs-sm); line-height: 1.25; }
+    .flow-node .fn-step { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+    .flow-node:hover { border-color: var(--accent); }
+    .flow-node:active { transform: translateY(1px); }
+    .flow-node.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: var(--ring); }
+    .flow-node.done { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); background: var(--ok-soft); }
+    .flow-arrow {
+      flex: 0 0 auto; color: var(--text-faint); font-family: var(--font-mono);
+      padding: 0 var(--sp-2); font-size: 1rem; user-select: none;
+    }
+    .flow-controls { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-4); flex-wrap: wrap; }
+    .flow-detail {
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4); font-size: var(--fs-sm); color: var(--text-muted); min-height: 6.5em;
+    }
+    .flow-detail b { color: var(--text); }
+    .flow-detail pre { margin: var(--sp-3) 0 0; box-shadow: none; font-size: 0.8rem; }
+    .flow-progress { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-faint); margin-bottom: var(--sp-2); }
+
+    .jwt-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+    .jwt-controls select { flex: 1 1 260px; min-width: 220px; }
+    .jwt-token {
+      font-family: var(--font-mono); font-size: 0.78rem; word-break: break-all;
+      background: var(--surface-code); color: var(--text-on-code); border: 1px solid var(--border-strong);
+      border-radius: var(--radius); padding: var(--sp-4); margin-bottom: var(--sp-4); line-height: 1.7;
+    }
+    .jwt-token .seg-header { color: #ff9e9e; }
+    .jwt-token .seg-payload { color: #8fd6ff; }
+    .jwt-token .seg-sig { color: #a7f0c4; }
+    .jwt-token .seg-dot { color: var(--text-faint); }
+    .guess-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: var(--sp-3) 0; }
+    .guess-btn {
+      font: inherit; font-size: var(--fs-sm); font-weight: 600;
+      padding: 0.45em 0.9em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .guess-btn:hover { border-color: var(--accent); }
+    .guess-btn.chosen { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+    .guess-btn:disabled { cursor: default; }
+    .jwt-result[hidden] { display: none; }
+    .jwt-verdict {
+      font-size: var(--fs-sm); font-weight: 700; margin-bottom: var(--sp-3);
+      padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
+    }
+    .jwt-verdict.hit { background: var(--ok-soft); color: var(--ok); }
+    .jwt-verdict.miss { background: var(--warn-soft); color: var(--warn); }
+    .issue-list { list-style: none; margin: 0 0 var(--sp-4); padding: 0; display: grid; gap: var(--sp-3); }
+    .issue-item {
+      display: grid; grid-template-columns: auto 1fr; gap: var(--sp-3);
+      padding: var(--sp-3) var(--sp-4); border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+    }
+    .issue-item .issue-icon {
+      width: 1.6rem; height: 1.6rem; border-radius: 50%; display: grid; place-items: center;
+      background: var(--danger-soft); color: var(--danger); font-family: var(--font-mono); font-weight: 800;
+    }
+    .issue-item.safe .issue-icon { background: var(--ok-soft); color: var(--ok); }
+    .issue-item .issue-title { font-weight: 700; margin-bottom: 0.2em; }
+    .issue-item p { margin: 0; font-size: var(--fs-sm); color: var(--text-muted); }
+    @media (max-width: 560px) { .jwt-controls { flex-direction: column; align-items: stretch; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Security &amp; Quality // 01</p>
+    <h1>Authentication &amp; Authorization Done Right</h1>
+
+    <p>
+      Every REST endpoint you learned to design in <em>Designing Clean REST APIs</em> eventually
+      answers two questions before it does anything else: <em>who is calling</em>, and
+      <em>are they allowed to do this</em>. Get either one wrong and the failure mode isn't a slow
+      query or a confusing error message — it's someone else's data in your response body, or your
+      name in a breach disclosure. Auth is disproportionately interview-relevant for the same
+      reason it's disproportionately dangerous in production: it's easy to build something that
+      <em>looks</em> correct (login works, tokens are issued, protected routes return 401 when
+      you'd expect) while being subtly, catastrophically wrong in a way that only shows up under
+      attack. This page is about the handful of decisions — hash function, token shape, flow
+      choice, access model — that separate "looks correct" from "is correct."
+    </p>
+
+    <h2>Authentication vs. authorization</h2>
+    <p>
+      The two words get used almost interchangeably in casual conversation and mean completely
+      different things in a system design:
+    </p>
+
+    <dl class="definition">
+      <dt>Authentication (AuthN)</dt>
+      <dd><em>Who are you?</em> The process of verifying an identity claim — a password matches, a
+        token is validly signed and unexpired, a certificate chains to a trusted root. The output
+        of authentication is a confirmed identity (a user ID, a service name).</dd>
+      <dt>Authorization (AuthZ)</dt>
+      <dd><em>What are you allowed to do?</em> Given a confirmed identity, deciding whether a
+        specific action on a specific resource is permitted. Authorization always runs
+        <b>after</b> authentication and is checked independently, per request — a valid identity is
+        necessary but never sufficient.</dd>
+    </dl>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>The single most common access-control bug in real systems is conflating the two:
+        checking "is this token valid" and treating that as "is this user allowed to see order
+        482," instead of separately checking "does the identity in this valid token own order
+        482." A perfectly authenticated user with a perfectly valid session can still be making an
+        <em>unauthorized</em> request — this is <b>broken object-level authorization</b>
+        (OWASP's #1 API security risk, more commonly known by its older name, IDOR — insecure
+        direct object reference), and it's covered in depth in the next deep-dive,
+        <em>Backend Security &amp; the OWASP Top&nbsp;10</em>. Authentication tells you who's
+        knocking; it never tells you which rooms they're allowed into.</p>
+      </div>
+    </div>
+
+    <h2>Storing passwords: hashing, not encryption</h2>
+    <p>
+      If your service authenticates users with passwords at all, exactly one storage design is
+      acceptable: never store the password, ever, in any recoverable form. Not encrypted (encryption
+      is reversible by design — whoever holds the key can recover every password), and never
+      plaintext. What you store is the output of a <span class="term">password hashing
+      function</span> — one-way by construction, so even a full database dump gives an attacker no
+      direct path back to the password.
+    </p>
+    <p>
+      But "one-way" alone isn't enough. General-purpose cryptographic hashes like SHA-256 are
+      designed to be <em>fast</em> — that's a feature for verifying file integrity and a
+      catastrophic bug for password storage, because fast means an attacker with a stolen hash
+      dump can try billions of candidate passwords per second on commodity GPUs. Password hashing
+      needs the opposite property: deliberately, tunably <em>slow</em>, so brute-forcing even a
+      single password is expensive.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Function</th><th>Verdict</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><code>MD5</code>, <code>SHA-1</code>, <code>SHA-256</code> (unsalted, direct)</td><td>Never for passwords</td><td>Fast by design; a modern GPU rig tries tens of billions of SHA-256 guesses/sec — an 8-character password falls in hours</td></tr>
+          <tr><td><code>bcrypt</code></td><td>Acceptable, widely deployed</td><td>Adaptive cost factor, battle-tested since 1999, but memory-hard against neither GPUs nor ASICs the way Argon2 is</td></tr>
+          <tr><td><code>scrypt</code></td><td>Acceptable</td><td>Memory-hard, good GPU resistance, less common tooling than Argon2/bcrypt</td></tr>
+          <tr><td><code>Argon2id</code></td><td><b>Recommended default</b></td><td>Winner of the 2015 Password Hashing Competition; tunable memory, time, and parallelism costs; the <code>id</code> variant resists both GPU cracking and side-channel timing attacks</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Every credible password hash also embeds a unique, random <span class="term">salt</span> per
+      password (bcrypt and Argon2id do this automatically as part of the stored hash string), so
+      two users with the identical password get completely different stored hashes — this is what
+      defeats precomputed <span class="term">rainbow table</span> attacks, which only work when the
+      same input always produces the same output.
+    </p>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>OWASP's current guidance for Argon2id: minimum <b>19 MiB memory, 2 iterations, 1 degree
+        of parallelism</b>, tuned upward from there — raise the memory parameter until a single
+        verification takes roughly 50–100&nbsp;ms on your production hardware. That's slow enough
+        to make offline brute-forcing expensive and fast enough that a real login doesn't feel
+        laggy. This is a genuine trade-off dial, not a "bigger is always better" setting: too slow
+        and you've built a self-inflicted denial-of-service on your own login endpoint under
+        load.</p>
+      </div>
+    </div>
+
+    <h2>Sessions vs. tokens</h2>
+    <p>
+      Once a user authenticates, the server needs a way to recognize them on every subsequent
+      request without re-checking a password each time. Two fundamentally different designs
+      dominate, and the choice cuts across the statelessness theme from
+      <em>Scaling &amp; Load Balancing</em>:
+    </p>
+
+    <dl class="definition">
+      <dt>Server-side sessions</dt>
+      <dd>On login, the server creates a session record (user ID, expiry, metadata) in shared
+        storage (Redis, a DB table) and hands the client an opaque, random <span class="term">session
+        ID</span> in a cookie. Every request, the server looks the session ID up. Revocation is
+        trivial — delete the row — but every app server now needs shared access to that session
+        store, reintroducing the stateful dependency that made horizontal scaling harder.</dd>
+      <dt>Tokens (bearer tokens, typically JWTs)</dt>
+      <dd>On login, the server issues a signed, self-contained token holding the user's identity
+        and claims directly. Any server that can verify the signature can authenticate the request
+        with <b>no shared storage lookup</b> — genuinely stateless, which is why tokens are the
+        default for APIs and microservices. The cost: revocation is hard (more below), and the
+        token's contents are visible to anyone who has it (signed, not encrypted, unless you
+        deliberately encrypt the payload too).</dd>
+    </dl>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Where you <em>store</em> the credential on the client matters as much as which kind you
+        pick. A token or session ID in <code>localStorage</code> is readable by any JavaScript
+        running on the page — including an attacker's, via XSS. An <code>httpOnly</code>,
+        <code>Secure</code>, <code>SameSite=Lax</code> (or <code>Strict</code>) cookie is invisible
+        to JavaScript entirely, closing that theft vector, but opens a different one —
+        cross-site request forgery (CSRF), where a malicious site makes the browser send the
+        cookie automatically. <code>SameSite</code> cookies mitigate CSRF for most cases; a
+        dedicated CSRF token is the belt-and-suspenders fix for anything sensitive. There's no
+        credential storage location with zero attack surface — only trade-offs, covered further in
+        <em>Backend Security &amp; the OWASP Top&nbsp;10</em>.</p>
+      </div>
+    </div>
+
+    <h2>JWTs: structure, and where the bugs live</h2>
+    <p>
+      A <span class="term">JSON Web Token</span> is three base64url-encoded segments joined by
+      dots: <code>header.payload.signature</code>. The header names the signing algorithm; the
+      payload carries claims (<code>sub</code> for subject/user ID, <code>exp</code> for expiry,
+      <code>iss</code> for issuer, <code>aud</code> for intended audience, plus whatever custom
+      claims your app needs); the signature is computed over the first two segments with a server
+      secret (HMAC, e.g. <code>HS256</code>) or private key (asymmetric, e.g. <code>RS256</code>),
+      and is what makes the token tamper-evident.
+    </p>
+    <p>
+      Note precisely what a JWT's signature guarantees and what it doesn't: it proves the payload
+      hasn't been altered since signing and that the signer possessed the key — it says nothing
+      about whether the token is still <em>meant</em> to be trusted right now. Every one of the
+      following is a real, repeated vulnerability class, not a hypothetical:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Bug</th><th>What goes wrong</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td><code>alg: none</code></td><td>Some libraries historically honored an unsigned token if the header said so — an attacker crafts a token with any claims they want and no signature at all</td><td>Explicitly reject <code>none</code>; better, use an allowlist of exactly one expected algorithm rather than trusting the header</td></tr>
+          <tr><td>Algorithm confusion (RS256 → HS256)</td><td>A verifier configured to "accept whatever <code>alg</code> the token claims" can be tricked into treating the server's <em>public</em> RSA key as an HMAC secret — since the public key is, well, public, the attacker can now forge valid-looking HS256 signatures</td><td>Pin the expected algorithm in code at verification time; never read it from the untrusted token itself</td></tr>
+          <tr><td>Missing expiry check</td><td>Library decodes the token and returns the claims without the caller ever checking <code>exp</code> — a stolen token from months ago is silently treated as current</td><td>Use a verification call that enforces <code>exp</code> (and <code>nbf</code>) by default, not a raw decode</td></tr>
+          <tr><td>Missing audience/issuer check</td><td>A token legitimately issued for <em>Service&nbsp;A</em> gets replayed against <em>Service&nbsp;B</em>, which also trusts the same signing key and never checks who the token was meant for</td><td>Verify <code>aud</code> matches this service and <code>iss</code> matches the expected issuer, every time</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>Nearly every JWT vulnerability above has the same root cause: trusting data the
+        <em>token itself</em> supplies (its claimed algorithm, its claimed audience) to decide how
+        to verify it, instead of anchoring verification to configuration the server controls. This
+        is the same lesson as SQL injection and command injection, just relocated — never let
+        untrusted input dictate how it gets validated.</p>
+      </div>
+    </div>
+
+    <h3>The revocation problem</h3>
+    <p>
+      A stateless token's whole value proposition — no server-side lookup needed — is exactly what
+      makes it impossible to revoke instantly. Once issued, a valid JWT stays valid until it
+      expires, no matter what happens to the account (password change, employee termination,
+      detected compromise) in between. There's no row to delete. Three practical mitigations, from
+      weakest to strongest guarantee (and correspondingly, least to most state you have to keep):
+    </p>
+    <ul>
+      <li><b>Keep access tokens short-lived</b> (5–15 minutes) and pair them with a longer-lived
+        <span class="term">refresh token</span> the client exchanges for a new access token. A
+        stolen access token is only useful for minutes; the blast radius shrinks to the refresh
+        token's exposure instead.</li>
+      <li><b>Refresh-token rotation with reuse detection</b>: each refresh issues a new refresh
+        token and invalidates the old one. If a refresh token is ever reused after rotation — a
+        strong signal it was stolen and both the attacker and the legitimate client are racing to
+        use it — revoke the whole token family, forcing re-login everywhere.</li>
+      <li><b>A server-side deny-list</b> keyed by the token's unique <code>jti</code> claim
+        (checked on every request, typically against Redis with a TTL matching the token's own
+        expiry so entries self-clean). This reintroduces the per-request lookup tokens were
+        supposed to avoid — a deliberate, narrow trade of some statelessness for the ability to
+        revoke immediately, reserved for genuinely sensitive actions.</li>
+    </ul>
+
+    <h2>OAuth2 and OIDC: delegated access, not just login</h2>
+    <p>
+      OAuth2 solves a narrower problem than "log a user in": letting a user grant a third-party
+      application limited access to their data on another service, <em>without handing over their
+      password</em>. Four roles appear in every flow:
+    </p>
+    <dl class="definition">
+      <dt>Resource owner</dt>
+      <dd>The user, who owns the data and grants (or denies) access.</dd>
+      <dt>Client</dt>
+      <dd>The application requesting access — your web app, wanting to read a user's calendar.</dd>
+      <dt>Authorization server</dt>
+      <dd>Issues tokens after authenticating the resource owner and recording their consent (e.g.
+        Google's or Auth0's login+consent screen).</dd>
+      <dt>Resource server</dt>
+      <dd>The API that actually holds the protected data and accepts the resulting access token.</dd>
+    </dl>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>OAuth2 is an <em>authorization</em> protocol — it proves a client holds a token scoped
+        to act on a user's behalf; it was never designed to prove <em>who the user is</em> to the
+        client. Using a raw OAuth2 access token as a login credential is a well-known
+        misuse pattern (an access token issued for an entirely different audience can sometimes
+        be replayed as if it were proof of identity). <span class="term">OpenID Connect
+        (OIDC)</span> is the actual fix: a thin identity layer on top of OAuth2 that adds a
+        purpose-built <code>id_token</code> (itself a JWT, with standardized identity claims like
+        <code>sub</code> and <code>email</code>) specifically meant to be consumed by the client as
+        a login assertion. If you're implementing "Sign in with X," you want OIDC, not raw
+        OAuth2.</p>
+      </div>
+    </div>
+
+    <p>
+      The dominant flow is the <span class="term">authorization code flow with PKCE</span>
+      (<b>P</b>roof <b>K</b>ey for <b>C</b>ode <b>E</b>xchange, pronounced "pixy") — walk through it
+      in the widget below. The short version: the client redirects the user to the authorization
+      server to log in and consent; the authorization server redirects back with a short-lived,
+      single-use <span class="term">authorization code</span> rather than a token directly; the
+      client then exchanges that code for the actual access token in a direct, back-channel
+      server-to-server call — a code intercepted in a browser redirect is useless on its own.
+    </p>
+
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip — what changed in OAuth 2.1</span>
+      <div class="callout-body">
+        <p>The 2.1 consolidation of OAuth2's accumulated best practices made several things that
+        used to be optional now mandatory, closing real, exploited attack surface: <b>PKCE is
+        required for every client</b>, not just mobile/SPA clients without a secret (it stops an
+        intercepted authorization code from being redeemed by anyone but the client that requested
+        it, via a one-time cryptographic challenge/verifier pair); the <b>implicit flow is removed
+        entirely</b> (it returned access tokens directly in a URL fragment — leakable via browser
+        history, referrer headers, and server logs); <b>refresh token rotation</b> is expected by
+        default; and redirect URIs must match <b>exactly</b>, not via prefix or pattern matching
+        (a loose match is an open redirect waiting to happen). If you're building or reviewing an
+        OAuth integration today, code flow + PKCE is the only flow you should reach for.</p>
+      </div>
+    </div>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — authorization code flow with PKCE, step by step</div>
+      <div class="flow-progress" id="flowProgress">Step 1 of 8</div>
+      <div class="flow-controls">
+        <button class="btn" id="flowNext" type="button">Next step →</button>
+        <button class="btn secondary" id="flowReset" type="button">Restart</button>
+      </div>
+      <div class="flow-track" id="flowTrack"></div>
+      <div class="flow-detail" id="flowDetail"></div>
+    </div>
+
+    <h2>API keys: the service-to-service default</h2>
+    <p>
+      Not every caller is a human sitting through a consent screen. Server-to-server integrations
+      (a payment webhook, a partner's batch job, an internal service calling another internal
+      service) most often authenticate with a simple <span class="term">API key</span> — a long,
+      random, opaque secret sent in a header (<code>Authorization: Bearer sk_live_...</code> or a
+      custom header). Simpler than OAuth because there's no user and no consent step, but the
+      simplicity shifts every safety property onto how you handle the secret:
+    </p>
+    <ul>
+      <li><b>Never in code or version control</b> — inject via environment variables or a secrets
+        manager (Vault, AWS Secrets Manager), not a config file committed to the repo.</li>
+      <li><b>Scope keys narrowly</b> — a read-only reporting integration should hold a key that
+        <em>cannot</em> write, even if nothing in your current code path would misuse that
+        power. Least privilege limits the blast radius of a leaked key to what it can actually do.</li>
+      <li><b>Make rotation routine, not an incident-response scramble</b> — support multiple active
+        keys per client so a scheduled rotation never causes downtime, and revoking a compromised
+        key is an operational button-press, not a fire drill.</li>
+    </ul>
+
+    <h2>Access models: RBAC vs. ABAC</h2>
+    <p>
+      Once identity is settled, authorization still needs a model for deciding what's allowed.
+      Two dominant approaches, and most real systems end up blending them:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Role-Based (RBAC)</th><th>Attribute-Based (ABAC)</th></tr></thead>
+        <tbody>
+          <tr><td>Model</td><td>Users are assigned roles (<code>admin</code>, <code>editor</code>, <code>viewer</code>); roles are assigned permissions</td><td>Rules evaluate attributes of the user, resource, action, and context (<code>user.department == resource.department AND time.hour BETWEEN 9 AND 17</code>)</td></tr>
+          <tr><td>Strength</td><td>Simple to reason about, audit, and explain; fast to check (look up the role's permission set)</td><td>Expresses fine-grained, contextual policy RBAC can't — "your own records only," "only during business hours," "only from a corporate network"</td></tr>
+          <tr><td>Weakness</td><td>"Role explosion" — real-world nuance (your own records vs. everyone's) forces ever-more-specific roles until the role list becomes unmanageable</td><td>Harder to audit ("what can this user actually do" requires evaluating rules, not reading a list); easier to introduce a subtle policy bug</td></tr>
+          <tr><td>Reach for it when</td><td>Permissions map cleanly onto a small set of job functions</td><td>Access genuinely depends on relationships or context, not just who the user is</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      In practice, most production systems layer both: coarse RBAC roles for broad capability
+      ("can this user access the admin panel at all") plus a narrower, per-resource ownership or
+      attribute check for anything sensitive ("is this <em>specific</em> order this
+      <em>specific</em> user's to view") — which is exactly the object-level check from the
+      broken-authorization pitfall earlier on this page.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>An inference endpoint has the same two questions as any other backend: who's calling
+        (a user's mobile app? another internal service? a batch scoring job?), and what are they
+        allowed to do (call this specific model? see raw feature values, or only the prediction?).
+        Service-to-service calls into a feature store or model server are exactly the API-key /
+        short-lived-token pattern above — often layered with mTLS between services in a mesh, so
+        even a leaked bearer token is useless without the matching client certificate. Where teams
+        actually get burned is authorization granularity that hasn't caught up to what the model
+        exposes: an endpoint that correctly authenticates the calling service but then returns
+        <em>every</em> feature it computed (including ones scoped to a different tenant or a
+        different privacy tier) is broken object-level authorization wearing an ML costume — the
+        fix is the same one: check what this specific caller is entitled to see, every time,
+        not just that the caller is <em>someone</em> the system recognizes.</p>
+      </div>
+    </div>
+
+    <p>
+      The widget below is a JWT flaw-spotter: pick a token, guess how many validation issues it's
+      hiding, then see what a careful verifier would catch.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — JWT flaw spotter</div>
+      <div class="jwt-controls">
+        <select id="jwtSelect" aria-label="Choose a token scenario"></select>
+        <button class="btn secondary" id="jwtReset" type="button">Reset</button>
+      </div>
+      <div class="jwt-token" id="jwtToken"></div>
+      <p class="mono muted" style="margin-top:-0.5rem">How many validation issues does a careful verifier catch here?</p>
+      <div class="guess-row" id="jwtGuessRow"></div>
+      <div class="jwt-result" id="jwtResult" hidden>
+        <div class="jwt-verdict" id="jwtVerdict"></div>
+        <ul class="issue-list" id="jwtIssueList"></ul>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A server verifies a JWT by reading the <code>alg</code> field from
+          the token header and using whatever algorithm it names to check the signature. Why is
+          this dangerous?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It isn't — the signature check will fail anyway if the token was tampered with.</button>
+          <button class="quiz-option" data-choice="b">An attacker controls the header, so they can claim <code>alg: none</code> for no signature at all, or trick an RS256 verifier into treating the public key as an HMAC secret for a forged HS256 signature.</button>
+          <button class="quiz-option" data-choice="c">It's dangerous only if the token is transmitted over plain HTTP instead of HTTPS.</button>
+        </div>
+        <p class="quiz-explain" hidden>The token's header is attacker-controlled input — trusting it to decide how the token gets verified hands the attacker the choice of "no verification, please." Correct verification pins the expected algorithm in server-side configuration and ignores what the token claims about itself.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. Why can't a stolen, still-valid JWT access token be revoked the way a
+          server-side session can (just delete a row)?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">A JWT is self-contained and stateless by design — there's no server-side record of it to delete; the token itself is the proof of authorization until it naturally expires.</button>
+          <button class="quiz-option" data-choice="b">JWTs can't be revoked because they're encrypted and the server has lost the key.</button>
+          <button class="quiz-option" data-choice="c">JWTs actually can be revoked exactly like sessions; this is a common misconception.</button>
+        </div>
+        <p class="quiz-explain" hidden>Statelessness is the whole point of a JWT — any server holding the verification key can accept it with no lookup. That same property means there's nothing to delete when you want to revoke it early; you can only mitigate with short expiries, refresh-token rotation with reuse detection, or a deliberate deny-list that reintroduces a lookup.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">3. A user is fully authenticated (valid session, valid token) and
+          requests <code>GET /invoices/9931</code>, which happens to belong to a different
+          customer. The endpoint returns it anyway because it only checked that the token was
+          valid. What's the category of bug?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">An authentication bug — the token shouldn't have been considered valid.</button>
+          <button class="quiz-option" data-choice="b">Not a bug — if the request is authenticated, returning the resource is correct behavior.</button>
+          <button class="quiz-option" data-choice="c">A broken object-level authorization bug (IDOR) — authentication succeeded correctly, but the authorization check that should verify this specific user owns this specific resource never ran.</button>
+        </div>
+        <p class="quiz-explain" hidden>Authentication and authorization are independent checks, and this endpoint only performed the first one. A valid identity was confirmed, but nothing then asked "does this identity have the right to invoice 9931 specifically" — the exact failure mode the AuthN-vs-AuthZ split at the top of this page warns about.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      This page covered getting identity and access decisions right by design. The next deep-dive,
+      <em>Backend Security &amp; the OWASP Top&nbsp;10</em>, covers what happens when those
+      decisions go wrong in practice — injection, the broken-access-control failure mode
+      previewed above, secrets management, and the rest of the threat model every production
+      service needs to defend against.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------- OAuth2 / PKCE flow stepper ---------------- */
+
+      var FLOW_STEPS = [
+        {
+          node: "Client", step: "1 / 8",
+          title: "1. Client generates a PKCE pair",
+          body: "Before redirecting anywhere, the client generates a random <b>code_verifier</b> (a long random string, kept secret, never sent yet) and derives a <b>code_challenge</b> from it (a SHA-256 hash, base64url-encoded). This happens locally, in the client — nothing has touched the network.",
+          code: "code_verifier = base64url(random(32 bytes))\ncode_challenge = base64url(SHA256(code_verifier))"
+        },
+        {
+          node: "Client", step: "2 / 8",
+          title: "2. Client redirects the user to the authorization server",
+          body: "The browser is redirected to the authorization server's <code>/authorize</code> endpoint with the client ID, requested scopes, a random <code>state</code> value (CSRF protection for this redirect), and the <code>code_challenge</code> — <b>not</b> the verifier.",
+          code: "GET /authorize?\n  response_type=code&\n  client_id=web-app-1&\n  redirect_uri=https://app.example.com/callback&\n  scope=calendar.read&\n  state=af0ifjsldkj&\n  code_challenge=E9Melhoa2...&\n  code_challenge_method=S256"
+        },
+        {
+          node: "Auth Server", step: "3 / 8",
+          title: "3. User authenticates and consents",
+          body: "The authorization server shows its own login page (the client never sees the user's password — this is the entire point) and a consent screen: \"web-app-1 wants to read your calendar. Allow?\""
+        },
+        {
+          node: "Auth Server", step: "4 / 8",
+          title: "4. Authorization server redirects back with a code",
+          body: "On approval, the browser is redirected to the client's <code>redirect_uri</code> with a short-lived, single-use <b>authorization code</b> and the same <code>state</code> value, which the client verifies matches step 2 to rule out CSRF.",
+          code: "GET https://app.example.com/callback?\n  code=SplxlOBeZQQYbYS6WxSbIA&\n  state=af0ifjsldkj"
+        },
+        {
+          node: "Client", step: "5 / 8",
+          title: "5. Client exchanges the code for tokens — back channel",
+          body: "The client's <b>server</b> (not the browser) calls the token endpoint directly, presenting the code alongside the original <code>code_verifier</code>. This is a direct server-to-server HTTPS call, invisible to anything that could have intercepted the browser redirect in step 4.",
+          code: "POST /token\n  grant_type=authorization_code&\n  code=SplxlOBeZQQYbYS6WxSbIA&\n  redirect_uri=https://app.example.com/callback&\n  client_id=web-app-1&\n  code_verifier=dBjftJeZ4CVP..."
+        },
+        {
+          node: "Auth Server", step: "6 / 8",
+          title: "6. Authorization server verifies the PKCE pair and issues tokens",
+          body: "The server hashes the received <code>code_verifier</code> and checks it matches the <code>code_challenge</code> from step 2. <b>This is what PKCE actually buys you</b>: even if an attacker intercepted the authorization code in step 4's redirect, they can't complete this exchange without the verifier, which never left the original client. Only then are tokens issued.",
+          code: "200 OK\n{\n  \"access_token\": \"eyJhbGciOi...\",\n  \"refresh_token\": \"8xLOxBtZp8...\",\n  \"expires_in\": 900,\n  \"token_type\": \"Bearer\"\n}"
+        },
+        {
+          node: "Client", step: "7 / 8",
+          title: "7. Client calls the resource server with the access token",
+          body: "Every subsequent API call carries the access token as a bearer credential. The resource server verifies the signature, checks <code>exp</code>/<code>aud</code>/<code>iss</code>, and — separately — checks that the token's scopes actually cover this specific action.",
+          code: "GET /v1/calendar/events\nAuthorization: Bearer eyJhbGciOi..."
+        },
+        {
+          node: "Client", step: "8 / 8",
+          title: "8. Access token expires — refresh, don't re-login",
+          body: "15 minutes later the access token expires. Rather than sending the user through the whole flow again, the client silently exchanges its refresh token for a new access token (and, under rotation, a new refresh token too) at the token endpoint — invisible to the user."
+        }
+      ];
+
+      var flowTrack = document.getElementById("flowTrack");
+      var flowDetail = document.getElementById("flowDetail");
+      var flowProgress = document.getElementById("flowProgress");
+      var flowNext = document.getElementById("flowNext");
+      var flowReset = document.getElementById("flowReset");
+      var flowIdx = 0;
+
+      function renderFlowTrack() {
+        flowTrack.innerHTML = "";
+        FLOW_STEPS.forEach(function (s, i) {
+          if (i > 0) {
+            var arrow = document.createElement("span");
+            arrow.className = "flow-arrow";
+            arrow.textContent = "→";
+            flowTrack.appendChild(arrow);
+          }
+          var node = document.createElement("button");
+          node.type = "button";
+          node.className = "flow-node";
+          node.innerHTML = '<span class="fn-step">' + s.step + '</span><span class="fn-name">' + s.node + '</span>';
+          node.addEventListener("click", function () { showFlowStep(i); });
+          flowTrack.appendChild(node);
+        });
+      }
+
+      function showFlowStep(i) {
+        flowIdx = i;
+        Array.prototype.forEach.call(flowTrack.querySelectorAll(".flow-node"), function (n, idx) {
+          n.classList.toggle("active", idx === i);
+          n.classList.toggle("done", idx < i);
+        });
+        var s = FLOW_STEPS[i];
+        flowProgress.textContent = "Step " + (i + 1) + " of " + FLOW_STEPS.length;
+        flowDetail.innerHTML = "<b>" + s.title + "</b><br>" + s.body + (s.code ? "<pre><code>" + s.code + "</code></pre>" : "");
+        flowNext.disabled = i === FLOW_STEPS.length - 1;
+        flowNext.textContent = i === FLOW_STEPS.length - 1 ? "Flow complete" : "Next step →";
+      }
+
+      flowNext.addEventListener("click", function () {
+        if (flowIdx < FLOW_STEPS.length - 1) showFlowStep(flowIdx + 1);
+      });
+      flowReset.addEventListener("click", function () { showFlowStep(0); });
+
+      renderFlowTrack();
+      showFlowStep(0);
+
+      /* ---------------- JWT flaw spotter ---------------- */
+
+      var JWT_SCENARIOS = [
+        {
+          id: "clean",
+          title: "1. A carefully verified token",
+          header: '{"alg":"RS256","typ":"JWT"}',
+          payload: '{"sub":"user_42","aud":"api.example.com","iss":"auth.example.com","exp":1780003200}',
+          sig: "MEUCIQDx8...(RSA signature, verified against a pinned public key)",
+          issues: []
+        },
+        {
+          id: "alg-none",
+          title: "2. Password reset token",
+          header: '{"alg":"none","typ":"JWT"}',
+          payload: '{"sub":"user_1","role":"admin","exp":1798003200}',
+          sig: "(empty — no signature present)",
+          issues: [
+            { title: "alg: none accepted", body: "The header claims no signature was used, and a verifier that honors this treats the payload — including the self-granted role: \"admin\" claim — as trusted with zero cryptographic proof behind it. Any client can forge this token by hand." }
+          ]
+        },
+        {
+          id: "alg-confusion",
+          title: "3. Service-to-service call",
+          header: '{"alg":"HS256","typ":"JWT"}',
+          payload: '{"sub":"svc_billing","aud":"internal-api","exp":1780003200}',
+          sig: "(HMAC computed using the server's RSA *public* key as the HMAC secret)",
+          issues: [
+            { title: "Algorithm confusion (RS256 → HS256)", body: "This server normally issues and expects RS256 tokens, verified with its public key. A verifier that reads alg from the header and blindly switches to HMAC verification can be fed a token \"signed\" with that same public key as an HMAC secret — since the public key is, by definition, not secret, anyone can compute this signature." }
+          ]
+        },
+        {
+          id: "no-exp-check",
+          title: "4. Six-month-old session token",
+          header: '{"alg":"RS256","typ":"JWT"}',
+          payload: '{"sub":"user_88","aud":"api.example.com","exp":1751328000}',
+          sig: "MEUCIQDx8...(valid RSA signature)",
+          issues: [
+            { title: "Expiry not enforced", body: "The signature genuinely verifies — the token really was issued by this server — but exp is six months in the past and the verifying code never checked it, just decoded the payload and trusted the claims. A signature proves authenticity, not currency; both need checking." }
+          ]
+        },
+        {
+          id: "wrong-audience",
+          title: "5. Token replayed against a different service",
+          header: '{"alg":"RS256","typ":"JWT"}',
+          payload: '{"sub":"user_5","aud":"partner-webhook-service","iss":"auth.example.com","exp":1780003200}',
+          sig: "MEUCIQDx8...(valid RSA signature)",
+          issues: [
+            { title: "Audience not enforced", body: "This token was legitimately issued, but explicitly scoped (aud) for partner-webhook-service — not the internal-orders-api it's being presented to here. Both services trust the same signing key, so the signature checks out; only an explicit audience check catches that this token was never meant for this service." }
+          ]
+        },
+        {
+          id: "double-bug",
+          title: "6. Legacy internal token",
+          header: '{"alg":"HS256","typ":"JWT"}',
+          payload: '{"sub":"svc_reports","exp":1751328000}',
+          sig: "(HMAC using the RSA public key as secret — algorithm confusion)",
+          issues: [
+            { title: "Algorithm confusion (RS256 → HS256)", body: "Same forgery as scenario 3 — a public key used as an HMAC secret produces a signature anyone can compute." },
+            { title: "Expiry not enforced", body: "exp is also long past; even a correctly-verified signature on this token shouldn't be trusted as current." },
+            { title: "No audience claim at all", body: "There's no aud claim to check in the first place, so this token — even if it were freshly issued — could be replayed against any service that trusts the same signing key." }
+          ]
+        }
+      ];
+
+      var jwtSelect = document.getElementById("jwtSelect");
+      var jwtToken = document.getElementById("jwtToken");
+      var jwtGuessRow = document.getElementById("jwtGuessRow");
+      var jwtResult = document.getElementById("jwtResult");
+      var jwtVerdict = document.getElementById("jwtVerdict");
+      var jwtIssueList = document.getElementById("jwtIssueList");
+      var jwtReset = document.getElementById("jwtReset");
+
+      var jwtCurrent = null;
+      var jwtGuessed = null;
+
+      function b64(str) {
+        try { return btoa(str).replace(/=+$/, ""); } catch (e) { return str; }
+      }
+
+      function populateJwtSelect() {
+        JWT_SCENARIOS.forEach(function (s, i) {
+          var opt = document.createElement("option");
+          opt.value = i;
+          opt.textContent = s.title;
+          jwtSelect.appendChild(opt);
+        });
+      }
+
+      function renderJwtGuessRow() {
+        jwtGuessRow.innerHTML = "";
+        [0, 1, 2, 3].forEach(function (n) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "guess-btn";
+          b.textContent = n === 3 ? "3+" : String(n);
+          b.dataset.n = n;
+          b.addEventListener("click", function () { onJwtGuess(n, b); });
+          jwtGuessRow.appendChild(b);
+        });
+      }
+
+      function loadJwtScenario(idx) {
+        jwtCurrent = JWT_SCENARIOS[idx];
+        jwtGuessed = null;
+        jwtToken.innerHTML =
+          '<span class="seg-header">' + b64(jwtCurrent.header) + '</span>' +
+          '<span class="seg-dot">.</span>' +
+          '<span class="seg-payload">' + b64(jwtCurrent.payload) + '</span>' +
+          '<span class="seg-dot">.</span>' +
+          '<span class="seg-sig">' + jwtCurrent.sig + '</span>';
+        jwtResult.hidden = true;
+        renderJwtGuessRow();
+      }
+
+      function onJwtGuess(n, btn) {
+        if (jwtGuessed !== null) return;
+        jwtGuessed = n;
+        Array.prototype.forEach.call(jwtGuessRow.children, function (c) { c.disabled = true; });
+        btn.classList.add("chosen");
+        revealJwtIssues();
+      }
+
+      function revealJwtIssues() {
+        var actual = jwtCurrent.issues.length;
+        var hit = jwtGuessed === actual || (jwtGuessed === 3 && actual >= 3);
+        jwtVerdict.className = "jwt-verdict " + (hit ? "hit" : "miss");
+        if (actual === 0) {
+          jwtVerdict.textContent = hit ?
+            "Correct — this token checks out. Valid signature, unexpired, correct audience and issuer." :
+            "Actually 0 issues — this token checks out under careful verification. Read why below.";
+        } else {
+          jwtVerdict.textContent = hit ?
+            ("Good catch — careful verification also found " + actual + (actual === 1 ? " issue." : " issues.")) :
+            ("Careful verification found " + actual + (actual === 1 ? " issue." : " issues.") + " Read through them below.");
+        }
+
+        jwtIssueList.innerHTML = "";
+        if (actual === 0) {
+          var li0 = document.createElement("li");
+          li0.className = "issue-item safe";
+          li0.innerHTML = '<span class="issue-icon">✓</span><div><div class="issue-title">No issues found</div><p>RS256 signature verifies against the pinned public key, exp is in the future, and aud/iss both match what this service expects. This is what "done right" looks like.</p></div>';
+          jwtIssueList.appendChild(li0);
+        } else {
+          jwtCurrent.issues.forEach(function (issue) {
+            var li = document.createElement("li");
+            li.className = "issue-item";
+            li.innerHTML =
+              '<span class="issue-icon">!</span>' +
+              '<div><div class="issue-title">' + issue.title + '</div>' +
+              '<p>' + issue.body + '</p></div>';
+            jwtIssueList.appendChild(li);
+          });
+        }
+        jwtResult.hidden = false;
+      }
+
+      jwtSelect.addEventListener("change", function () { loadJwtScenario(parseInt(jwtSelect.value, 10)); });
+      jwtReset.addEventListener("click", function () { loadJwtScenario(parseInt(jwtSelect.value, 10)); });
+
+      populateJwtSelect();
+      loadJwtScenario(0);
+
+      /* ---------------- Quiz interactivity ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

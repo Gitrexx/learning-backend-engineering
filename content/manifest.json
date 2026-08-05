@@ -220,7 +220,7 @@
       "summary": "AuthN vs AuthZ, password hashing, sessions vs JWT, OAuth2/OIDC, and RBAC vs ABAC.",
       "prerequisites": ["rest-api-design"],
       "file": "auth-and-access.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "backend-security",
