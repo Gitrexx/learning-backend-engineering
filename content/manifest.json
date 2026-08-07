@@ -240,7 +240,7 @@
       "summary": "The testing pyramid, unit vs integration vs contract vs e2e, test doubles, and CI gates.",
       "prerequisites": ["rest-api-design"],
       "file": "testing-backend.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "system-design-method",

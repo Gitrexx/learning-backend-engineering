@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Testing Backend Systems — Backend Engineering</title>
+  <link rel="stylesheet" href="../assets/theme.css" />
+  <style>
+    /* Page-local CSS: wiring for the "place the test" scenario widget only. */
+    .pt-progress { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-faint); margin-bottom: var(--sp-2); }
+    .pt-score { float: right; color: var(--text-muted); }
+    .pt-scenario {
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4); font-size: var(--fs-base);
+    }
+    .pt-scenario b { color: var(--text); }
+    .pt-choices { display: grid; gap: var(--sp-3); grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: var(--sp-4); }
+    .pt-choice {
+      font: inherit; font-weight: 600; font-size: var(--fs-sm);
+      padding: var(--sp-3) var(--sp-3); border-radius: var(--radius); border: 1px solid var(--border-strong);
+      background: var(--surface); color: var(--text); cursor: pointer; text-align: center;
+      transition: border-color .15s, background .15s, transform .05s;
+    }
+    .pt-choice:hover { border-color: var(--accent); }
+    .pt-choice:active { transform: translateY(1px); }
+    .pt-choice.chosen-correct { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    .pt-choice.chosen-wrong { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+    .pt-choice.reveal-correct { border-color: var(--ok); }
+    .pt-choice:disabled { cursor: default; }
+    .pt-feedback[hidden] { display: none; }
+    .pt-feedback {
+      padding: var(--sp-4); border-radius: var(--radius); margin-bottom: var(--sp-4);
+      background: var(--surface); border: 1px solid var(--border); font-size: var(--fs-sm);
+    }
+    .pt-feedback.hit { border-left: 4px solid var(--ok); }
+    .pt-feedback.miss { border-left: 4px solid var(--warn); }
+    .pt-feedback .pt-verdict { font-weight: 700; margin-bottom: 0.4em; color: var(--text); }
+    .pt-controls { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+    .pt-done { text-align: center; padding: var(--sp-5); }
+    .pt-done .pt-final-score { font-size: var(--fs-xl); font-weight: 700; color: var(--accent-strong); margin-bottom: var(--sp-2); }
+  </style>
+</head>
+<body>
+  <main class="deepdive">
+    <p class="eyebrow">Security &amp; Quality // 03</p>
+    <h1>Testing Backend Systems</h1>
+
+    <p>
+      <em>Backend Security &amp; the OWASP Top&nbsp;10</em> was about not shipping the wrong thing.
+      This page is about the machinery that lets you ship <em>anything</em>, fast, without finding
+      out it was wrong from a paging alert. Every production-readiness property you've studied so
+      far — correct isolation levels, idempotent retries, safe rollouts — is a claim about behavior
+      under conditions you can't fully observe by reading the code. Tests are how you make that
+      claim checkable by a machine, on every commit, before a human ever has to find out the hard
+      way. A team with no tests can still ship fast for a while; a team with the <em>wrong shape</em>
+      of tests ships slow and still gets paged, because their test suite is expensive to run and
+      still doesn't catch the bugs that matter. Testing strategy — what to test, at which layer,
+      with which kind of double — is a design decision with real trade-offs, not a checkbox.
+    </p>
+
+    <h2>The testing pyramid</h2>
+    <p>
+      The pyramid is a shape, not a rulebook: <span class="term">many</span> fast, isolated tests at
+      the bottom, <span class="term">fewer</span>, slower, more-integrated tests as you go up, and a
+      <span class="term">small number</span> of full end-to-end tests at the top. The shape exists
+      because speed and confidence trade off in opposite directions at each layer, and a healthy
+      suite needs both: fast feedback on every keystroke, and real confidence before a release.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>Exercises</th><th>Speed</th><th>What it catches</th><th>What it can't catch</th></tr></thead>
+        <tbody>
+          <tr><td><b>Unit</b></td><td>One function/class, in isolation, no I/O</td><td>Milliseconds; thousands run per second</td><td>Logic bugs, edge cases, off-by-ones — cheaply, exhaustively</td><td>Whether the pieces actually fit together, or whether a real dependency behaves as assumed</td></tr>
+          <tr><td><b>Integration</b></td><td>Your code against a real (or realistic) dependency — a database, a message broker, a filesystem</td><td>Seconds per test; a real process is involved</td><td>Wrong assumptions about how a dependency actually behaves (a DB constraint, a serialization format, a query's real result set)</td><td>Whether the dependency's <em>current API version</em> still matches what you both expect</td></tr>
+          <tr><td><b>Contract</b></td><td>The request/response shape between your service and one it calls (or is called by)</td><td>Seconds; no full environment needed</td><td>Breaking API changes between independently-deployed services, before either side deploys</td><td>Whether the two services' <em>business logic</em> agrees — only the shape of the conversation</td></tr>
+          <tr><td><b>End-to-end (E2E)</b></td><td>A full user journey across the whole running system</td><td>Tens of seconds to minutes; slow and comparatively brittle</td><td>Whether a real critical path — the thing users and revenue depend on — actually works, wired together for real</td><td>Root cause on failure (a broken checkout could be the cart, payment, email, or DNS) and edge-case coverage (too slow/expensive to run exhaustively)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">Insight</span>
+      <div class="callout-body">
+        <p>The pyramid's shape is really a statement about where a bug is <em>cheapest to catch</em>.
+        A pricing-logic bug caught by a unit test costs a developer 200&nbsp;ms of feedback loop. The
+        same bug, if the only test covering it is a full checkout E2E test, costs minutes of CI time
+        to even discover, and probably more minutes debugging which of five wired-together services
+        is actually at fault. Pushing coverage as far down the pyramid as the bug's <em>nature</em>
+        allows isn't a purity rule — it's the fastest, cheapest place to catch that particular class
+        of mistake.</p>
+      </div>
+    </div>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — the ice-cream-cone anti-pattern</span>
+      <div class="callout-body">
+        <p>Invert the pyramid — a handful of unit tests, some integration tests, and the bulk of
+        coverage sitting in slow, brittle, end-to-end (often manual or Selenium-style) tests — and
+        you get the <span class="term">ice-cream cone</span>: wide at the top, narrow at the bottom.
+        It's a common organic outcome, not a deliberate choice: E2E tests feel like they cover "the
+        real thing," so teams under deadline pressure keep adding more of them instead of writing
+        cheaper, more targeted tests lower down. The result is a suite that takes an hour to run,
+        fails intermittently for reasons unrelated to the change under test, and tells you
+        <em>that</em> something broke without telling you <em>what</em> — the opposite of what a
+        test suite is for.</p>
+      </div>
+    </div>
+
+    <h2>Test doubles: precise vocabulary</h2>
+    <p>
+      "Mock" gets used loosely for anything fake, but the five kinds of <span class="term">test
+      double</span> (Gerard Meszaros's taxonomy, still the industry vocabulary) mean genuinely
+      different things, and picking the wrong one is how tests end up brittle or worthless:
+    </p>
+
+    <dl class="definition">
+      <dt>Dummy</dt>
+      <dd>An object passed around to satisfy a parameter list but never actually used by the code
+        path under test — e.g. a placeholder logger a constructor requires but this test never
+        triggers a log call for.</dd>
+      <dt>Stub</dt>
+      <dd>Provides canned, hardcoded answers to calls made during the test, with no real logic
+        behind them — a payment client stub that always returns <code>{status: "approved"}"</code>
+        regardless of input, so you can test the code that reacts to approval.</dd>
+      <dt>Fake</dt>
+      <dd>A genuinely working, simplified implementation — an in-memory hash map standing in for a
+        database repository. It has real behavior (insert then get actually round-trips data) but
+        isn't fit for production (no persistence, no real query semantics).</dd>
+      <dt>Mock</dt>
+      <dd>Pre-programmed with <em>expectations</em> about which calls it should receive, and the
+        test fails if those expected interactions didn't happen — verifying <em>behavior</em>
+        (was this method called, with these arguments) rather than the resulting state.</dd>
+      <dt>Spy</dt>
+      <dd>Wraps a real or fake implementation and records how it was called, for inspection
+        <em>after</em> the fact — similar to a mock, but the assertion is made afterward instead of
+        pre-programmed as an expectation.</dd>
+    </dl>
+
+    <div class="callout pitfall">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Pitfall — over-mocking</span>
+      <div class="callout-body">
+        <p>Mocks verify <em>how</em> code did its job; most tests should verify <em>what</em> job it
+        did — the observable output or resulting state, not the sequence of internal calls that
+        produced it. A test that mocks a private helper method and asserts it was called with
+        specific arguments is coupled to the current implementation, not the behavior a caller
+        actually depends on: refactor the internals (even correctly, with identical output) and the
+        test breaks anyway, training the team to see red test runs as noise rather than signal. The
+        rule of thumb: mock things <em>at the boundary of your system</em> (the payment gateway you
+        don't own, the flaky third-party API) where you genuinely can't or shouldn't invoke the real
+        thing — and assert on outcomes, not on internal call sequences, for logic you own.</p>
+      </div>
+    </div>
+
+    <h2>Testing against real dependencies</h2>
+    <p>
+      A fake in-memory repository is fast, but it only behaves the way <em>you</em> assumed a
+      database behaves — and production databases have opinions of their own. A unique constraint
+      that treats two <code>NULL</code>s as distinct (or doesn't), a transaction isolation anomaly
+      from <em>Transactions, ACID &amp; Isolation Levels</em>, a query that's correct SQL but returns
+      rows in an order your code silently depended on — none of these show up against a hand-rolled
+      fake, because the fake was written by the same assumptions the production code makes.
+    </p>
+    <p>
+      <span class="term">Testcontainers</span> (and similar tooling) closes that gap by spinning up
+      the <em>real</em> dependency — an actual Postgres, Kafka, or Redis — in a throwaway Docker
+      container for the duration of an integration test, then tearing it down. You get real
+      engine-specific behavior with none of the pain of a shared, stateful test environment that
+      other test runs (or other engineers) can corrupt.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>In-memory fake</th><th>Real dependency (Testcontainers)</th></tr></thead>
+        <tbody>
+          <tr><td>Speed</td><td>Microseconds — no process boundary</td><td>Hundreds of ms to a few seconds to boot the container</td></tr>
+          <tr><td>Fidelity</td><td>Only as correct as whoever wrote the fake</td><td>Exactly the engine you run in production</td></tr>
+          <tr><td>CI requirements</td><td>None</td><td>Docker (or equivalent) available in the CI runner</td></tr>
+          <tr><td>Best for</td><td>High-volume, logic-heavy unit tests where the dependency's exact semantics don't matter</td><td>The smaller set of tests where a real constraint, real query plan, or real transaction behavior is exactly what's being verified</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Contract testing across services</h2>
+    <p>
+      Once a system is split into independently-deployed services — the world of
+      <em>Messaging, Queues &amp; Event-Driven Architecture</em> and everything downstream of it —
+      "does my code work" stops being answerable in isolation. Your order service can be perfectly
+      correct and still break in production the moment the payment service's team renames a field.
+      Standing up the entire payment service (and everything <em>it</em> depends on) just to test
+      against it is the E2E trap: slow, whoever owns the environment becomes a bottleneck, and a
+      failure two services away still shows up as "checkout is broken" with no clue why.
+    </p>
+    <p>
+      <span class="term">Consumer-driven contract testing</span> (the pattern popularized by
+      <b>Pact</b>) solves this without a shared environment. The consumer team writes an expectation
+      — "when I call <code>POST /charge</code> with this shape, I expect a response shaped like
+      this" — against a mock of the provider, and that expectation is published as a
+      <span class="term">contract</span>. The provider's own CI pipeline then replays every
+      published contract against its <em>real</em> implementation and fails the build if it no
+      longer satisfies a contract some consumer depends on. Neither side needs the other's full
+      stack running; both sides find out about a breaking change before either one deploys it.
+    </p>
+
+    <div class="callout tip">
+      <span class="callout-icon">✓</span>
+      <span class="callout-title">Tip</span>
+      <div class="callout-body">
+        <p>Contract tests are not a substitute for integration or E2E tests — they verify the
+        <em>shape</em> of a conversation, not that the business logic on either end is correct. A
+        provider can satisfy a contract perfectly (right fields, right types) while still computing
+        the wrong charge amount. Think of a contract test as a very cheap, very fast tripwire for
+        the specific failure mode of independently-deployed services drifting apart — it earns its
+        keep by catching that one thing constantly, not by replacing the rest of the pyramid.</p>
+      </div>
+    </div>
+
+    <h2>Place the test</h2>
+    <p>
+      Five short scenarios, each with a code change or testing decision. Pick the layer of the
+      pyramid you'd reach for first, and see the reasoning.
+    </p>
+
+    <div class="widget">
+      <div class="widget-label">Interactive — place the test</div>
+      <div class="pt-progress" id="ptProgress">Scenario 1 of 5 <span class="pt-score" id="ptScore">Score: 0 / 0</span></div>
+      <div class="pt-scenario" id="ptScenario"></div>
+      <div class="pt-choices" id="ptChoices"></div>
+      <div class="pt-feedback" id="ptFeedback" hidden>
+        <div class="pt-verdict" id="ptVerdict"></div>
+        <div id="ptExplain"></div>
+      </div>
+      <div class="pt-controls">
+        <button class="btn" id="ptNext" type="button" hidden>Next scenario →</button>
+        <button class="btn secondary" id="ptRestart" type="button" hidden>Restart</button>
+      </div>
+    </div>
+
+    <h2>Flakiness: the trust killer</h2>
+    <p>
+      A test suite only works as a safety net if a red run reliably means something is broken. A
+      <span class="term">flaky test</span> — one that sometimes passes and sometimes fails against
+      the exact same code — destroys that guarantee: engineers learn to re-run failures instead of
+      investigating them, and eventually stop trusting red at all, at which point the suite is
+      providing negative value (false confidence plus wasted CI minutes).
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Cause</th><th>Why it flakes</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td>Shared mutable state</td><td>Two tests touch the same global, DB row, or singleton and run order changes the outcome</td><td>Isolate state per test — a fresh fixture, transaction rollback, or container per run</td></tr>
+          <tr><td>Real wall-clock time</td><td>A test computes an expiry with <code>now()</code> and occasionally crosses a boundary mid-run</td><td>Inject a controllable clock/fake timer instead of reading real time</td></tr>
+          <tr><td>Unpinned randomness</td><td>A random seed occasionally produces an edge-case input the test didn't account for</td><td>Fix the seed in tests; treat any resulting failure as a real bug, not noise</td></tr>
+          <tr><td>Real network calls</td><td>An external dependency is slow, rate-limited, or briefly down</td><td>Stub the boundary in anything below E2E; reserve real calls for a deliberately small integration/E2E set</td></tr>
+          <tr><td>Missing async waits</td><td>A test asserts before an async operation (a queued job, a debounced UI update) has actually finished</td><td>Wait on the actual condition/event, never a fixed <code>sleep()</code> — a sleep that's "usually enough" is a flake generator</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout caution">
+      <span class="callout-icon">!</span>
+      <span class="callout-title">Caution</span>
+      <div class="callout-body">
+        <p>The tempting quick fix — retry a failing test a few times and only fail the build if all
+        retries fail — treats the symptom and buries the disease. It keeps CI green while the
+        underlying nondeterminism (a real race condition, sometimes) stays in the code, silently.
+        Quarantine a known-flaky test out of the required gate <em>with a tracked ticket to fix it</em>
+        if you must unblock a pipeline, but blanket retry-until-green policies are how a suite
+        quietly stops meaning anything.</p>
+      </div>
+    </div>
+
+    <h2>CI gates: mapping the pyramid to the pipeline</h2>
+    <p>
+      A production CI/CD pipeline (from <em>Deployment, CI/CD &amp; Release Strategies</em>) should
+      run cheap, high-signal tests first and gate expensive ones behind them — there's no point
+      spinning up a Testcontainers Postgres for an integration suite against code that a five-second
+      unit-test run would already have rejected.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Stage</th><th>Runs</th><th>When</th><th>Gate</th></tr></thead>
+        <tbody>
+          <tr><td>Pre-commit / on save</td><td>A fast subset of unit tests</td><td>Continuously, locally</td><td>Advisory — tightens the loop before code is even pushed</td></tr>
+          <tr><td>Every push / PR</td><td>Full unit suite + fast contract tests</td><td>Seconds to a couple minutes</td><td>Required — blocks merge on failure</td></tr>
+          <tr><td>On merge to main</td><td>Integration suite (real dependencies via Testcontainers)</td><td>A few minutes</td><td>Required — blocks the deploy pipeline from proceeding</td></tr>
+          <tr><td>Pre-deploy / canary</td><td>A small, curated E2E smoke suite on the critical paths</td><td>Minutes, against a near-production environment</td><td>Required before promoting a canary to full rollout</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout insight">
+      <span class="callout-icon">★</span>
+      <span class="callout-title">ML-systems bridge</span>
+      <div class="callout-body">
+        <p>The pyramid maps cleanly onto an ML pipeline once you stop thinking of "the model" as the
+        only thing worth testing. Feature-engineering and data-transform functions are pure logic —
+        unit-test them like any other function, including edge cases (nulls, out-of-range values,
+        empty batches). A feature-store read against a real store, or a training job against a real
+        (small) data warehouse, is exactly the integration-test case Testcontainers-style tooling
+        targets. The serving client's expected input/output tensor shape versus the model server's
+        actual contract is a contract test in every sense of the term — and it's exactly what
+        catches the schema drift behind a lot of real <em>training-serving skew</em> incidents,
+        cheaply, before a bad deploy. And a fixed evaluation set with expected outputs, re-run on
+        every retrain to catch a silent quality regression, is the ML analogue of an E2E smoke test:
+        expensive to run exhaustively, but the last line of defense on the path that actually
+        matters — whether the model that ships is still good enough to ship.</p>
+      </div>
+    </div>
+
+    <div class="quiz" id="quiz">
+      <div class="quiz-block" data-answer="b">
+        <p class="quiz-q">1. A team's test suite is 80% slow Selenium end-to-end tests, with only a
+          handful of unit tests underneath. What's this shape called, and what's the core problem
+          with it?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">A healthy pyramid — E2E tests give the most realistic confidence, so more of them is strictly better.</button>
+          <button class="quiz-option" data-choice="b">The "ice-cream cone" anti-pattern — most bugs end up caught (slowly, flakily) at the most expensive layer instead of cheaply near where they were introduced, and failures are hard to localize.</button>
+          <button class="quiz-option" data-choice="c">This is fine as long as the E2E tests are well-written; layer distribution doesn't actually matter.</button>
+        </div>
+        <p class="quiz-explain" hidden>Inverting the pyramid (wide at the top) is the ice-cream-cone anti-pattern: it trades cheap, fast, precisely-localized failures for expensive, slow, hard-to-diagnose ones, and teams under it tend to stop trusting red CI runs because failures take too long to triage.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="c">
+        <p class="quiz-q">2. A test mocks a class's private helper method and asserts it was called
+          exactly twice with specific arguments, rather than checking the value the public method
+          actually returns. What's the risk?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">No risk — verifying internal calls is strictly more thorough than checking output alone.</button>
+          <button class="quiz-option" data-choice="b">The risk is only that the test runs slower than necessary.</button>
+          <button class="quiz-option" data-choice="c">Over-mocking: the test is coupled to the current implementation rather than the observable behavior, so a correct refactor that changes internal call patterns (but not output) breaks the test for no real reason.</button>
+        </div>
+        <p class="quiz-explain" hidden>Tests should generally verify what a unit does (its output or resulting state), not exactly how it internally does it. Asserting on internal call sequences to code you own makes tests brittle to safe refactors — the opposite of what a test suite should protect.</p>
+      </div>
+
+      <div class="quiz-block" data-answer="a">
+        <p class="quiz-q">3. Your order service calls an independently-deployed payment service's
+          <code>/charge</code> endpoint. You want to catch a breaking API change from the payment
+          team before either side deploys, without standing up the payment service's full
+          environment. Which testing approach fits best?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-choice="a">A consumer-driven contract test — the consumer publishes its expectation of the request/response shape, and the provider's CI verifies it still satisfies that contract.</button>
+          <button class="quiz-option" data-choice="b">A full end-to-end test that spins up both services together on every commit.</button>
+          <button class="quiz-option" data-choice="c">A unit test that mocks the payment client, since mocking already proves the integration is correct.</button>
+        </div>
+        <p class="quiz-explain" hidden>Contract testing is designed for exactly this: catching shape-level drift between independently-deployed services without needing a shared full-stack environment. A unit test with a mock only proves your code handles whatever shape you assumed — it can't catch the provider actually changing that shape.</p>
+      </div>
+    </div>
+
+    <h2>What's next</h2>
+    <p>
+      With <em>Backend Security &amp; the OWASP Top&nbsp;10</em> and this page, the Security &amp;
+      Quality area is complete — you know how to keep a service safe and how to keep changing it
+      without breaking it. The <em>Capstone</em> area is next: <em>The System Design Method</em>
+      assembles every area of this roadmap into a single, repeatable way of answering "design a
+      system that does X" out loud.
+    </p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ---------------- Place the test ---------------- */
+
+      var SCENARIOS = [
+        {
+          text: "You add a function that computes a shopping cart's total, combining a percentage-off coupon with a free-shipping threshold. It's a pure function: numbers in, a number out, no I/O.",
+          answer: "unit",
+          explain: "Pure logic with no I/O is the cheapest, fastest thing to test exhaustively — every coupon/threshold edge case (zero total, coupon larger than the order, threshold exactly met) belongs in a unit test. Reaching for a database or a running server here would just make the same coverage slower and more fragile."
+        },
+        {
+          text: "You add a new Postgres table with a <code>UNIQUE</code> constraint across two columns, and you need to confirm your repository code handles a duplicate-key violation exactly the way you expect, including how Postgres treats <code>NULL</code>s in that constraint.",
+          answer: "integration",
+          explain: "This is precisely the case a hand-rolled in-memory fake can't be trusted for — NULL handling in a unique constraint is a real, engine-specific behavior. An integration test against a real Postgres (e.g. via Testcontainers) verifies your code against the actual semantics it will hit in production, not the semantics you assumed when writing a fake."
+        },
+        {
+          text: "Your shipping-cost function calls out to a third-party rates API to get a live quote. You want to test how your code reacts to a slow or malformed response from that API.",
+          answer: "unit",
+          explain: "The third-party API itself isn't what you're testing — its slowness and non-determinism would just make your test flaky. Stub the API client at the boundary and unit-test your own handling logic (timeouts, malformed payloads, retries) deterministically and fast; you only need a small, separate integration/E2E check that the real client wiring works at all."
+        },
+        {
+          text: "Your order service calls the independently-deployed payment service's <code>POST /charge</code> endpoint. The payment team ships on their own schedule, and you want to catch a breaking change to that endpoint's shape before either side deploys — without spinning up the whole payment service.",
+          answer: "contract",
+          explain: "This is the textbook case for consumer-driven contract testing: it catches request/response shape drift between two independently-deployed services fast and cheaply, without either side needing the other's full running stack. An E2E test would also catch it, eventually — slower, and only after both services are already running together."
+        },
+        {
+          text: "Before a major release, leadership wants confidence that the entire checkout journey — browse, add to cart, apply a coupon, pay, receive a confirmation email — actually works end to end, wired together for real.",
+          answer: "e2e",
+          explain: "This is exactly what a small number of end-to-end tests are for: proving a real, high-value user journey works against the fully wired system, right before it matters most. You wouldn't want dozens of these (slow, comparatively brittle) — just enough to cover the critical paths the business can't afford to have silently break."
+        }
+      ];
+
+      var LAYER_LABELS = { unit: "Unit", integration: "Integration", contract: "Contract", e2e: "E2E" };
+      var LAYER_ORDER = ["unit", "integration", "contract", "e2e"];
+
+      var ptScenario = document.getElementById("ptScenario");
+      var ptChoices = document.getElementById("ptChoices");
+      var ptFeedback = document.getElementById("ptFeedback");
+      var ptVerdict = document.getElementById("ptVerdict");
+      var ptExplain = document.getElementById("ptExplain");
+      var ptProgress = document.getElementById("ptProgress");
+      var ptScore = document.getElementById("ptScore");
+      var ptNext = document.getElementById("ptNext");
+      var ptRestart = document.getElementById("ptRestart");
+
+      var ptIdx = 0;
+      var ptCorrect = 0;
+      var ptAnswered = 0;
+
+      function renderScenario() {
+        if (ptIdx >= SCENARIOS.length) {
+          renderDone();
+          return;
+        }
+        var s = SCENARIOS[ptIdx];
+        ptProgress.innerHTML = "Scenario " + (ptIdx + 1) + " of " + SCENARIOS.length +
+          ' <span class="pt-score" id="ptScore">Score: ' + ptCorrect + " / " + ptAnswered + "</span>";
+        ptScenario.innerHTML = s.text;
+        ptFeedback.hidden = true;
+        ptNext.hidden = true;
+        ptRestart.hidden = true;
+        ptChoices.innerHTML = "";
+        LAYER_ORDER.forEach(function (key) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "pt-choice";
+          b.textContent = LAYER_LABELS[key];
+          b.dataset.choice = key;
+          b.addEventListener("click", function () { onChoose(key, b); });
+          ptChoices.appendChild(b);
+        });
+      }
+
+      function onChoose(key, btn) {
+        var s = SCENARIOS[ptIdx];
+        var hit = key === s.answer;
+        ptAnswered++;
+        if (hit) ptCorrect++;
+
+        Array.prototype.forEach.call(ptChoices.children, function (c) {
+          c.disabled = true;
+          if (c.dataset.choice === s.answer) c.classList.add("reveal-correct");
+          if (c === btn && hit) c.classList.add("chosen-correct");
+          if (c === btn && !hit) c.classList.add("chosen-wrong");
+        });
+
+        ptFeedback.className = "pt-feedback " + (hit ? "hit" : "miss");
+        ptVerdict.textContent = hit ?
+          ("Correct — " + LAYER_LABELS[s.answer] + " test.") :
+          ("Best fit: " + LAYER_LABELS[s.answer] + " test.");
+        ptExplain.textContent = s.explain;
+        ptFeedback.hidden = false;
+
+        document.getElementById("ptScore").textContent = "Score: " + ptCorrect + " / " + ptAnswered;
+
+        if (ptIdx < SCENARIOS.length - 1) {
+          ptNext.hidden = false;
+        } else {
+          ptNext.hidden = true;
+          ptRestart.hidden = false;
+        }
+      }
+
+      function renderDone() {
+        ptScenario.innerHTML = "";
+        ptChoices.innerHTML = "";
+        ptFeedback.hidden = true;
+        ptProgress.textContent = "Done";
+        ptNext.hidden = true;
+        ptRestart.hidden = false;
+      }
+
+      ptNext.addEventListener("click", function () {
+        ptIdx++;
+        renderScenario();
+      });
+      ptRestart.addEventListener("click", function () {
+        ptIdx = 0;
+        ptCorrect = 0;
+        ptAnswered = 0;
+        renderScenario();
+      });
+
+      renderScenario();
+
+      /* ---------------- Quiz interactivity ---------------- */
+      document.querySelectorAll(".quiz-block").forEach(function (block) {
+        var answer = block.dataset.answer;
+        var explain = block.querySelector(".quiz-explain");
+        var options = block.querySelectorAll(".quiz-option");
+        options.forEach(function (opt) {
+          opt.addEventListener("click", function () {
+            if (block.dataset.answered) return;
+            block.dataset.answered = "true";
+            options.forEach(function (o) {
+              if (o.dataset.choice === answer) o.classList.add("correct");
+              else if (o === opt) o.classList.add("incorrect");
+            });
+            explain.hidden = false;
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
