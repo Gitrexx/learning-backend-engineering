@@ -230,7 +230,7 @@
       "summary": "Injection and parameterized queries, broken access control, secrets, rate limiting, least privilege.",
       "prerequisites": ["rest-api-design"],
       "file": "backend-security.html",
-      "status": "planned"
+      "status": "done"
     },
     {
       "id": "testing-backend",
